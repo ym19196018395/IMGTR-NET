@@ -132,6 +132,7 @@ print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in mo
 
 # main function
 def train():
+    # 学习率调度器初始化
     milestones = [int(epoch_idx) for epoch_idx in args.lrepochs.split(':')[0].split(',')]
     lr_gamma = 1 / float(args.lrepochs.split(':')[1])
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=lr_gamma,
@@ -148,6 +149,7 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             do_summary = global_step % args.summary_freq == 0
             do_summary_image = global_step % (50*args.summary_freq) == 0
+            # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary)
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
@@ -210,8 +212,8 @@ def train_sample(sample, detailed_summary=False):
     
     sample_cuda = tocuda(sample)
     depth_gt = sample_cuda["depth"] 
-    mask = sample_cuda["mask"]      
-    
+    mask = sample_cuda["mask"]
+    # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], 
                         sample_cuda["depth_min"], sample_cuda["depth_max"])
     
@@ -219,8 +221,10 @@ def train_sample(sample, detailed_summary=False):
     
     depth_patchmatch = outputs["depth_patchmatch"]
 
+    # 通过计算最终的损失
     loss = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
     loss.backward()
+    # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
     scalar_outputs = {"loss": loss}

@@ -99,6 +99,7 @@ class Refinement(nn.Module):
 
 
 class PatchmatchNet(nn.Module):
+    """ 主体网络，执行 coarse→fine 的可学习 PatchMatch 深度估计"""
     def __init__(self, patchmatch_interval_scale = [0.005, 0.0125, 0.025], propagation_range = [6,4,2],
                 patchmatch_iteration = [1,2,2], patchmatch_num_sample = [8,8,16], propagate_neighbors = [0,8,16],
                 evaluate_neighbors = [9,9,9]):
@@ -115,6 +116,7 @@ class PatchmatchNet(nn.Module):
         super(PatchmatchNet, self).__init__()
 
         self.stages = 4
+        # 获取特征
         self.feature = FeatureNet()
         self.patchmatch_num_sample = patchmatch_num_sample
         
@@ -124,9 +126,10 @@ class PatchmatchNet(nn.Module):
         self.evaluate_neighbors = evaluate_neighbors
         # number of groups for group-wise correlation
         self.G = [4,8,8]
-        
+
+        # 为每一个阶段设置一个PatchMatch模块，从0开始，对应1,2,3阶段
         for l in range(self.stages-1):
-            
+            #如果是第三阶段需要随机初始化
             if l == 2:
                 patchmatch = PatchMatch(True, propagation_range[l], patchmatch_iteration[l], 
                             patchmatch_num_sample[l], patchmatch_interval_scale[l],
@@ -137,6 +140,7 @@ class PatchmatchNet(nn.Module):
                             patchmatch_num_sample[l], patchmatch_interval_scale[l], 
                             num_features[l+1], self.G[l], self.propagate_neighbors[l], l+1,
                             evaluate_neighbors[l])
+            # 使用 setattr 函数将创建的 patchmatch 实例设置为 self 对象的一个属性
             setattr(self, f'patchmatch_{l+1}', patchmatch)
         # 最后进行上采样 输出完整的深度图
         self.upsample_net = Refinement()
@@ -155,7 +159,7 @@ class PatchmatchNet(nn.Module):
         self.imgs_3_ref = imgs_3[0]
         del imgs_1, imgs_2, imgs_3
 
-        
+        # ym-problem 这个是已经处理好的投影矩阵
         self.proj_matrices_0 = torch.unbind(proj_matrices['stage_0'].float(), 1)
         self.proj_matrices_1 = torch.unbind(proj_matrices['stage_1'].float(), 1)
         self.proj_matrices_2 = torch.unbind(proj_matrices['stage_2'].float(), 1)
@@ -163,12 +167,15 @@ class PatchmatchNet(nn.Module):
         del proj_matrices
         
         assert len(imgs_0) == len(self.proj_matrices_0), "Different number of images and projection matrices"
-        
+
+        # step 0 ym—problem,已经在dataloader里面进行了处理 调整图像尺寸：保证输入宽高是 8 的倍数（便于下采样），同时更新相机内参
+
         # step 1. Multi-scale feature extraction
         features = []
         for img in imgs_0:
             output_feature = self.feature(img)
             features.append(output_feature)
+            # ym_need_add 打印出特征图的样子以及特征数据
         del imgs_0
         ref_feature, src_features = features[0], features[1:]
         
@@ -181,12 +188,16 @@ class PatchmatchNet(nn.Module):
         depth_patchmatch = {}
         refined_depth = {}
         
-        for l in reversed(range(1, self.stages)):
+        for l in reversed(range(1, self.stages)):# for（int i = stages-1; i>0 ;i--）
+            # 取出当前尺度的源特征列表 src_features_l
             src_features_l = [src_fea[f'stage_{l}'] for src_fea in src_features]
             projs_l = getattr(self, f'proj_matrices_{l}')
+            # 参考和源图的投影矩阵，已经在处理完毕
             ref_proj, src_projs = projs_l[0], projs_l[1:]
-            
+
+            # 初始化patchmatch，通过getattr方式，分别对应stage3和其他
             if l > 1:
+                # 只在第一回合获得视图权重
                 depth, _, view_weights = getattr(self, f'patchmatch_{l}')(ref_feature[f'stage_{l}'], src_features_l, 
                                         ref_proj, src_projs, 
                                         depth_min, depth_max, depth=depth, img=getattr(self,f'imgs_{l}_ref'), view_weights=view_weights)
@@ -197,6 +208,7 @@ class PatchmatchNet(nn.Module):
             
             del src_features_l, ref_proj, src_projs, projs_l
 
+            # 存放各个阶段的深度图，并将最新得到的深度图进行分出来进行一个上采样来适应下一个阶段
             depth_patchmatch[f'stage_{l}'] = depth
             
             depth = depth[-1].detach()
@@ -204,6 +216,7 @@ class PatchmatchNet(nn.Module):
                 # upsampling the depth map and pixel-wise view weight for next stage
                 depth = F.interpolate(depth,
                                     scale_factor=2, mode='nearest')
+                # 视图权重进行上采样，以便于后续阶段用
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
             
@@ -238,7 +251,10 @@ class PatchmatchNet(nn.Module):
         
 
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
-    
+    """
+    损失函数有所改变
+
+    """
     stage = 4
 
     loss = 0
@@ -259,6 +275,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     
     depth1 = depth_refined_l[mask_l]
     depth2 = depth_gt_l[mask_l]
+    # 相较之前加入了一个
     loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
     
     return loss
