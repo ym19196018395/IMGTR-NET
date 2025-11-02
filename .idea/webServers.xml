@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="e1b9f789-d814-49df-bdf1-d3b2a2fa7258" name="patchmatchnet_new">
+        <fileTransfer rootFolder="/home/ym" accessType="SFTP" host="10.15.97.23" port="22" sshConfigId="949b4dc4-4063-411c-b01a-b10941e8c405" sshConfig="ym@10.15.97.23:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
