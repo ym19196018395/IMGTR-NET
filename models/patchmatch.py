@@ -14,22 +14,23 @@ class DepthInitialization(nn.Module):
     
     def forward(self, random_initialization, min_depth, max_depth, height, width, depth_interval_scale, device, 
                 depth=None):
-        
-        
+
+        # 初始化只初始一次，后面都是局部扰动
         batch_size = min_depth.size()[0]
         if random_initialization:
             # first iteration of Patchmatch on stage 3, sample in the inverse depth range
             # divide the range into several intervals and sample in each of them
             inverse_min_depth = 1.0 / min_depth
             inverse_max_depth = 1.0 / max_depth
-            patchmatch_num_sample = 48 
-            # [B,Ndepth,H,W]
+            # 分为48个区间，并在每个区间内随机取样
+            patchmatch_num_sample = 48
+            # 1.生成随机偏移，形状 (B, N, H, W)，rand初始值会在0-1之间
             depth_sample = torch.rand((batch_size, patchmatch_num_sample, height, width), device=device) + \
                                 torch.arange(0, patchmatch_num_sample, 1, device=device).view(1, patchmatch_num_sample, 1, 1)
-       
+            # 2.把上一步结果映射到逆深度区间
             depth_sample = inverse_max_depth.view(batch_size,1,1,1) + depth_sample / patchmatch_num_sample * \
                                     (inverse_min_depth.view(batch_size,1,1,1) - inverse_max_depth.view(batch_size,1,1,1))
-            
+            # 3.将逆深度取反，变为正常深度
             depth_sample = 1.0 / depth_sample
            
             return depth_sample
@@ -37,15 +38,18 @@ class DepthInitialization(nn.Module):
         else:
             # other Patchmatch, local perturbation is performed based on previous result
             # uniform samples in an inversed depth range
-            if self.patchmatch_num_sample == 1:
+            if self.patchmatch_num_sample == 1:#不进行变化
                 return depth.detach()
             else:
+                # 局部扰动操作，都是在逆深度下进行的，是基于之前的深度进行局部扰动，而不是像素点周围局部扰动
+                # ym_issue，局部扰动在stage3第一次迭代不执行，其他都执行
                 inverse_min_depth = 1.0 / min_depth
                 inverse_max_depth = 1.0 / max_depth
-                
+                # 局部扰动整数偏移集合
                 depth_sample = torch.arange(-self.patchmatch_num_sample//2, self.patchmatch_num_sample//2, 1, 
                                     device=device).view(1, self.patchmatch_num_sample, 1, 1).repeat(batch_size,
                                     1, height, width).float()
+                # 扰动步长，局部扰动在偏移位置上该一次该移动多大位置
                 inverse_depth_interval = (inverse_min_depth - inverse_max_depth) * depth_interval_scale
                 inverse_depth_interval = inverse_depth_interval.view(batch_size,1,1,1)
                 
@@ -54,11 +58,13 @@ class DepthInitialization(nn.Module):
                 depth_clamped = []
                 del depth
                 for k in range(batch_size):
+                    # 对每一个batch进行一个约束
                     depth_clamped.append(torch.clamp(depth_sample[k], min=inverse_max_depth[k], max=inverse_min_depth[k]).unsqueeze(0))
-                
+
+                # 最终把每个 batch 的候选倒回到深度空间，并合并成 (B, N, H, W)
                 depth_sample = 1.0 / torch.cat(depth_clamped,dim=0)
                 del depth_clamped
-                
+
                 return depth_sample
                 
 
@@ -70,19 +76,35 @@ class Propagation(nn.Module):
         
     
     def forward(self, batch, height, width, depth_sample, grid, depth_min, depth_max, depth_interval_scale):
+        """Forward method of adaptive propagation
+        每个像素参考其邻居像素的较好深度候选，将这些候选加入自己的候选集，再通过排序保留更优的候选
+        邻居坐标网格，应该是经过学习学来的，因为是自适应传播
+        Args:
+            depth_sample: sample depth map, in shape of [batch, num_depth, height, width],邻居的参考深度假设
+            grid: 2D grid for bilinear gridding, in shape of [batch, neighbors*H, W, 2(为像素坐标)]，邻居坐标网格，
+            这样定义的目的是为了和传入参考深度假设一样
+
+        Returns:
+            propagate depth: sorted propagate depth map [batch, num_depth+num_neighbors, height, width]
+        """
         # [B,D,H,W]
-        num_depth = depth_sample.size()[1]    
+        num_depth = depth_sample.size()[1]
+        # 是之前的深度候选加上邻居的深度候选
         propogate_depth = depth_sample.new_empty(batch, num_depth + self.neighbors, height, width)
         propogate_depth[:,0:num_depth,:,:] = depth_sample
-        
-        
-        propogate_depth_sample = F.grid_sample(depth_sample[:, num_depth // 2,:,:].unsqueeze(1), 
-                                    grid, 
-                                    mode='bilinear',
-                                    padding_mode='border')
+
+        # grid_sample是网格采样函数，根据grid定义的邻居坐标，来获取邻居最佳深度假设
+        propogate_depth_sample = F.grid_sample(
+            # 选取邻居一个最佳深度假设加入候选，一般最佳深度假设在中间（前面已经筛选出来的），48/2=24，
+                depth_sample[:, num_depth // 2,:,:].unsqueeze(1),# 因为只选取了一个就降了个维度，后来又填充了一个维度，导致维度不变
+                grid,
+                mode='bilinear',
+                padding_mode='border')
         del grid
+
         propogate_depth_sample = propogate_depth_sample.view(batch, self.neighbors, height, width)
-        
+        # 将原来的深度候选（num_depth个）和从邻居传播来的候选（num_neighbors个）在 “候选数维度”（dim=1）拼接，
+        # 得到num_depth + num_neighbors个候选
         propogate_depth[:,num_depth:,:,:] = propogate_depth_sample
         del propogate_depth_sample
         
@@ -107,7 +129,28 @@ class Evaluation(nn.Module):
         
     
     def forward(self, ref_feature, src_features, ref_proj, src_projs, depth_sample, depth_min, depth_max, iter, grid=None, weight=None, view_weights=None):
-        
+        """Forward method for adaptive evaluation
+
+               Args:
+                   ref_feature: feature from reference view, (B, C, H, W)
+                   src_features: features from (Nview-1) source views, (Nview-1) * (B, C, H, W), where Nview is the number of
+                       input images (or views) of PatchmatchNet
+                   ref_proj: projection matrix of reference view, (B, 4, 4)
+                   src_projs: source matrices of source views, (Nview-1) * (B, 4, 4), where Nview is the number of input
+                       images (or views) of PatchmatchNet
+                   depth_sample: sample depth map, (B,Ndepth,H,W)，每个像素的深度假设
+                   grid: grid, (B, evaluate_neighbors*H, W, 2)
+                   weight: weight, (B,Ndepth,1,H,W)
+                   view_weights: Tensor to store weights of source views, in shape of (B,Nview-1,H,W),
+                       Nview-1 represents the number of source views
+                   is_inverse: Flag for inverse depth regression
+
+               Returns:
+                   depth_sample: expectation of depth sample, (B,H,W)
+                   score: probability map, (B,Ndepth,H,W)
+                   view_weights: optional, Tensor to store weights of source views, in shape of (B,Nview-1,H,W),
+                       Nview-1 represents the number of source views
+        """
         num_src_features = len(src_features)
         num_src_projs = len(src_projs)
         batch, feature_channel, height, width = ref_feature.size()
@@ -119,24 +162,29 @@ class Evaluation(nn.Module):
             assert num_src_features == view_weights.size()[1], "Patchmatch Evaluation: Different number of images and view weights"
         
         pixel_wise_weight_sum = 0
-        
+        # 特征分组
         ref_feature = ref_feature.view(batch, self.G, feature_channel//self.G, height, width)
 
         similarity_sum = 0
-        
+        # 对于没有视图权重的时候，计算视图权重，权重只计算一次
         if self.stage == 3 and view_weights == None:
             view_weights = []
+            # 对于每一个源图进行一个可微分投影计算代价
             for src_feature, src_proj in zip(src_features, src_projs):
-                
+                # todo:改天有时间将代价体和视图权重图以及扭曲特征输出出来
+                # 1.可微投影，然后进行一个特征分组
                 warped_feature = differentiable_warping(src_feature, src_proj, ref_proj, depth_sample)
                 warped_feature = warped_feature.view(batch, self.G, feature_channel//self.G, num_depth, height, width)
-                # group-wise correlation
+
+                # 2.group-wise correlation 分组相关，并将组内channel求平均，求相似度
                 similarity = (warped_feature * ref_feature.unsqueeze(3)).mean(2)
-                # pixel-wise view weight
+
+                # 3.pixel-wise view weight:根据相似体，学习每个源视图的可靠性,只学习一次 [B,1,H,W]
                 view_weight = self.pixel_wise_net(similarity)
                 view_weights.append(view_weight)
                 
                 if self.training:
+                    # 将所有相似体权重和视图权重加在一起以便于后面的计算
                     similarity_sum = similarity_sum + similarity * view_weight.unsqueeze(1) # [B, G, Ndepth, H, W]
                     pixel_wise_weight_sum = pixel_wise_weight_sum + view_weight.unsqueeze(1) #[B,1,1,H,W]
                 else:
@@ -146,10 +194,14 @@ class Evaluation(nn.Module):
                 del warped_feature, src_feature, src_proj, similarity, view_weight
             del src_features, src_projs
             view_weights = torch.cat(view_weights,dim=1) #[B,4,H,W], 4 is the number of source views
-            # aggregated matching cost across all the source views
+
+            # 4.对所有源视图的相似度进行加权平均,S均(p, j)
             similarity = similarity_sum.div_(pixel_wise_weight_sum)
+
             del ref_feature, pixel_wise_weight_sum, similarity_sum
-            # adaptive spatial cost aggregation
+            # 5.adaptive spatial cost aggregation
+                ## 1.通过这个多通道1x1x1卷积网络将G通道压缩为1通道
+                ## 2.相似像素（如同一物体表面）的深度假设应相近，通过邻域信息优化当前像素的代价
             score = self.similarity_net(similarity, grid, weight)
             del similarity, grid, weight
             
@@ -160,9 +212,9 @@ class Evaluation(nn.Module):
             
             # depth regression: expectation
             depth_sample = torch.sum(depth_sample * score, dim = 1)
-
+            #第一阶段直接返回 深度分类期望和 深度分数 ym-issue 调试一下看一下
             return depth_sample, score, view_weights.detach()
-        else:
+        else:# 已经有权重了
             i=0
             for src_feature, src_proj in zip(src_features, src_projs):
                 warped_feature = differentiable_warping(src_feature, src_proj, ref_proj, depth_sample)
@@ -196,7 +248,7 @@ class Evaluation(nn.Module):
             
 
             if self.stage == 1 and iter == self.iterations: 
-                # depth regression: inverse depth regression
+                # 逆深度回归（远距离深度分布更均匀），在最后一个阶段最后一次迭代回归逆深度，应该是给深度图细化模块用
                 depth_index = torch.arange(0, num_depth, 1, device=device).view(1, num_depth, 1, 1)
                 depth_index = torch.sum(depth_index * score, dim = 1)
                 
@@ -219,6 +271,19 @@ class PatchMatch(nn.Module):
     def __init__(self, random_initialization = False, propagation_out_range = 2, 
                 patchmatch_iteration = 2, patchmatch_num_sample = 16, patchmatch_interval_scale = 0.025,
                 num_feature = 64, G = 8, propagate_neighbors = 16, stage=3, evaluate_neighbors=9):
+        """Initialize method
+
+        Args:
+            propagation_out_range: range of propagation out,
+            patchmatch_iteration: number of iterations in patchmatch,
+            patchmatch_num_sample: number of samples in patchmatch,
+            patchmatch_interval_scale: interval scale,
+            num_feature: number of features,
+            G: the feature channels of input will be divided evenly into G groups,
+            propagate_neighbors: number of neighbors to be sampled in propagation,
+            stage: number of stage,
+            evaluate_neighbors: number of neighbors to be sampled in evaluation,
+        """
         super(PatchMatch, self).__init__()
         self.random_initialization = random_initialization
         self.depth_initialization = DepthInitialization(patchmatch_num_sample)
@@ -241,6 +306,7 @@ class PatchMatch(nn.Module):
         if self.propagate_neighbors > 0:
             # last iteration on stage 1 does not have propagation (photometric consistency filtering)
             if not (self.stage == 1 and self.patchmatch_iteration == 1):
+                # 定义了两个卷积网络用来得到自适应传播和聚合的网格grid ym-issue 为啥需要设置dilation呢
                 self.propa_conv = nn.Conv2d(
                                 self.propa_num_feature,
                                 2 * self.propagate_neighbors,
@@ -257,11 +323,24 @@ class PatchMatch(nn.Module):
                                     padding=self.dilation, dilation=self.dilation, bias=True)
         nn.init.constant_(self.eval_conv.weight, 0.)
         nn.init.constant_(self.eval_conv.bias, 0.)
+        # ym—issue 这个特征权重网络最后和自适应聚合如何进行一个构建的
         self.feature_weight_net = FeatureWeightNet(num_feature, self.evaluate_neighbors, self.G)
         
 
     # compute the offset for adaptive propagation
     def get_propagation_grid(self, batch, height, width, offset, device, img=None):
+        """Compute the offset for adaptive propagation in adaptive evaluation
+
+        Args:
+            batch: batch size
+            height: grid height
+            width: grid width
+            offset: grid offset
+            device: device on which to place tensor
+
+        Returns:
+            generated grid: in the shape of [batch, propagate_neighbors*H, W, 2]
+        """
         if self.propagate_neighbors == 4:
             original_offset = [ [-self.dilation, 0],
                                 [0,             -self.dilation],  [0,              self.dilation],
@@ -313,7 +392,18 @@ class PatchMatch(nn.Module):
 
     # compute the offests for adaptive spatial cost aggregation in adaptive evaluation
     def get_evaluation_grid(self, batch, height, width, offset, device, img=None):
-        
+        """Compute the offset for patial cost aggregation in adaptive evaluation
+
+                Args:
+                    batch: batch size
+                    height: grid height
+                    width: grid width
+                    offset: grid offset
+                    device: device on which to place tensor
+
+                Returns:
+                    generated grid: in the shape of [batch, propagate_neighbors*H, W, 2]
+                """
         if self.evaluate_neighbors==9:
             dilation = self.dilation-1 #dilation of evaluation is a little smaller than propagation
             original_offset = [[-dilation, -dilation], [-dilation, 0], [-dilation, dilation],
@@ -363,11 +453,32 @@ class PatchMatch(nn.Module):
 
     def forward(self, ref_feature, src_features, ref_proj, src_projs, depth_min, depth_max,
                 depth = None, img = None, view_weights = None):
+        """Forward method for PatchMatch
+
+                Args:
+                    ref_feature: feature from reference view, (B, C, H, W)
+                    src_features: features from (Nview-1) source views, (Nview-1) * (B, C, H, W), where Nview is the number of
+                        input images (or views) of PatchmatchNet
+                    ref_proj: projection matrix of reference view, (B, 4, 4)
+                    src_projs: source matrices of source views, (Nview-1) * (B, 4, 4), where Nview is the number of input
+                        images (or views) of PatchmatchNet
+                    depth_min: minimum virtual depth, (B,)
+                    depth_max: maximum virtual depth, (B,)
+                    depth: current depth map, (B,1,H,W) or None
+                    view_weights: Tensor to store weights of source views, in shape of (B,Nview-1,H,W),
+                        Nview-1 represents the number of source views
+
+                Returns:
+                    depth_samples: list of depth maps from each patchmatch iteration, Niter * (B,1,H,W)
+                    score: evaluted probabilities, (B,Ndepth,H,W)
+                    view_weights: Tensor to store weights of source views, in shape of (B,Nview-1,H,W),
+                        Nview-1 represents the number of source views
+                """
         depth_samples = []
 
         device = ref_feature.get_device()
         batch, _, height, width = ref_feature.size()
-        
+        # todo：grid 如何学习而来，并且深度和特征权重如何得来，有空细看一遍
         # the learned additional 2D offsets for adaptive propagation
         if self.propagate_neighbors > 0:
             # last iteration on stage 1 does not have propagation (photometric consistency filtering)
@@ -381,16 +492,19 @@ class PatchMatch(nn.Module):
         eval_offset = eval_offset.view(batch, 2 * self.evaluate_neighbors, height*width)
         eval_grid = self.get_evaluation_grid(batch,height,width,eval_offset,device,img)
 
+        # [B, evaluate_neighbors, H, W] 获取自适应代价体聚集权重
         feature_weight = self.feature_weight_net(ref_feature.detach(), eval_grid)
-        
-        
+
+        # 新版本的代码中，将第一次迭代单独放出来了
         # first iteration of Patchmatch
         iter = 1
-        if self.random_initialization:
+        if self.random_initialization:# 只需要初始化一次，只在stage3第一次迭代中
             # first iteration on stage 3, random initialization, no adaptive propagation
             depth_sample = self.depth_initialization(True, depth_min, depth_max, height, width, 
                                     self.patchmatch_interval_scale, device)
-            # weights for adaptive spatial cost aggregation in adaptive evaluation
+            # 第一次迭代是没有自适应传播的
+
+            # weights for adaptive spatial cost aggregation in adaptive evaluation，深度和特征权重聚合目的是后面自适应代价聚合
             weight = depth_weight(depth_sample.detach(), depth_min, depth_max, eval_grid.detach(), self.patchmatch_interval_scale,
                                     self.evaluate_neighbors)
             weight = weight * feature_weight.unsqueeze(1)
@@ -417,8 +531,9 @@ class PatchMatch(nn.Module):
             # weights for adaptive spatial cost aggregation in adaptive evaluation
             weight = depth_weight(depth_sample.detach(), depth_min, depth_max, eval_grid.detach(), self.patchmatch_interval_scale,
                                     self.evaluate_neighbors)
+            # 将之前得到的特征权重和深度权重进行了一个融合
             weight = weight * feature_weight.unsqueeze(1)
-            weight = weight / torch.sum(weight, dim=2).unsqueeze(2)
+            weight = weight / torch.sum(weight, dim=2).unsqueeze(2) # [B,Ndepth,1,H,W]
             
             # evaluation, outputs regressed depth map
             depth_sample, score = self.evaluation(ref_feature, src_features, ref_proj, src_projs, 
@@ -556,8 +671,20 @@ def depth_weight(depth_sample, depth_min, depth_max, grid, patchmatch_interval_s
 
 # estimate pixel-wise view weight
 class PixelwiseNet(nn.Module):
+    """Pixelwise Net: A simple pixel-wise view weight network, composed of 1x1x1 convolution layers
+    and sigmoid nonlinearities, takes the initial set of similarities to output a number between 0 and 1 per
+    pixel as estimated pixel-wise view weight.
+
+    1. The Pixelwise Net is used in adaptive evaluation step
+    2. The similarity is calculated by ref_feature and other source_features warped by differentiable_warping
+    3. The learned pixel-wise view weight is estimated in the first iteration of Patchmatch and kept fixed in the
+    matching cost computation.
+    """
     def __init__(self, G):
         super(PixelwiseNet, self).__init__()
+
+        # 3D 卷积（kernel_size=1x1x1）的作用是：同时捕捉 “深度假设维度（Ndepth）” 和 “空间维度（H,W）” 的特征关联
+        # 1x1x1卷积仅做通道维度的融合（如从G组→16 通道→8 通道），计算效率极高
         self.conv0 = ConvBnReLU3D(G, 16, 1, 1, 0)
         self.conv1 = ConvBnReLU3D(16, 8, 1, 1, 0)
         self.conv2 = nn.Conv3d(8, 1, kernel_size=1, stride=1, padding=0)
@@ -565,6 +692,11 @@ class PixelwiseNet(nn.Module):
         
 
     def forward(self, x1):
+        """Forward method for PixelwiseNet
+
+        Args:
+            x1: pixel-wise view weight, [B, G, Ndepth, H, W], where G is the number of groups
+        """
         # x1: [B, G, Ndepth, H, W]
         
         # [B, Ndepth, H, W]
@@ -572,7 +704,7 @@ class PixelwiseNet(nn.Module):
         
         output = self.output(x1)
         del x1
-        # [B,H,W]
+        # [B,1,H,W] 一个源视图是否可靠，取决于它在‘最可能的深度假设’下是否有高相似度所以取max
         output = torch.max(output, dim=1)[0]
         
         return output.unsqueeze(1)

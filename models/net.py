@@ -159,7 +159,7 @@ class PatchmatchNet(nn.Module):
         self.imgs_3_ref = imgs_3[0]
         del imgs_1, imgs_2, imgs_3
 
-        # ym-problem 这个是已经处理好的投影矩阵
+        # ym-issue 这个是已经处理好的投影矩阵，有时间看一下dataloader
         self.proj_matrices_0 = torch.unbind(proj_matrices['stage_0'].float(), 1)
         self.proj_matrices_1 = torch.unbind(proj_matrices['stage_1'].float(), 1)
         self.proj_matrices_2 = torch.unbind(proj_matrices['stage_2'].float(), 1)
