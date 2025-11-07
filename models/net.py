@@ -1,3 +1,5 @@
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -279,3 +281,26 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
     
     return loss
+
+def adjust_image_dims(
+        images: List[torch.Tensor], intrinsics: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor, int, int]:
+    """
+    :param images: 数据集
+    :param intrinsics: 相机参数集
+    :return:
+    """
+    # stretch or compress image slightly to ensure width and height are multiples of 8
+    # B 3 H W 图片的格式
+    _, _, ref_height, ref_width = images[0].size()
+    for i in range(len(images)):
+        _, _, height, width = images[i].size()
+        new_height = int(round(height / 8)) * 8
+        new_width = int(round(width / 8)) * 8
+        # 如果不是，则进行一个相机参数，和图片的下采样 让其符合标准
+        if new_width != width or new_height != height:
+            intrinsics[:, i, 0] *= new_width / width
+            intrinsics[:, i, 1] *= new_height / height
+            images[i] = nn.functional.interpolate(
+                images[i], size=[new_height, new_width], mode='bilinear', align_corners=False)
+
+    return images, intrinsics, ref_height, ref_width

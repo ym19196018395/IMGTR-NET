@@ -153,9 +153,6 @@ class MVSDataset(Dataset):
                 depth_min =  depth_min_
                 depth_max = depth_max_
 
-                
-            
-
         # imgs: N*3*H0*W0, N is number of images
         imgs_0 = np.stack(imgs_0).transpose([0, 3, 1, 2])
         imgs_1 = np.stack(imgs_1).transpose([0, 3, 1, 2])

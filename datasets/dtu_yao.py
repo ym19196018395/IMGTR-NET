@@ -24,19 +24,28 @@ class MVSDataset(Dataset):
         self.metas = self.build_list()
 
     def build_list(self):
+        """
+        return:metas 里面装着 各种类似于 ('scan2', 0, 0, [10, 1, 9, 12, 11, 13, 2, 8, 14, 27])
+        分别对应的是，数据集种类，光度值，参考图的编号，源图的编号
+        """
         metas = []
         with open(self.listfile) as f:
             scans = f.readlines()
             scans = [line.rstrip() for line in scans]
 
         for scan in scans:
+            # 存储着一共多少视角图，以及选中该视角图为参考图之后对应的源图
             pair_file = "Cameras_1/pair.txt"
             
             with open(os.path.join(self.datapath, pair_file)) as f:
-                self.num_viewpoint = int(f.readline())
+                self.num_viewpoint = int(f.readline()) # 视图数
                 # viewpoints (49)
                 for view_idx in range(self.num_viewpoint):
+                    # ref_view：直接从那一行读取参考视角 id
                     ref_view = int(f.readline().rstrip())
+                    f.readline().rstrip().split()
+                    # 把第二行按空格拆成token列表，形式像['k', 'view1', 'score1',  ...]
+                    # [1::2] 这个意味着从索引 1 开始、步长 2，取出 view1, view2
                     src_views = [int(x) for x in f.readline().rstrip().split()[1::2]]
                     # light conditions 0-6
                     for light_idx in range(7):
