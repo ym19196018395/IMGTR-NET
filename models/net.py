@@ -131,7 +131,7 @@ class PatchmatchNet(nn.Module):
 
         # 为每一个阶段设置一个PatchMatch模块，从0开始，对应1,2,3阶段
         for l in range(self.stages-1):
-            #如果是第三阶段需要随机初始化
+            #如果是stage_3需要随机初始化
             if l == 2:
                 patchmatch = PatchMatch(True, propagation_range[l], patchmatch_iteration[l], 
                             patchmatch_num_sample[l], patchmatch_interval_scale[l],
@@ -147,7 +147,7 @@ class PatchmatchNet(nn.Module):
         # 最后进行上采样 输出完整的深度图
         self.upsample_net = Refinement()
         
-    def forward(self, imgs, proj_matrices, depth_min, depth_max):
+    def forward(self, imgs, proj_matrices, depth_min, depth_max,vertexs,lines,triangles):
         
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
         imgs_1 = torch.unbind(imgs['stage_1'], 1)
@@ -254,7 +254,7 @@ class PatchmatchNet(nn.Module):
 
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     """
-    损失函数有所改变
+    损失函数有所改变，损失函数只计算mask标记有深度值的
 
     """
     stage = 4
@@ -262,6 +262,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     loss = 0
     for l in range(1, stage):
         depth_gt_l = depth_gt[f'stage_{l}']
+        # 代表这个地方深度是有效的
         mask_l = mask[f'stage_{l}'] > 0.5
         depth2 = depth_gt_l[mask_l]
         
@@ -277,7 +278,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     
     depth1 = depth_refined_l[mask_l]
     depth2 = depth_gt_l[mask_l]
-    # 相较之前加入了一个
+    # 相较之前加入了一个refine图片的损失函数
     loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
     
     return loss

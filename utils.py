@@ -153,3 +153,51 @@ def Thres_metrics(depth_est, depth_gt, mask, thres):
 def AbsDepthError_metrics(depth_est, depth_gt, mask):
     depth_est, depth_gt = depth_est[mask], depth_gt[mask]
     return torch.mean((depth_est - depth_gt).abs())
+
+def tocuda(sample, device, skip_keys=None, non_blocking=True):
+    """
+    将 sample 中的可转为 GPU 的项搬到 device。
+    - sample: dict-like (通常 DataLoader 返回的 batch)
+    - device: torch.device("cuda:0") 等
+    - skip_keys: iterable of top-level keys to skip (e.g. ["vertexs","lines","triangles"])
+    - non_blocking: 用于 tensor.to(..., non_blocking=...)
+    返回修改后的 sample（in-place 修改并返回）
+    """
+    if skip_keys is None:
+        skip_keys = set()
+    else:
+        skip_keys = set(skip_keys)
+
+    def _move(x):
+        # torch tensor -> 发送到 device
+        if isinstance(x, torch.Tensor):
+            return x.to(device, non_blocking=non_blocking)
+        # numpy array -> 转 torch 然后送 device
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).to(device, non_blocking=non_blocking)
+        # number -> 转 tensor
+        if isinstance(x, (int, float)):
+            return torch.tensor(x).to(device)
+        # dict/list/tuple -> 递归处理
+        if isinstance(x, dict):
+            return {k: _move(v) for k, v in x.items()}
+        if isinstance(x, list):
+            # 列表通常我们希望保留（例如 triangles 是 list-of-arrays）——
+            # 这里做保守处理：如果列表里全是 torch.Tensor / np.ndarray / numbers，则把每个元素搬；
+            # 否则返回原始列表（保持在 CPU，由使用处决定如何处理）
+            if all(isinstance(el, (torch.Tensor, np.ndarray, int, float)) for el in x):
+                return [_move(el) for el in x]
+            else:
+                return x  # 保持原样
+        if isinstance(x, tuple):
+            # 转成 tuple 返回
+            return tuple(_move(el) for el in x)
+        # 其他对象（自定义类、namedtuple 等）——保守返回原对象（不要试图搬）
+        return x
+
+    # 对顶层键做 skip
+    for k in list(sample.keys()):
+        if k in skip_keys:
+            continue
+        sample[k] = _move(sample[k])
+    return sample

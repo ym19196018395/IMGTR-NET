@@ -6,6 +6,9 @@ from datasets.data_io import *
 import cv2
 import random
 
+from torch.utils.data._utils.collate import default_collate
+from datasets.triangulation import *
+
 
 class MVSDataset(Dataset):
     def __init__(self, datapath, listfile, mode, nviews, robust_train = False):
@@ -15,9 +18,9 @@ class MVSDataset(Dataset):
         self.datapath = datapath
         self.listfile = listfile
         self.mode = mode
-        self.nviews = nviews
+        self.nviews = nviews # 每个样本使用的视图数量（参考视图+源视图）
         
-        self.robust_train = robust_train
+        self.robust_train = robust_train # 是否使用鲁棒训练策略（随机选择源视图）
         
 
         assert self.mode in ["train", "val", "test"]
@@ -43,7 +46,6 @@ class MVSDataset(Dataset):
                 for view_idx in range(self.num_viewpoint):
                     # ref_view：直接从那一行读取参考视角 id
                     ref_view = int(f.readline().rstrip())
-                    f.readline().rstrip().split()
                     # 把第二行按空格拆成token列表，形式像['k', 'view1', 'score1',  ...]
                     # [1::2] 这个意味着从索引 1 开始、步长 2，取出 view1, view2
                     src_views = [int(x) for x in f.readline().rstrip().split()[1::2]]
@@ -70,6 +72,9 @@ class MVSDataset(Dataset):
         return intrinsics, extrinsics, depth_min, depth_max
 
     def read_img(self, filename):
+        """
+        读取图像并生成 4 个尺度（用于多尺度模型）：
+        """
         img = Image.open(filename)
         # scale 0~255 to 0~1
         
@@ -87,6 +92,9 @@ class MVSDataset(Dataset):
         return np.array(read_pfm(filename)[0], dtype=np.float32)
 
     def prepare_img(self, hr_img):
+        """
+        对高分辨率图像预处理（下采样 1/2 + 裁剪到 512x640），统一输入尺寸
+        """
         # original w,h: 1600, 1200; downsample -> 800, 600 ; crop -> 640, 512
         #downsample
         h, w = hr_img.shape
@@ -100,6 +108,9 @@ class MVSDataset(Dataset):
         return hr_img_crop
 
     def read_mask_hr(self, filename):
+        """
+        读取掩码图像（用于过滤无效深度区域），预处理后生成多尺度掩码
+        """
         img = Image.open(filename)
         np_img = np.array(img, dtype=np.float32)
         np_img = (np_img > 10).astype(np.float32)
@@ -116,7 +127,9 @@ class MVSDataset(Dataset):
         
 
     def read_depth_hr(self, filename):
-        
+        """
+        读取高分辨率深度图，预处理后生成多尺度深度图（作为模型训练的真值）
+        """
         depth_hr = np.array(read_pfm(filename)[0], dtype=np.float32)
         depth_hr = np.squeeze(depth_hr,2)
         depth_lr = self.prepare_img(depth_hr)
@@ -132,13 +145,18 @@ class MVSDataset(Dataset):
         return depth_lr_ms
 
 
+
+
+
     def __getitem__(self, idx):
+        # 这里是对应的一组数据包括一张参考图加几张源图
         meta = self.metas[idx]
         scan, light_idx, ref_view, src_views = meta
         
         # robust training strategy
         if self.robust_train:
             num_src_views = len(src_views)
+            # 在10个源图中，随机选几个源图，使得参考图加上源图等于nviews数
             index = random.sample(range(num_src_views), self.nviews - 1)
             view_ids = [ref_view] + [src_views[i] for i in index]
 
@@ -159,16 +177,22 @@ class MVSDataset(Dataset):
         proj_matrices_1 = []
         proj_matrices_2 = []
         proj_matrices_3 = []
-        
 
+        # 装载cdt三角剖分数据
+        # 顶点坐标集合：[(x1, y1), (x2, y2), ...]
+        # 线集合：[Line(p1, p2, face1, face2), ...]
+        # 三角形集合：[Triangle(vertex_ids, line_ids, valid_points), ...]
+        cdt_data=[]
+        # 读取源图和参考图的信息
         for i, vid in enumerate(view_ids):
             # NOTE that the id in image file names is from 1 to 49 (not 0~48)
             img_filename = os.path.join(self.datapath,
-                                        'Rectified/{}_train/rect_{:0>3}_{}_r5000.png'.format(scan, vid + 1, light_idx))
+                                        'Rectified/{}_train/urd/rect_{:0>3}_{}_r5000.png'.format(scan, vid + 1, light_idx))
             
             mask_filename_hr = os.path.join(self.datapath, 'Depths/Depths/{}/depth_visual_{:0>4}.png'.format(scan, vid))
             depth_filename_hr = os.path.join(self.datapath, 'Depths/Depths/{}/depth_map_{:0>4}.pfm'.format(scan, vid))
             proj_mat_filename = os.path.join(self.datapath, 'Cameras_1/train/{:0>8}_cam.txt').format(vid)
+
 
             imgs = self.read_img(img_filename)
             imgs_0.append(imgs['stage_0'])
@@ -176,11 +200,16 @@ class MVSDataset(Dataset):
             imgs_2.append(imgs['stage_2'])
             imgs_3.append(imgs['stage_3'])
 
+
             # here, the intrinsics from file is already adjusted to the downsampled size of feature 1/4H0 * 1/4W0
+            # 之前已经将深度图变为1/4了
             intrinsics, extrinsics, depth_min_, depth_max_ = self.read_cam_file(proj_mat_filename)
 
+            # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
             proj_mat = extrinsics.copy()
+            # 将1，2行的系数*scale
             intrinsics[:2,:] *= 0.5
+            # 求得是投影矩阵 P = K [R|t]  外参矩阵是取三行四列大小的数据
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_3.append(proj_mat)
 
@@ -210,10 +239,17 @@ class MVSDataset(Dataset):
                     mask[f'stage_{l}'] = mask[f'stage_{l}'].transpose([2,0,1])
                     depth[f'stage_{l}'] = np.expand_dims(depth[f'stage_{l}'],2)
                     depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
-                
-                
 
-                
+                # ym-add 获取参考图三角网数据
+                triangulation_filename = os.path.join(self.datapath,
+                                                    'Rectified/{}_train/triangulation/CDTinfo/CDT_info_vlf_rect_{:03d}_1_r5000.txt'.format(
+                                                        scan, view_ids[0]))
+                img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(view_ids[0])
+                W=imgs_0[0].shape[1]
+                H=imgs_0[0].shape[0]
+                cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
+
+        # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致
         # imgs: N*3*H0*W0, N is number of images
         imgs_0 = np.stack(imgs_0).transpose([0, 3, 1, 2])
         imgs_1 = np.stack(imgs_1).transpose([0, 3, 1, 2])
@@ -237,15 +273,39 @@ class MVSDataset(Dataset):
         proj['stage_2']=proj_matrices_2
         proj['stage_1']=proj_matrices_1
         proj['stage_0']=proj_matrices_0
-        
 
+        # todo：将数据转化为list or ndarray，为的是后续可以使用，如果之后要进行并行运算还需要修改
+        vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
+        lines = np.asarray(cdt_data.lines, dtype=np.int64)
+        # 每个 triangle 分开处理，保留 list，
+        triangles = []
+        for t in cdt_data.triangles:
+            tri_v = np.asarray(t.vertex_ids, dtype=np.int64)
+            tri_l = np.asarray(t.line_ids, dtype=np.int64)
+            tri_pts = np.asarray(t.valid_points, dtype=np.int64)  # 变长，允许不同长度
+            triangles.append({'vertex_ids': tri_v, 'line_ids': tri_l, 'valid_points': tri_pts})
 
-        
         # data is numpy array
         return {"imgs": imgs,                   # N*3*H0*W0
-                "proj_matrices": proj, # N*4*4
+                "proj_matrices": proj,          # N*4*4
                 "depth": depth,                 # 1*H0 * W0
                 "depth_min": depth_min,         # scalar
                 "depth_max": depth_max,         # scalar
-                "mask": mask}                   # 1*H0 * W0
+                "mask": mask,                   # 1*H0 * W0
+                "vertexs": vertexs,         # ndarray (Nv, ..)
+                "lines": lines,             # ndarray (Nl, ..)
+                "triangles": triangles      # list of ndarrays
+                }
 
+def collate_keep_list(batch):
+    """
+    跳过cdt-data，后面单独进行一个处理
+    """
+    out = {}
+    keys = batch[0].keys()
+    for k in keys:
+        if k in ['triangles', 'vertexs', 'lines']:
+            out[k] = [b[k] for b in batch]
+        else:
+            out[k] = default_collate([b[k] for b in batch])
+    return out

@@ -18,6 +18,7 @@ from utils import *
 import gc
 import sys
 import datetime
+from datasets.dtu_yao import collate_keep_list
 
 # ym_add 这对应的就是实际的cuda
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -93,8 +94,12 @@ if args.dataset == 'dtu_yao':
     train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 5, robust_train=True)
     test_dataset = MVSDataset(args.valpath, args.vallist, "val", 5,  robust_train=False)
 
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=8, drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+# TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=8, drop_last=True)
+# TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list，num_workers=4, drop_last=False)
+
+# ym-modified 为了探测问题 num_workers设置为0
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=0, drop_last=True)
+TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False,collate_fn=collate_keep_list, num_workers=0, drop_last=False)
 
 # model, optimizer
 model = PatchmatchNet(patchmatch_interval_scale=args.patchmatch_interval_scale,
@@ -143,12 +148,27 @@ def train():
         lr_scheduler.step()
         global_step = len(TrainImgLoader) * epoch_idx
 
-        # training
+        # training 这个是一共多少批次，每批次的大小是batch-size
         for batch_idx, sample in enumerate(TrainImgLoader):
             start_time = time.time()
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             do_summary = global_step % args.summary_freq == 0
             do_summary_image = global_step % (50*args.summary_freq) == 0
+
+            # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+            # vertexs/list-of-arrays -> 转 tensor 并 to(device)
+            vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+            lines_batch=[torch.from_numpy(v).to(device) for v in sample['lines']]
+            triangles_batch = []
+            for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+                tri_processed = []
+                for t in tri_list:
+                    v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+                    l_ids = torch.from_numpy(t['line_ids']).to(device)
+                    pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+                    tri_processed.append((v_ids, l_ids, pts))
+                triangles_batch.append(tri_processed)
+
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary)
             if do_summary:
@@ -196,6 +216,21 @@ def test():
     avg_test_scalars = DictAverageMeter()
     for batch_idx, sample in enumerate(TestImgLoader):
         start_time = time.time()
+
+        # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+        # vertexs/list-of-arrays -> 转 tensor 并 to(device)
+        vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+        lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+        triangles_batch = []
+        for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+            tri_processed = []
+            for t in tri_list:
+                v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+                l_ids = torch.from_numpy(t['line_ids']).to(device)
+                pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+                tri_processed.append((v_ids, l_ids, pts))
+            triangles_batch.append(tri_processed)
+
         loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=True)
         avg_test_scalars.update(scalar_outputs)
         del scalar_outputs, image_outputs
@@ -209,13 +244,18 @@ def test():
 def train_sample(sample, detailed_summary=False):
     model.train()
     optimizer.zero_grad()
-    
-    sample_cuda = tocuda(sample)
+
+    # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
+    skip = ["vertexs", "lines", "triangles"]
+    sample_cuda = tocuda(sample,device=device,skip_keys=skip)
+
     depth_gt = sample_cuda["depth"] 
     mask = sample_cuda["mask"]
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], 
-                        sample_cuda["depth_min"], sample_cuda["depth_max"])
+                        sample_cuda["depth_min"], sample_cuda["depth_max"],
+                    sample_cuda["vertexs"], sample_cuda["lines"],
+                    sample_cuda["triangles"])
     
     depth_est = outputs["refined_depth"]
     
@@ -263,12 +303,18 @@ def train_sample(sample, detailed_summary=False):
 @make_nograd_func
 def test_sample(sample, detailed_summary=True):
     model.eval()
-    sample_cuda = tocuda(sample)
+
+    # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
+    skip = ["vertexs", "lines", "triangles"]
+    sample_cuda = tocuda(sample, device=device, skip_keys=skip)
+
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
-    
-    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], 
-                        sample_cuda["depth_min"], sample_cuda["depth_max"])
+
+    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+                    sample_cuda["depth_min"], sample_cuda["depth_max"],
+                    sample_cuda["vertexs"], sample_cuda["lines"],
+                    sample_cuda["triangles"])
     
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]
