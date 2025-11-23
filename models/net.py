@@ -99,7 +99,6 @@ class Refinement(nn.Module):
         return depth
     
 
-
 class PatchmatchNet(nn.Module):
     """ 主体网络，执行 coarse→fine 的可学习 PatchMatch 深度估计"""
     def __init__(self, patchmatch_interval_scale = [0.005, 0.0125, 0.025], propagation_range = [6,4,2],
@@ -123,7 +122,8 @@ class PatchmatchNet(nn.Module):
         self.patchmatch_num_sample = patchmatch_num_sample
         
         num_features = [8, 16, 32, 64]
-        
+
+
         self.propagate_neighbors = propagate_neighbors
         self.evaluate_neighbors = evaluate_neighbors
         # number of groups for group-wise correlation
@@ -146,7 +146,10 @@ class PatchmatchNet(nn.Module):
             setattr(self, f'patchmatch_{l+1}', patchmatch)
         # 最后进行上采样 输出完整的深度图
         self.upsample_net = Refinement()
-        
+
+        # ym—need-modify 后面可能需要加入传播里面
+        self.edge_head = EdgeHead(num_features[1])
+
     def forward(self, imgs, proj_matrices, depth_min, depth_max,vertexs,lines,triangles):
         
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
@@ -197,23 +200,30 @@ class PatchmatchNet(nn.Module):
             # 参考和源图的投影矩阵，已经在处理完毕
             ref_proj, src_projs = projs_l[0], projs_l[1:]
 
-            # 初始化patchmatch，通过getattr方式，分别对应stage3和其他
+            # 初始化patchmatch，通过getattr方式，分别对应stage3和stage2
             if l > 1:
                 # 只在第一回合获得视图权重
                 depth, _, view_weights = getattr(self, f'patchmatch_{l}')(ref_feature[f'stage_{l}'], src_features_l, 
                                         ref_proj, src_projs, 
                                         depth_min, depth_max, depth=depth, img=getattr(self,f'imgs_{l}_ref'), view_weights=view_weights)
             else:
-                depth, score, _ = getattr(self, f'patchmatch_{l}')(ref_feature[f'stage_{l}'], src_features_l, 
-                                        ref_proj, src_projs, 
+                # ym-add 在stage1阶段进行一个边断裂预测,暂时不用
+                # depth, score, _ ,edge_alphas,edge_mats= getattr(self, f'patchmatch_{l}')(ref_feature[f'stage_{l}'], src_features_l,
+                #                         ref_proj, src_projs,
+                #                         depth_min, depth_max, depth=depth,img=getattr(self,f'imgs_{l}_ref'), view_weights=view_weights,
+                #                         vertexs=vertexs,lines=lines,triangles=triangles)
+
+                depth, score, _ = getattr(self, f'patchmatch_{l}')(ref_feature[f'stage_{l}'], src_features_l,
+                                        ref_proj, src_projs,
                                         depth_min, depth_max, depth=depth,img=getattr(self,f'imgs_{l}_ref'), view_weights=view_weights)
             
             del src_features_l, ref_proj, src_projs, projs_l
 
             # 存放各个阶段的深度图，并将最新得到的深度图进行分出来进行一个上采样来适应下一个阶段
             depth_patchmatch[f'stage_{l}'] = depth
-            
+            # 这里数据分为两份，一份用来上采样，一份用来返回
             depth = depth[-1].detach()
+
             if l > 1:
                 # upsampling the depth map and pixel-wise view weight for next stage
                 depth = F.interpolate(depth,
@@ -222,17 +232,28 @@ class PatchmatchNet(nn.Module):
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
             
-        
+        # 因为评估数据还没有进行处理，所以评估数据进行一个跳过,ym-need-modify
+        tri_infos=[]
+        edge_alphas,edge_mats=[],[]
+        if self.training:
+            _, _, height, width = depth.size()
+            device = depth.get_device()
+            # 因为传入的是原分辨率的三角信息，在里面会进行一个1/2的缩放
+            tri_infos = batch_convert_to_tri_infos(vertexs, lines, triangles, height*2 , width*2 , device)
+            edge_alphas, edge_mats = self.edge_head(ref_feature['stage_1'], img=None, depth_map=depth, tri_infos=tri_infos)
+
         # step 3. Refinement  
         depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
         refined_depth['stage_0'] = depth
-        
+
         del depth, ref_feature, src_features
-        
-        
+
         if self.training:
             return {"refined_depth": refined_depth, 
                         "depth_patchmatch": depth_patchmatch,
+                        "tri_infos": tri_infos,
+                        "edge_alphas": edge_alphas,
+                    "edge_mats": edge_mats
                     }
             
         else:
@@ -251,7 +272,6 @@ class PatchmatchNet(nn.Module):
                         "photometric_confidence": photometric_confidence,
                     }
         
-
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     """
     损失函数有所改变，损失函数只计算mask标记有深度值的
@@ -265,7 +285,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
         # 代表这个地方深度是有效的
         mask_l = mask[f'stage_{l}'] > 0.5
         depth2 = depth_gt_l[mask_l]
-        
+
         depth_patchmatch_l = depth_patchmatch[f'stage_{l}']
         for i in range(len(depth_patchmatch_l)):
             depth1 = depth_patchmatch_l[i][mask_l]
@@ -275,12 +295,12 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     depth_refined_l = refined_depth[f'stage_{l}']
     depth_gt_l = depth_gt[f'stage_{l}']
     mask_l = mask[f'stage_{l}'] > 0.5
-    
+
     depth1 = depth_refined_l[mask_l]
     depth2 = depth_gt_l[mask_l]
     # 相较之前加入了一个refine图片的损失函数
     loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
-    
+
     return loss
 
 def adjust_image_dims(

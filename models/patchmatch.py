@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils import convert_to_tri_infos, batch_convert_to_tri_infos
+from . import edge_head
+from .edge_head import EdgeHead
 from .module import *
 import cv2
 import numpy as np
@@ -212,9 +216,10 @@ class Evaluation(nn.Module):
 
             # depth regression: expectation
             depth_sample = torch.sum(depth_sample * score, dim = 1)
-            #第一阶段直接返回 深度分类期望和 深度分数 ym-issue 调试一下看一下
+            # 第一阶段直接返回 深度分类期望和 深度分数 ym-issue 调试一下看一下
             return depth_sample, score, view_weights.detach()
-        else:# 已经有权重了，唯一的区别就是用之前已经生成的深度图
+        # 已经有权重了，唯一的区别就是用之前已经生成的深度图
+        else:
             i=0
             for src_feature, src_proj in zip(src_features, src_projs):
                 warped_feature = differentiable_warping(src_feature, src_proj, ref_proj, depth_sample)
@@ -326,6 +331,8 @@ class PatchMatch(nn.Module):
         nn.init.constant_(self.eval_conv.bias, 0.)
         # ym—issue 这个特征权重网络最后和自适应聚合如何进行一个构建的
         self.feature_weight_net = FeatureWeightNet(num_feature, self.evaluate_neighbors, self.G)
+        # ym-add 边断裂预测头 暂时不在这里添加
+        # self.edge_head=EdgeHead(num_feature)
 
 
     # compute the offset for adaptive propagation
@@ -453,7 +460,7 @@ class PatchMatch(nn.Module):
 
 
     def forward(self, ref_feature, src_features, ref_proj, src_projs, depth_min, depth_max,
-                depth = None, img = None, view_weights = None):
+                    depth = None, img = None, view_weights = None,vertexs =None,lines =None,triangles =None):
         """Forward method for PatchMatch
 
                 Args:
@@ -566,6 +573,14 @@ class PatchMatch(nn.Module):
 
             depth_sample = depth_sample.unsqueeze(1)
             depth_samples.append(depth_sample)
+
+        # todo：暂时只在h/2，w/2分辨率处理，这个三角数据是否可以在一开始之前就进行处理
+        # if(self.stage==1):
+        #     # 处理一下三角数据，用来传入边预测头
+        #     # 这里要首先映射到原来大小，然后再经过一个下采样
+        #     tri_infos = batch_convert_to_tri_infos(vertexs, lines, triangles, height*2, width*2, device)
+        #     edge_alphas,edge_mats=self.edge_head(ref_feature,img=None,depth_map=depth_sample[-1],tri_infos=tri_infos)
+        #     return depth_samples, score, view_weights,edge_alphas,edge_mats
 
         return depth_samples, score, view_weights
 

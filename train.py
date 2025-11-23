@@ -1,6 +1,9 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+
+from models.sum_loss import *
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -94,18 +97,19 @@ if args.dataset == 'dtu_yao':
     train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 5, robust_train=True)
     test_dataset = MVSDataset(args.valpath, args.vallist, "val", 5,  robust_train=False)
 
-# TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=8, drop_last=True)
-# TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list，num_workers=4, drop_last=False)
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=8, drop_last=True)
+TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,num_workers=4, drop_last=False)
 
 # ym-modified 为了探测问题 num_workers设置为0
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=0, drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False,collate_fn=collate_keep_list, num_workers=0, drop_last=False)
+# TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=0, drop_last=True)
+# TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False,collate_fn=collate_keep_list, num_workers=0, drop_last=False)
 
 # model, optimizer
 model = PatchmatchNet(patchmatch_interval_scale=args.patchmatch_interval_scale,
                 propagation_range = args.patchmatch_range, patchmatch_iteration=args.patchmatch_iteration, 
                 patchmatch_num_sample = args.patchmatch_num_sample, 
                 propagate_neighbors=args.propagate_neighbors, evaluate_neighbors=args.evaluate_neighbors)
+
 # if args.mode in ["train", "val"]:
 #     model = nn.DataParallel(model)
 # model.cuda()
@@ -154,23 +158,8 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             do_summary = global_step % args.summary_freq == 0
             do_summary_image = global_step % (50*args.summary_freq) == 0
-
-            # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
-            # vertexs/list-of-arrays -> 转 tensor 并 to(device)
-            vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-            lines_batch=[torch.from_numpy(v).to(device) for v in sample['lines']]
-            triangles_batch = []
-            for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
-                tri_processed = []
-                for t in tri_list:
-                    v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-                    l_ids = torch.from_numpy(t['line_ids']).to(device)
-                    pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
-                    tri_processed.append((v_ids, l_ids, pts))
-                triangles_batch.append(tri_processed)
-
             # 处理单个样本，计算损失并反向传播
-            loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary)
+            loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,global_step=global_step)
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
             if do_summary_image:
@@ -216,21 +205,6 @@ def test():
     avg_test_scalars = DictAverageMeter()
     for batch_idx, sample in enumerate(TestImgLoader):
         start_time = time.time()
-
-        # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
-        # vertexs/list-of-arrays -> 转 tensor 并 to(device)
-        vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-        lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
-        triangles_batch = []
-        for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
-            tri_processed = []
-            for t in tri_list:
-                v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-                l_ids = torch.from_numpy(t['line_ids']).to(device)
-                pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
-                tri_processed.append((v_ids, l_ids, pts))
-            triangles_batch.append(tri_processed)
-
         loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=True)
         avg_test_scalars.update(scalar_outputs)
         del scalar_outputs, image_outputs
@@ -241,40 +215,90 @@ def test():
     print("final", avg_test_scalars)
 
 
-def train_sample(sample, detailed_summary=False):
+def train_sample(sample, detailed_summary=False,global_step=0):
     model.train()
     optimizer.zero_grad()
 
+    # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+    # vertexs/list-of-arrays -> 转 tensor 并 to(device)
+    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    triangles_batch = []
+    for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+        tri_processed = []
+        for t in tri_list:
+            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+            l_ids = torch.from_numpy(t['line_ids']).to(device)
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+            tri_processed.append((v_ids, l_ids, pts))
+        triangles_batch.append(tri_processed)
+
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
     skip = ["vertexs", "lines", "triangles"]
-    sample_cuda = tocuda(sample,device=device,skip_keys=skip)
+    sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
     depth_gt = sample_cuda["depth"] 
     mask = sample_cuda["mask"]
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
-    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], 
-                        sample_cuda["depth_min"], sample_cuda["depth_max"],
-                    sample_cuda["vertexs"], sample_cuda["lines"],
-                    sample_cuda["triangles"])
+    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+                    sample_cuda["depth_min"], sample_cuda["depth_max"],
+                    vertexs_batch, lines_batch,triangles_batch)
     
     depth_est = outputs["refined_depth"]
     
     depth_patchmatch = outputs["depth_patchmatch"]
 
     # 通过计算最终的损失
-    loss = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
+    # 总损失：深度损失+边断裂损失+连续性损失
+    loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask) # 深度损失
+
+    # 1) EdgeConsistencyLoss（自监督 BCE）
+    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.02, feat_weight=0.0, smooth_weight=0.0)
+    loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
+        pred_alpha_list=outputs["edge_alphas"],
+        # 1/2分辨率图
+        depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+        tri_infos_list=outputs["tri_infos"],
+        feat_map=None,
+        tri_depths_list=None
+    )
+
+    # 加上边断裂损失
+    loss_depth,loss_alpha_sup=normalized_loss_fusion(loss_depth,loss_alpha_sup, alpha_weight=3.0, beta_weight=1.0)
+    loss=loss_depth+loss_alpha_sup
+
+    # 边断裂损失
     loss.backward()
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
-    scalar_outputs = {"loss": loss}
+    # 生成图
+    # visualize_edges_to_tb(outputs["tri_infos"], writer=logger, global_step=global_step, tag_prefix='Edges')
+
+    image_outputs_4 = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 3],edge_alphas_list=outputs["edge_alphas"],
+        tri_infos_list=outputs["tri_infos"],device=device
+    )
+    image_outputs_5 = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 4],edge_alphas_list=outputs["edge_alphas"],
+        tri_infos_list=outputs["tri_infos"],device=device
+    )
+
+    scalar_outputs = {"loss": loss,
+                      "loss_depth": loss_depth,
+                      "loss_alpha_sup": loss_alpha_sup}
+
     image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'], 
                     "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_0'][:, 0],
+                     "ref_img": sample["imgs"]['stage_1'][:, 3],
+                     "ref_img_2": sample["imgs"]['stage_1'][:, 4],
+                     "ref_img_edge_alpha_4": image_outputs_4["ref_img_edge_alpha"],
+                     "ref_img_edge_alpha_5": image_outputs_5["ref_img_edge_alpha"]
                      }
+
     if detailed_summary:
         image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
         image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * mask['stage_1']
@@ -301,8 +325,22 @@ def train_sample(sample, detailed_summary=False):
 
 
 @make_nograd_func
-def test_sample(sample, detailed_summary=True):
+def test_sample(sample, detailed_summary=True,global_step=0):
     model.eval()
+
+    # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+    # vertexs/list-of-arrays -> 转 tensor 并 to(device)
+    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    triangles_batch = []
+    for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+        tri_processed = []
+        for t in tri_list:
+            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+            l_ids = torch.from_numpy(t['line_ids']).to(device)
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+            tri_processed.append((v_ids, l_ids, pts))
+        triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
     skip = ["vertexs", "lines", "triangles"]
@@ -313,8 +351,7 @@ def test_sample(sample, detailed_summary=True):
 
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
-                    sample_cuda["vertexs"], sample_cuda["lines"],
-                    sample_cuda["triangles"])
+                    vertexs_batch, lines_batch,triangles_batch)
     
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]

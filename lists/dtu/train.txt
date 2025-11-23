@@ -42,8 +42,6 @@ scan84
 scan85
 scan87
 scan88
-scan89
-scan90
 scan91
 scan92
 scan93
