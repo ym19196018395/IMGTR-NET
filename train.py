@@ -3,7 +3,7 @@ import os
 
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -153,9 +153,11 @@ def train():
         global_step = len(TrainImgLoader) * epoch_idx
 
         # training 这个是一共多少批次，每批次的大小是batch-size
+        # ym-issue 为什么一开始会调用很多次trainimgloader呢
         for batch_idx, sample in enumerate(TrainImgLoader):
             start_time = time.time()
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
+            # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
             do_summary_image = global_step % (50*args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
@@ -220,6 +222,7 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     optimizer.zero_grad()
 
     # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+    # ym-issue 是不是可以不用这么早进行一个处理
     # vertexs/list-of-arrays -> 转 tensor 并 to(device)
     vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
     lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
@@ -253,18 +256,18 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask) # 深度损失
 
     # 1) EdgeConsistencyLoss（自监督 BCE）
-    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.02, feat_weight=0.0, smooth_weight=0.0)
+    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
     loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
-        pred_alpha_list=outputs["edge_alphas"],
-        # 1/2分辨率图
-        depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
-        tri_infos_list=outputs["tri_infos"],
+        pred_alphas_list=outputs["edge_alphas"],
+        # 1/2分辨率图的深度图
+        gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+        tri_infos=outputs["tri_infos"],
         feat_map=None,
-        tri_depths_list=None
     )
 
-    # 加上边断裂损失
-    loss_depth,loss_alpha_sup=normalized_loss_fusion(loss_depth,loss_alpha_sup, alpha_weight=3.0, beta_weight=1.0)
+    # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
+    weight_alpha=100
+    loss_alpha_sup=loss_alpha_sup*weight_alpha
     loss=loss_depth+loss_alpha_sup
 
     # 边断裂损失
@@ -273,16 +276,17 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     optimizer.step()
 
     # 生成图
-    # visualize_edges_to_tb(outputs["tri_infos"], writer=logger, global_step=global_step, tag_prefix='Edges')
+    image_outputs_0 = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+        edge_alphas_list=outputs["edge_alphas"],
+        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+        device=device,
+        overlay_alpha=0.8,  # 线条显示的透明度
+        line_thickness=1  # 线条粗细
+    )
 
-    image_outputs_4 = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 3],edge_alphas_list=outputs["edge_alphas"],
-        tri_infos_list=outputs["tri_infos"],device=device
-    )
-    image_outputs_5 = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 4],edge_alphas_list=outputs["edge_alphas"],
-        tri_infos_list=outputs["tri_infos"],device=device
-    )
+    ref_img=sample["imgs"]['stage_1'][:, 0]
+    ref_img_edge_alpha_0=image_outputs_0["ref_img_edge_alpha"]
 
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth,
@@ -293,10 +297,8 @@ def train_sample(sample, detailed_summary=False,global_step=0):
                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_1'][:, 3],
-                     "ref_img_2": sample["imgs"]['stage_1'][:, 4],
-                     "ref_img_edge_alpha_4": image_outputs_4["ref_img_edge_alpha"],
-                     "ref_img_edge_alpha_5": image_outputs_5["ref_img_edge_alpha"]
+                     "ref_img": sample["imgs"]['stage_1'][:, 0],
+                     "ref_img_edge_alpha_0": ref_img_edge_alpha_0
                      }
 
     if detailed_summary:

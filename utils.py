@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import torchvision.utils as vutils
 import torch
@@ -203,6 +204,7 @@ def tocuda(sample, device, skip_keys=None, non_blocking=True):
         sample[k] = _move(sample[k])
     return sample
 
+#====================ym-add==================================
 
 def bresenham_line(p1, p2):
     """Bresenham算法计算两点间所有像素坐标（(x, y)格式，x=列，y=行）"""
@@ -239,7 +241,6 @@ def bresenham_line(p1, p2):
         pixels.append((x, y))  # 加入终点像素
     return pixels
 
-
 def scale_pixel_coords(pixels, old_W, old_H, new_W, new_H):
     """
     缩放像素坐标（从(old_W, old_H)到(new_W, new_H)）
@@ -266,81 +267,205 @@ def scale_pixel_coords(pixels, old_W, old_H, new_W, new_H):
 
     return scaled_pixels
 
-
-def convert_to_tri_infos(vertexs, lines, triangles, H, W, device, scale_ratio=0.5):
+def norm_pixel_coords(pixels, old_W, old_H):
     """
-    适配数组/张量格式的lines（每个Line对应[ p1, p2, face1, face2 ]）
-
-    参数:
-        vertexs: np.ndarray, 形状 (Nv, 2)，顶点坐标 (x, y)
-        lines: np.ndarray/torch.Tensor, 形状 (Ne, 4)，每行对应[ p1, p2, face1, face2 ]
-               - 若为torch.Tensor，会自动转numpy处理
-        triangles: list, 每个元素为dict:
-            {
-                'vertex_ids': np.ndarray (3,), 三角形顶点ID
-                'line_ids': np.ndarray (3,), 三角形边ID
-                'valid_points': np.ndarray (M, 2), 三角形内像素 (x, y)
-            }
-        H/W: 图像尺寸
-        device: 计算设备
-
-    返回:
-        tri_infos: dict（格式同前）
+    归一化像素坐标
     """
+
+    scaled_pixels = []
+    for (x, y) in pixels:
+        # 归一化具体操作
+        x_norm = (x / max(old_W - 1, 1)) * 2.0 - 1.0
+        y_norm = (y / max(old_H - 1, 1)) * 2.0 - 1.0
+        scaled_pixels.append((x_norm, y_norm))
+
+    return scaled_pixels
+
+def convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device, scale_ratio=0.5):
+    """
+       适配数组/张量格式的lines，生成三角形的缩放后顶点、质心，以及缩放后的边信息
+
+       参数:
+           vertexs: np.ndarray, 形状 (Nv, 2)，顶点坐标 (x, y)（x=列，y=行）
+           lines: np.ndarray/torch.Tensor, 形状 (Ne, 4)，每行对应[ p1, p2, face1, face2 ]
+                  - 若为torch.Tensor，会自动转numpy处理
+           triangles: list, 每个元素为dict:
+               {
+                   'vertex_ids': np.ndarray (3,), 三角形顶点ID
+                   'line_ids': np.ndarray (3,), 三角形边ID
+                   'valid_points': np.ndarray (M, 2), 三角形内像素 (x, y)
+               }
+           H/W: 原始图像尺寸（高/宽）
+           device: 计算设备（此处仅为兼容参数，实际未使用）
+           scale_ratio: 缩放比例（默认0.5）
+
+       返回:
+           tri_infos: dict
+               {
+                   'num_tri': 三角形数量,
+                   'centroids': list of np.ndarray, 每个元素为(2,)，三角形缩放后的质心坐标 (x, y)
+                   'vertices': list of np.ndarray, 每个元素为(3,2)，三角形缩放后的三个顶点坐标
+                   'edges': list of dict, 每条边的缩放后信息（含tri_ids和edge_pixels）
+               }
+       """
     tri_infos = {
         'num_tri': len(triangles),
-        'tri_masks': [],
+        'centroids':[],
+        'vertices':[],
         'edges': []
     }
     new_H = int(H * scale_ratio)
     new_W = int(W * scale_ratio)
-    # -------------------------- 1. 生成缩放后的三角掩码（CPU→GPU） --------------------------
+
+    scale_x = scale_ratio       # x方向缩放因子
+    scale_y = scale_ratio       # y方向缩放因子
+
+    # -------------------------- 1. 每个三角形的顶点和和三角形的质点，并进行一个缩放 --------------------------
     for tri in triangles:
-        valid_points = tri['valid_points']  # 原始尺寸像素坐标 (x,y)
+        # 1.1 获取三角形的三个顶点ID对应的原始坐标
+        vertex_ids = tri['vertex_ids']  # (3,) 顶点ID数组
+        tri_vertices_original = vertexs[vertex_ids]  # (3, 2) 原始顶点坐标 (x, y)
 
-        if len(valid_points) > 0:
-            # 方案1：先缩小valid_points坐标，再生成小尺寸掩码（更省内存）
-            # 缩放valid_points到新尺寸
-            valid_points_scaled_x = (valid_points[:, 0] * scale_ratio).round().astype(np.int64)
-            valid_points_scaled_y = (valid_points[:, 1] * scale_ratio).round().astype(np.int64)
-            # 裁剪到新尺寸范围内
-            valid_points_scaled_x = np.clip(valid_points_scaled_x, 0, new_W - 1)
-            valid_points_scaled_y = np.clip(valid_points_scaled_y, 0, new_H - 1)
+        # 1.2 缩放顶点坐标（与边像素缩放逻辑一致）
+        tri_vertices_scaled = np.zeros_like(tri_vertices_original, dtype=np.float32)
+        tri_vertices_scaled[:, 0] = tri_vertices_original[:, 0] * scale_x  # x坐标缩放
+        tri_vertices_scaled[:, 1] = tri_vertices_original[:, 1] * scale_y  # y坐标缩放
+        # 可选：裁剪到目标尺寸范围内（防止越界）
+        tri_vertices_scaled[:, 0] = np.clip(tri_vertices_scaled[:, 0], 0, new_W - 1)
+        tri_vertices_scaled[:, 1] = np.clip(tri_vertices_scaled[:, 1], 0, new_H - 1)
 
-            # 在CPU上创建小尺寸numpy掩码
-            tri_mask_np = np.zeros((new_H, new_W), dtype=np.float32)
-            tri_mask_np[valid_points_scaled_y, valid_points_scaled_x] = 1.0  # y对应行，x对应列
+        # 1.3 计算三角形质心（质点）：三个顶点坐标的平均值
+        centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,) 原始质心
+        # 缩放质心坐标
+        centroid_scaled = np.array([
+            centroid_original[0] * scale_x,
+            centroid_original[1] * scale_y
+        ], dtype=np.float32)
+        # 可选：裁剪质心坐标
+        centroid_scaled[0] = np.clip(centroid_scaled[0], 0, new_W - 1)
+        centroid_scaled[1] = np.clip(centroid_scaled[1], 0, new_H - 1)
+
+        # 1.4 存入tri_infos
+        tri_infos['vertices'].append(tri_vertices_scaled)
+        tri_infos['centroids'].append(centroid_scaled)
 
 
-        else:
-            tri_mask_np = np.zeros((new_H, new_W), dtype=np.float32)
-
-        # 转成小尺寸GPU tensor（仅占用new_H*new_W内存，远小于原始尺寸）
-        tri_mask_tensor = torch.from_numpy(tri_mask_np).to(device)
-        tri_infos['tri_masks'].append(tri_mask_tensor)
-
-    # 堆叠为(N, new_H, new_W)的GPU tensor（此时尺寸已缩小，显存占用低）
-    # tri_infos['tri_masks'] = torch.stack(tri_infos['tri_masks'], dim=0)
-    # todo:非常严重的问题，显存爆了
-    # 新代码：分批次堆叠后拼接
-    stack_batch_size = 100
-    mask_list = tri_infos['tri_masks']  # 所有小尺寸掩码的列表
-    if len(mask_list) == 0:
-        tri_infos['tri_masks'] = torch.empty(0, new_H, new_W, device=device)
-    else:
-        # 分批次堆叠
-        stacked_batches = []
-        for i in range(0, len(mask_list), stack_batch_size):
-            # 取当前批次的掩码（i到i+stack_batch_size）
-            batch_masks = mask_list[i:i+stack_batch_size]
-            # 堆叠当前批次
-            batch_stacked = torch.stack(batch_masks, dim=0)
-            stacked_batches.append(batch_stacked)
-        # 拼接所有批次（最终形状和一次性stack一致）
-        tri_infos['tri_masks'] = torch.cat(stacked_batches, dim=0)
-
-    # -------------------------- 3. 处理边信息（按索引取值）缩放--------------------------
+    # -------------------------- 2. 处理边信息（按索引取值）缩放--------------------------
     # 将lines转为numpy数组（兼容tensor输入）
+
+    if isinstance(lines, torch.Tensor):
+        lines_np = lines.cpu().numpy()
+    else:
+        lines_np = lines
+
+    for line_arr in lines_np:
+        # 按索引取Line字段：[p1, p2, face1, face2]
+        v1_id = int(line_arr[0])  # 索引0 = p1
+        v2_id = int(line_arr[1])  # 索引1 = p2
+        face1 = int(line_arr[2])  # 索引2 = face1
+        face2 = int(line_arr[3])  # 索引3 = face2
+
+        # 处理face为无效值的情况（如None转成的-1或0）
+        tri_ids = []
+        if face1 != -1 and face1 is not None:  # 假设-1表示无相邻面
+            tri_ids.append(face1)
+        else: # 如果一条面为空，则给一个-1
+            tri_ids.append(-1)
+        if face2 != -1 and face2 is not None:
+            tri_ids.append(face2)
+        else:
+            tri_ids.append(-1)
+        tri_ids = tuple(tri_ids)
+
+        # 计算边的像素坐标
+        p1 = (vertexs[v1_id][0], vertexs[v1_id][1])
+        p2 = (vertexs[v2_id][0], vertexs[v2_id][1])
+        edge_pixels_original = bresenham_line(p1, p2)
+
+        # 归一化像素坐标供后续处理
+        edge_pixels_scaled = norm_pixel_coords(edge_pixels_original, W, H)
+
+        del edge_pixels_original
+        # 添加边信息
+        tri_infos['edges'].append({
+            'tri_ids': tri_ids,
+            'edge_pixels': edge_pixels_scaled,  # 存储缩放后的像素
+        })
+
+    return tri_infos
+
+def convert_to_tri_infos(vertexs, lines, triangles, H, W, device, scale_ratio=0.5):
+    """
+       适配数组/张量格式的lines，生成三角形的缩放后顶点、质心，以及缩放后的边信息
+
+       参数:
+           vertexs: np.ndarray, 形状 (Nv, 2)，顶点坐标 (x, y)（x=列，y=行）
+           lines: np.ndarray/torch.Tensor, 形状 (Ne, 4)，每行对应[ p1, p2, face1, face2 ]
+                  - 若为torch.Tensor，会自动转numpy处理
+           triangles: list, 每个元素为dict:
+               {
+                   'vertex_ids': np.ndarray (3,), 三角形顶点ID
+                   'line_ids': np.ndarray (3,), 三角形边ID
+                   'valid_points': np.ndarray (M, 2), 三角形内像素 (x, y)
+               }
+           H/W: 原始图像尺寸（高/宽）
+           device: 计算设备（此处仅为兼容参数，实际未使用）
+           scale_ratio: 缩放比例（默认0.5）
+
+       返回:
+           tri_infos: dict
+               {
+                   'num_tri': 三角形数量,
+                   'centroids': list of np.ndarray, 每个元素为(2,)，三角形缩放后的质心坐标 (x, y)
+                   'vertices': list of np.ndarray, 每个元素为(3,2)，三角形缩放后的三个顶点坐标
+                   'edges': list of dict, 每条边的缩放后信息（含tri_ids和edge_pixels）
+               }
+       """
+    tri_infos = {
+        'num_tri': len(triangles),
+        'centroids':[],
+        'vertices':[],
+        'edges': []
+    }
+    new_H = int(H * scale_ratio)
+    new_W = int(W * scale_ratio)
+
+    scale_x = scale_ratio       # x方向缩放因子
+    scale_y = scale_ratio       # y方向缩放因子
+
+    # -------------------------- 1. 每个三角形的顶点和和三角形的质点，并进行一个缩放 --------------------------
+    for tri in triangles:
+        # 1.1 获取三角形的三个顶点ID对应的原始坐标
+        vertex_ids = tri['vertex_ids']  # (3,) 顶点ID数组
+        tri_vertices_original = vertexs[vertex_ids]  # (3, 2) 原始顶点坐标 (x, y)
+
+        # 1.2 缩放顶点坐标（与边像素缩放逻辑一致）
+        tri_vertices_scaled = np.zeros_like(tri_vertices_original, dtype=np.float32)
+        tri_vertices_scaled[:, 0] = tri_vertices_original[:, 0] * scale_x  # x坐标缩放
+        tri_vertices_scaled[:, 1] = tri_vertices_original[:, 1] * scale_y  # y坐标缩放
+        # 可选：裁剪到目标尺寸范围内（防止越界）
+        tri_vertices_scaled[:, 0] = np.clip(tri_vertices_scaled[:, 0], 0, new_W - 1)
+        tri_vertices_scaled[:, 1] = np.clip(tri_vertices_scaled[:, 1], 0, new_H - 1)
+
+        # 1.3 计算三角形质心（质点）：三个顶点坐标的平均值
+        centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,) 原始质心
+        # 缩放质心坐标
+        centroid_scaled = np.array([
+            centroid_original[0] * scale_x,
+            centroid_original[1] * scale_y
+        ], dtype=np.float32)
+        # 可选：裁剪质心坐标
+        centroid_scaled[0] = np.clip(centroid_scaled[0], 0, new_W - 1)
+        centroid_scaled[1] = np.clip(centroid_scaled[1], 0, new_H - 1)
+
+        # 1.4 存入tri_infos
+        tri_infos['vertices'].append(tri_vertices_scaled)
+        tri_infos['centroids'].append(centroid_scaled)
+
+
+    # -------------------------- 2. 处理边信息（按索引取值）缩放--------------------------
+    # 将lines转为numpy数组（兼容tensor输入）
+
     if isinstance(lines, torch.Tensor):
         lines_np = lines.cpu().numpy()
     else:
@@ -372,6 +497,7 @@ def convert_to_tri_infos(vertexs, lines, triangles, H, W, device, scale_ratio=0.
 
         # 缩放边像素到目标尺寸
         edge_pixels_scaled = scale_pixel_coords(edge_pixels_original, W, H, new_W, new_H)
+
         del edge_pixels_original
         # 添加边信息
         tri_infos['edges'].append({
@@ -379,128 +505,59 @@ def convert_to_tri_infos(vertexs, lines, triangles, H, W, device, scale_ratio=0.
             'edge_pixels': edge_pixels_scaled,  # 存储缩放后的像素
         })
 
+
+
     return tri_infos
 
-def visualize_triangles_and_edges(tri_infos, save_path_tri, save_path_edges):
+def visualize_centroids_and_edges(tri_infos, H, W, save_path):
     """
-    可视化tri_infos中的三角形掩码和边像素
+    将三角形质心和边像素绘制在同一张图上（支持手动传入H,W）
 
     参数:
-        tri_infos: 转换得到的tri_infos字典
-        save_path_tri: 三角形可视化图片保存路径（如"triangles.png"）
-        save_path_edges: 边可视化图片保存路径（如"edges.png"）
+        tri_infos: 转换得到的tri_infos字典（含centroids、edges）
+        H: 图片高度（用户手动指定）
+        W: 图片宽度（用户手动指定）
+        save_path: 最终可视化图片保存路径（如"centroids_edges.png"）
     """
-    # 获取图像尺寸 (H, W)
-    H = tri_infos['tri_masks'].shape[1]
-    W = tri_infos['tri_masks'].shape[2]
+    # -------------------------- 创建画布 --------------------------
+    # 创建白色背景的RGB图片（尺寸为W×H，对应图像的宽和高）
+    img = Image.new('RGB', (W, H), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # -------------------------- 1. 绘制边像素（先画边，后画质心，质心更显眼） --------------------------
+    edge_color = (0, 0, 255)  # 边用蓝色，可根据需要调整
+    for edge in tri_infos['edges']:
+        edge_pixels = edge['edge_pixels']
+        for (x, y) in edge_pixels:
+            # 确保坐标在用户指定的H,W范围内
+            if 0 <= x < W and 0 <= y < H:
+                draw.point((x, y), fill=edge_color)
+
+    # -------------------------- 2. 绘制三角形质心（含标记和ID） --------------------------
     num_tri = tri_infos['num_tri']
-    num_edges = len(tri_infos['edges'])
-
-    # -------------------------- 1. 可视化三角形掩码 --------------------------
-    # 创建空白RGB图片（白色背景）
-    img_tri = Image.new('RGB', (W, H), color=(255, 255, 255))
-    draw_tri = ImageDraw.Draw(img_tri)
-
-    # 为每个三角形生成随机颜色（半透明效果，避免完全覆盖）
-    tri_colors = [
-        (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+    # 为每个质心生成唯一颜色（深色系，避免与蓝色边冲突）
+    centroid_colors = [
+        (random.randint(0, 100), random.randint(100, 200), random.randint(0, 100))  # 绿/红色系
         for _ in range(num_tri)
     ]
 
-    # 遍历每个三角形，绘制掩码区域
-    for tri_id in range(num_tri):
-        # 获取当前三角形的掩码（转为CPU numpy数组）
-        tri_mask = tri_infos['tri_masks'][tri_id].cpu().numpy()
-        # 找到掩码中值为1的像素坐标（y, x）
-        y_coords, x_coords = np.where(tri_mask == 1.0)
-        # 遍历像素并绘制（用随机颜色）
-        color = tri_colors[tri_id]
-        for x, y in zip(x_coords, y_coords):
-            # 确保坐标在有效范围内（防止越界）
-            if 0 <= x < W and 0 <= y < H:
-                draw_tri.point((x, y), fill=color)
+    for tri_id, centroid in enumerate(tri_infos['centroids']):
+        cx, cy = int(centroid[0]), int(centroid[1])
+        color = centroid_colors[tri_id]
 
-    # 保存三角形图片
-    img_tri.save(save_path_tri)
-    print(f"三角形可视化图片已保存至: {save_path_tri}")
+        # 绘制质心标记：外圆（直径8像素）+ 实心点（增强辨识度）
+        if 0 <= cx < W and 0 <= cy < H:
+            draw.ellipse([cx - 1, cy - 1, cx + 1, cy + 1], outline=color, width=1)  # 外圆
+            draw.point((cx, cy), fill=color)  # 中心点
 
-    # -------------------------- 2. 可视化边像素 --------------------------
-    # 创建空白RGB图片（白色背景）
-    img_edges = Image.new('RGB', (W, H), color=(255, 255, 255))
-    draw_edges = ImageDraw.Draw(img_edges)
-
-    # 为每条边生成随机颜色
-    edge_colors = [
-        (0, 0, 255)
-        for _ in range(num_edges)
-    ]
-
-    # 遍历每条边，绘制边像素
-    for edge_id, edge in enumerate(tri_infos['edges']):
-        edge_pixels = edge['edge_pixels']  # list of (x, y)
-        color = edge_colors[edge_id]
-        for (x, y) in edge_pixels:
-            # 确保坐标在有效范围内
-            if 0 <= x < W and 0 <= y < H:
-                draw_edges.point((x, y), fill=color)
-
-    # 保存边图片
-    img_edges.save(save_path_edges)
-    print(f"边可视化图片已保存至: {save_path_edges}")
-
-
-# 简单版：把 tri_infos 的边像素画成图片并直接上传到 TensorBoard
-def visualize_edges_to_tb(tri_infos_list, writer, global_step, tag_prefix='Edges'):
-    """
-    简单：把每个 sample 的 edges (edge_pixels) 画到白底图上并写入 TensorBoard
-    - tri_infos_list: list, batch 的 tri_infos（如果是单个 dict，也可传 [tri_infos]）
-      每个 tri_infos 需包含 'tri_masks'（用于推 H,W）和 'edges'（edge dict 包含 'edge_pixels' 列表）
-      edge_pixels 格式按你原先：[(x,y), ...]
-    - writer: torch.utils.tensorboard.SummaryWriter 实例
-    - global_step: int
-    - tag_prefix: tensorboard 的标签前缀
-    """
-    if not isinstance(tri_infos_list, list):
-        tri_infos_list = [tri_infos_list]
-
-    for b, tri_infos in enumerate(tri_infos_list):
-        # 从 tri_infos 获得尺寸（按你原代码）
-        H = tri_infos['tri_masks'].shape[1]
-        W = tri_infos['tri_masks'].shape[2]
-
-        # 白底 RGB 图
-        img = Image.new('RGB', (W, H), (255, 255, 255))
-        draw = ImageDraw.Draw(img)
-
-        edges = tri_infos.get('edges', [])
-        # 固定颜色：蓝色 (B,G,R)
-        color = (0, 0, 255)
-
-        for edge in edges:
-            # 支持 edge 为 dict 或 tuple；优先取 edge_pixels 字段
-            if isinstance(edge, dict):
-                pixs = edge.get('edge_pixels', None)
-            else:
-                pixs = None
-            if not pixs:
-                continue
-            for (x, y) in pixs:
-                # 简单边界检查，避免越界报错
-                if 0 <= x < W and 0 <= y < H:
-                    draw.point((x, y), fill=color)
-
-        # 转 numpy HWC uint8，然后写到 tensorboard（dataformats='HWC'）
-        np_img = np.array(img)  # shape (H, W, 3), dtype uint8
-        writer.add_image(f"{tag_prefix}/edges_{b}", np_img, global_step, dataformats='HWC')
-
-    # 不返回复杂内容，按你要求只上传到 tensorboard
-    return
-
+    # -------------------------- 保存图片 --------------------------
+    img.save(save_path)
+    print(f"质心+边可视化图片已保存至: {save_path}")
 
 def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W, device,scale_ratio=0.5):
     """
-    批量转换多个样本（适配顶点坐标为(x, y)格式）
-
+    批量转换多个样本（适配顶点坐标为(x, y)格式）,
+    并对其进行一个格式调整归一化等等,用来传入预测头
     参数:
         vertexs_batch: list of tensor, 每个元素为单个样本的顶点（已to(device)，形状(Nv, 2)，(x, y)）
         lines_batch: list of tensor, 每个元素为单个样本的边（已to(device)，形状(Ne, 2)，(v1_id, v2_id)）
@@ -513,9 +570,16 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
         device: 计算设备
 
     返回:
-        tri_infos_batch: list of dict, 每个元素为单个样本的tri_infos
+    tri_infos: list length B, 每项为 dict:
+                {
+                    'batch_num_tri': int,三角形的数量
+                    'centroids': [B,n_tri,2] 每个三角形的质点
+                    'vertices': [B,n_tri,3,2] 每个三角形的顶点
+                    'edges_list' :进行了一个归一化处理边像素点集合,以及其邻接面，去除掉了单邻接面的线段
+                    boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                }
     """
-    tri_infos_batch = []
+    tri_infos_batch_normal = []
     for b in range(len(vertexs_batch)):
         # 1. 提取单个样本数据（从tensor转回numpy处理坐标）
         vertexs = vertexs_batch[b].cpu().numpy()  # (Nv, 2)，(x, y)
@@ -534,410 +598,295 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
             })
 
         # 3. 转换为tri_infos格式,并且进行一个缩放
-        tri_info = convert_to_tri_infos(vertexs, lines, triangles, H, W, device)
-        tri_infos_batch.append(tri_info)
+        scale_ratio = 0.5
+        # 将边像素转化为normal，目的是给后面预测头用
+        tri_info_normal = convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device,scale_ratio)
+        tri_infos_batch_normal.append(tri_info_normal)
 
-        # 4. 可视化并保存，正常
-        visualize_triangles_and_edges(
-            tri_info,
-            save_path_tri="triangles_visual_tensor.png",
-            save_path_edges="edges_visual_tensor.png"
-        )
+        # # 4. 可视化并保存，正常
+        # # 将边像素缩小，目的是测试用输出图片
+        # tri_info=convert_to_tri_infos(vertexs, lines, triangles, H, W, device,scale_ratio)
+        # visualize_centroids_and_edges(
+        #     tri_info,int(H*scale_ratio),int(W*scale_ratio),
+        #     save_path="edges_visual_tensor{}.png".format(b)
+        # )
 
-    return tri_infos_batch
+    # 5) 将 tri_infos 的 centroids / vertices 转为统一的 padded tensor
+    #    并做归一化到 后续的 grid_sample 要求的 [-1,1]（注意 x 对应宽 W，y 对应高 H）
+    #    知道断裂边的位置
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+    batch_num_tri = []
+    centers_list = []
+    vertices_list = []
+    edges_list = []  # 临时存储每个样本的 edges，已经处理完毕的，去除掉了单邻接面的线段
+    edges_pixels=[] # 存储着每个线段的像素已经做归一化处理
+    boundary_local_idxs_per_batch = []  # 存储着断裂边，也就是只有一个面的边
 
-def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, tri_infos_list,
-                                 out_key='ref_img_edge_alpha', image_outputs=None,
-                                 overlay_alpha=0.6, cmap='jet', device=None):
-    """
-    生成 edge alpha 的 heatmap overlay 并写入 image_outputs[out_key]
-    - ref_imgs: torch.Tensor, shape [B, C, H, W] or [B, H, W] (C can be 1 or 3)
-                值可以是 0..1 或 0..255（函数会自动归一化到 0..1）
-    - edge_alphas_list: list length B, each is tensor or ndarray of shape [E] (alpha in 0..1)
-    - tri_infos_list: list length B, 每项 dict 至少包含 'edges'（list），
-                      优先使用 edges[i]['edge_pixels']（list of (y,x)）
-                      退回方案：使用 tri_infos['tri_masks']（tensor [N,H,W] 或 list）
-    - out_key: 保存到 image_outputs 的键名
-    - image_outputs: dict （若为 None 会创建一个新的 dict 并返回）
-    - overlay_alpha: heatmap 覆盖原图时的透明度（0~1）
-    - cmap: matplotlib colormap 名称
-    - device: torch device 用于返回 tensor，默认取 ref_imgs.device
-    返回:
-      image_outputs (dict) ，并把 overlay tensor 存在 image_outputs[out_key]
-      overlay shape: torch.FloatTensor [B, 3, H, W], 值范围 0..1
-    """
+    for b in range(len(vertexs_batch)):
+        info = tri_infos_batch_normal[b]
+        # 取出 lists
+        centroids_py = info.get('centroids', [])  # list of np.ndarray (2,)
+        vertices_py = info.get('vertices', [])  # list of np.ndarray (3,2)
+        edges_py = info.get('edges', [])  # list of dicts with 'tri_ids'
 
-    if image_outputs is None:
-        image_outputs = {}
+        n_tri = len(centroids_py)
+        batch_num_tri.append(n_tri)
 
-    if device is None:
-        device = ref_imgs.device if isinstance(ref_imgs, torch.Tensor) else torch.device('cpu')
+        # 将 centroids 转为 numpy array (n_tri, 2)，若为空则用 zeros
+        if n_tri == 0:
+            cent_np = np.zeros((0, 2), dtype=np.float32)
+            vert_np = np.zeros((0, 3, 2), dtype=np.float32)
+        else:
+            # centroids_py 每项形如 (2,)
+            cent_np = np.stack([np.asarray(c, dtype=np.float32) for c in centroids_py], axis=0)  # [n_tri,2]
+            # vertices_py 每项形如 (3,2)
+            vert_np = np.stack([np.asarray(v, dtype=np.float32) for v in vertices_py], axis=0)  # [n_tri,3,2]
 
-    # 规范 ref_imgs 到 numpy float 0..1，保留 batch
-    if isinstance(ref_imgs, torch.Tensor):
-        imgs = ref_imgs.detach().cpu()
-    else:
-        imgs = torch.from_numpy(np.array(ref_imgs))
+        # 归一化: 分别对顶点和质点进行一个归一化，为了后续用双线性插值采样
+        # x_norm = (x / (W-1)) * 2 - 1 ; y_norm = (y / (H-1)) * 2 - 1
+        if cent_np.shape[0] > 0:
+            x = cent_np[:, 0]
+            y = cent_np[:, 1]
+            # 归一化具体操作
+            x_norm = (x / max(W - 1, 1)) * 2.0 - 1.0
+            y_norm = (y / max(H - 1, 1)) * 2.0 - 1.0
+            cent_norm = np.stack([x_norm, y_norm], axis=1)  # [n_tri,2]
+        else:
+            cent_norm = cent_np.reshape(0, 2)
 
-    # imgs shape handling
-    # 如果是 [B, H, W] -> 变为 [B,1,H,W]
-    if imgs.dim() == 3:
-        imgs = imgs.unsqueeze(1)
-    B, C, H, W = imgs.shape
+        if vert_np.shape[0] > 0:
+            vx = vert_np[:, :, 0]
+            vy = vert_np[:, :, 1]  # [n_tri,3]
+            vx_norm = (vx / max(W - 1, 1)) * 2.0 - 1.0
+            vy_norm = (vy / max(H - 1, 1)) * 2.0 - 1.0
+            vert_norm = np.stack([vx_norm, vy_norm], axis=2)  # [n_tri,3,2]
+        else:
+            vert_norm = vert_np.reshape(0, 3, 2)
 
-    # 归一化图片到 0..1 float
-    imgs_np = imgs.clone().float()
-    if imgs_np.max() > 1.1:
-        imgs_np = imgs_np / 255.0
-    imgs_np = imgs_np.numpy()  # numpy for blending with matplotlib cmap output
+        centers_list.append(torch.from_numpy(cent_norm).float())  # [n_tri,2]
+        vertices_list.append(torch.from_numpy(vert_norm).float())  # [n_tri,3,2]
 
-    # 结果容器
-    overlays = np.zeros((B, 3, H, W), dtype=np.float32)
-
-    cmap_func = plt.get_cmap(cmap)
-
-    for b in range(B):
-        # 1) 生成空 alpha_map (H,W)
-        alpha_map = np.zeros((H, W), dtype=np.float32)
-
-        # 得到 edge_alphas (E,)
-        alphas = edge_alphas_list[b]
-        if isinstance(alphas, torch.Tensor):
-            alphas = alphas.detach().cpu().numpy()
-        alphas = np.asarray(alphas).astype(np.float32)
-
-        tri_infos = tri_infos_list[b]
-
-        # 2) 优先使用 edges[].edge_pixels（每条边的像素列表）
-        edges_data = tri_infos.get('edges', None)
-        used_pixels = False
-        if edges_data is not None and len(edges_data) > 0:
-            # 判断第一个 edge entry 是否为 dict 且包含 'edge_pixels'
-            if isinstance(edges_data[0], dict) and ('edge_pixels' in edges_data[0]):
-                used_pixels = True
-                for ei, e in enumerate(edges_data):
-                    pixs = e.get('edge_pixels', None)
-                    if not pixs:
-                        continue
-                    arr = np.array(pixs, dtype=np.int32)
-                    if arr.size == 0:
-                        continue
-                    xs = arr[:, 0]; ys = arr[:, 1]
-                    a = float(alphas[ei]) if ei < len(alphas) else 0.0
-                    # 若多个边写到同一像素，取最大值，避免覆盖掉强 alpha
-                    alpha_map[ys, xs] = np.maximum(alpha_map[ys, xs], a)
-
-        # 3) 回退：若没有 edge_pixels，则使用 tri_masks 找跨三角边像素
-        if not used_pixels:
-            # tri_masks 可以是 tensor [N,H,W] 或 list of masks
-            tri_masks = tri_infos.get('tri_masks', None)
-            if tri_masks is None:
-                raise ValueError("tri_infos 中既没有 'edge_pixels' 也没有 'tri_masks'，无法构建 alpha 映射")
-            # 把 tri_masks 转为 numpy [N,H,W]
-            if isinstance(tri_masks, list):
-                tri_masks_np = np.stack([m.astype(np.int8) if isinstance(m, np.ndarray) else m.numpy().astype(np.int8)
-                                         for m in tri_masks], axis=0)
+        # 处理 edges：把 tri_ids 提取成 (E_b,2) 的 LongTensor（局部索引）
+        edge_ids = []
+        # 记录本 sample 内为 boundary 的边在 edge_ids 中的局部索引
+        boundary_local_idxs = []
+        pixels=[]
+        for ed in edges_py:
+            # 获取每个线段的归一化像素集
+            pixels.append(ed.get('edge_pixels', None))
+            # 支持 ed 为 dict 或 tuple/list
+            if isinstance(ed, dict):
+                tid = ed.get('tri_ids', None)
             else:
-                # 可能为 torch tensor
-                if isinstance(tri_masks, torch.Tensor):
-                    tri_masks_np = tri_masks.detach().cpu().numpy()
-                else:
-                    tri_masks_np = np.array(tri_masks)
-            # tri_id_map via argmax (若有重叠，argmax 取第一个最大的)
-            if tri_masks_np.shape[0] == 0:
-                # 没有三角，保持 alpha_map 全 0
-                pass
-            else:
-                tri_id_map = np.argmax(tri_masks_np, axis=0).astype(np.int32)  # [H,W]
-                # edge list: tri_infos['edges'] 给出 tri_ids 对应的顺序，我们按 edges 列表索引获取 alpha
-                # 构造一个 map from (t1,t2) -> alpha value
-                pair_to_alpha = {}
-                for ei, e in enumerate(edges_data):
-                    if isinstance(e, dict):
-                        tid = e.get('tri_ids', None)
-                        if tid is None:
-                            continue
-                        t1, t2 = int(tid[0]), int(tid[1])
-                    else:
-                        t1, t2 = int(e[0]), int(e[1])
-                    # 规范 (min,max) 以便查找
-                    pair_to_alpha[(t1, t2)] = float(alphas[ei]) if ei < len(alphas) else 0.0
-                    pair_to_alpha[(t2, t1)] = pair_to_alpha[(t1, t2)]
-                # 找右邻和下邻跨三角像素，将对应 alpha 填到 alpha_map
-                left = tri_id_map[:, :-1]; right = tri_id_map[:, 1:]
-                diff_mask_r = (left != right)
-                if diff_mask_r.any():
-                    ys, xs = np.where(diff_mask_r)
-                    t_left = left[ys, xs]; t_right = right[ys, xs]
-                    for y, x, tl, tr in zip(ys, xs, t_left, t_right):
-                        alpha_map[y, x] = max(alpha_map[y, x], pair_to_alpha.get((int(tl), int(tr)), 0.0))
-                up = tri_id_map[:-1, :]; down = tri_id_map[1:, :]
-                diff_mask_d = (up != down)
-                if diff_mask_d.any():
-                    ys, xs = np.where(diff_mask_d)
-                    t_up = up[ys, xs]; t_down = down[ys, xs]
-                    for y, x, tu, td in zip(ys, xs, t_up, t_down):
-                        alpha_map[y, x] = max(alpha_map[y, x], pair_to_alpha.get((int(tu), int(td)), 0.0))
-
-        # 4) alpha_map 现在是 coarse/full-res 对应的像素位置（假设与 ref_img 分辨率一致）
-        #    将 alpha_map 限制到 [0,1]
-        alpha_map = np.clip(alpha_map, 0.0, 1.0)
-
-        # 5) 用 colormap 映射 alpha_map -> RGB (float 0..1)
-        heatmap = cmap_func(alpha_map)[:, :, :3]  # shape [H,W,3]
-
-        # 6) 获取背景图（ref image）并确保为 float 0..1
-        bg = imgs_np[b]  # shape [C,H,W]
-        # 转为 H,W,3
-        if bg.shape[0] == 1:
-            bg_rgb = np.stack([bg[0]]*3, axis=2)  # [H,W,3]
-        else:
-            bg_rgb = bg.transpose(1,2,0)  # [H,W,3]
-        if bg_rgb.max() > 1.1:
-            bg_rgb = bg_rgb / 255.0
-
-        # 7) overlay
-        overlay = bg_rgb * (1.0 - overlay_alpha) + heatmap * overlay_alpha
-        overlay = np.clip(overlay, 0.0, 1.0)
-
-        # 8) 存回 overlays 容器（CHW）
-        overlays[b] = overlay.transpose(2,0,1)
-
-    # 转回 torch tensor [B,3,H,W] float 0..1，在指定 device 上
-    overlays_t = torch.from_numpy(overlays).float().to(device)
-
-    # 写入 image_outputs
-    image_outputs[out_key] = overlays_t
-
-    return image_outputs
-
-
-
-def visualize_edges_with_alpha(tri_infos_list, edge_alphas_list,
-                               ref_imgs=None,    # optional: torch.Tensor [B,C,H,W] or None
-                               overlay_alpha=0.6,
-                               cmap_name='RdYlGn_r',
-                               device=None,
-                               verbose=False):
-    """
-    用颜色（绿->黄->红）可视化每条边的断裂概率 alpha（越红表示越“断裂”）。
-    - tri_infos_list: list length B，每项为 tri_infos dict（含 'num_tri','tri_masks' 或 'edges'）
-    - edge_alphas_list: list length B，每项 tensor or ndarray shape [E_b]（alpha in [0,1]）
-    - ref_imgs: optional 原图 tensor [B, C, H, W]（C 1 或 3），若提供则返回 overlay tensor 也会被归一化到 0..1
-    - out_key: 用于写回 image_outputs 的键名（如果你集成到 image_outputs）
-    - overlay_alpha: 覆盖透明度（heatmap 覆盖到原图时）
-    - device: 返回 overlay tensor 的 device（默认与 ref_imgs 相同或 cpu）
-    - 返回: (pil_images, overlay_tensor or None)
-        - pil_images: list 长度 B，每项 PIL.Image RGB
-        - overlay_tensor: 若 ref_imgs 提供，返回 torch.FloatTensor [B,3,H,W], 值 0..1；否则 None
-    """
-    assert isinstance(tri_infos_list, list), "tri_infos_list must be a list (batch)"
-    B = len(tri_infos_list)
-    cmap = plt.get_cmap(cmap_name)
-
-    # 处理 ref_imgs 和尺寸信息
-    if ref_imgs is not None:
-        if isinstance(ref_imgs, torch.Tensor):
-            imgs_t = ref_imgs.detach().cpu()
-        else:
-            imgs_t = torch.from_numpy(np.array(ref_imgs))
-        if imgs_t.dim() == 3:   # [H,W] -> [1,1,H,W]
-            imgs_t = imgs_t.unsqueeze(0).unsqueeze(1)
-        if imgs_t.dim() == 4 and imgs_t.shape[1] in (1,3):
-            pass
-        else:
-            raise ValueError("ref_imgs must be [B,C,H,W] with C=1 or 3 or None")
-        B_img, C, H, W = imgs_t.shape
-        assert B_img == B, "ref_imgs batch size must match tri_infos_list length"
-        # 规范到 0..1 float numpy
-        imgs_np = imgs_t.clone().float().numpy()
-        if imgs_np.max() > 1.1:
-            imgs_np = imgs_np / 255.0
-    else:
-        # 没有 ref_imgs 时，从 tri_infos 中尝试读取 tri_masks 的尺寸作为 H,W
-        # 若无法获得尺寸则报错
-        sample_info = tri_infos_list[0]
-        tm = sample_info.get('tri_masks', None)
-        if tm is None:
-            raise ValueError("没有传入 ref_imgs，且 tri_infos 中也没有 tri_masks 可推断尺寸，请传入 ref_imgs 或 tri_masks")
-        if isinstance(tm, list):
-            H, W = tm[0].shape
-        else:
-            H, W = tm.shape[1], tm.shape[2]
-        imgs_np = None
-
-    # 结果容器
-    pil_images = []
-    overlays_tensor = None
-    if ref_imgs is not None:
-        overlays = np.zeros((B, 3, H, W), dtype=np.float32)
-
-    # 主循环：生成每张图的 pixel-level alpha_map（每像素取覆盖到该像素的最大 alpha）
-    for b in range(B):
-        tri_infos = tri_infos_list[b]
-        alphas = edge_alphas_list[b]
-        if isinstance(alphas, torch.Tensor):
-            alphas = alphas.detach().cpu().numpy()
-        alphas = np.asarray(alphas).astype(np.float32)
-        H_local = H; W_local = W
-
-        # 初始化 per-pixel alpha map（0..1）
-        alpha_map = np.zeros((H_local, W_local), dtype=np.float32)
-        # 如果你想也保留每像素对应的 edge id，可建立一个 int map（-1 表示无边）
-        # edge_id_map = -1 * np.ones((H_local, W_local), dtype=np.int32)
-
-        edges_data = tri_infos.get('edges', None)
-        used_pixels = False
-        if edges_data is not None and len(edges_data) > 0 and isinstance(edges_data[0], dict) and ('edge_pixels' in edges_data[0]):
-            used_pixels = True
-            # 逐边写入（以 numpy vector 化方式尽量加速）
-            for ei, e in enumerate(edges_data):
-                pixs = e.get('edge_pixels', None)
-                if not pixs:
-                    continue
-                arr = np.array(pixs, dtype=np.int64)  # shape (K,2) 可能为 (x,y) 或 (y,x)
-                if arr.ndim != 2 or arr.shape[1] < 2:
-                    continue
-                xs = arr[:, 0].copy()
-                ys = arr[:, 1].copy()
-                # 自动检测并修正 (x,y) vs (y,x)
-                # 若 xs.max() > W-1 but ys.max() <= W-1 and ys.max() <= H-1 => 很可能原来是 (y,x)，交换
-                if (xs.max() >= W_local or ys.max() >= H_local) and not (ys.max() >= W_local or xs.max() >= H_local):
-                    # 交换
-                    xs, ys = ys, xs
-                # clip 防止越界
-                xs = np.clip(xs, 0, W_local - 1)
-                ys = np.clip(ys, 0, H_local - 1)
-                if xs.size == 0:
-                    continue
-                a = float(alphas[ei]) if ei < len(alphas) else 0.0
-                # 多个边覆盖同一像素时取最大 alpha（突出最严重）
-                # 由于可能存在重复像素索引，我们先以一维索引方式处理以减少 Python 循环
-                idx_1d = ys * W_local + xs
-                # current values
-                cur_vals = alpha_map.reshape(-1)
-                # 用最大值赋值： cur[idx] = max(cur[idx], a)
-                # 为减少 Python 循环，使用 numpy.maximum.at
-                np.maximum.at(cur_vals, idx_1d, a)
-                alpha_map = cur_vals.reshape(H_local, W_local)
-        else:
-            # 退回：使用 tri_masks -> tri_id_map -> 边对映射
-            tri_masks = tri_infos.get('tri_masks', None)
-            if tri_masks is None:
-                # 无 edge_pixels 且无 tri_masks，跳过
-                if verbose:
-                    print(f"[visualize_edges] tri_infos[{b}] 没有 'edge_pixels' 也没有 'tri_masks'，跳过该样本")
-                pil_images.append(Image.new('RGB', (W_local, H_local), color=(255,255,255)))
-                if ref_imgs is not None:
-                    overlays[b] = np.stack([np.zeros((H_local,W_local))]*3, axis=0)
+                tid = ed
+            if tid is None:
                 continue
-            # 把 tri_masks 变为 numpy [N,H,W]
-            if isinstance(tri_masks, list):
-                tri_masks_np = np.stack([m.astype(np.uint8) if isinstance(m, np.ndarray) else m.numpy().astype(np.uint8)
-                                         for m in tri_masks], axis=0)
+            t1, t2 = int(tid[0]), int(tid[1])
+
+            # 三种情形：
+            # 1) 两侧面都存在 (常规)：加入 [t1, t2]
+            # 2) 只有一侧存在（boundary）：加入 [t_valid, t_valid] 并记录为 boundary（稍后把 alpha 设为 1）
+            # 3) 两侧都不存在（非法）,则警告
+            valid1 = (0 <= t1 < n_tri)
+            valid2 = (0 <= t2 < n_tri)
+
+            if valid1 and valid2:
+                edge_ids.append([t1, t2])
+            elif valid1 and not valid2:
+                edge_ids.append([t1, t1])
+                boundary_local_idxs.append(len(edge_ids) - 1)
+            elif valid2 and not valid1:
+                edge_ids.append([t2, t2])
+                boundary_local_idxs.append(len(edge_ids) - 1)
             else:
-                tri_masks_np = tri_masks.detach().cpu().numpy()
-            if tri_masks_np.shape[0] == 0:
-                # 没有三角
-                pil_images.append(Image.new('RGB', (W_local, H_local), color=(255,255,255)))
-                if ref_imgs is not None:
-                    overlays[b] = np.stack([np.zeros((H_local,W_local))]*3, axis=0)
-                continue
-            tri_id_map = np.argmax(tri_masks_np, axis=0).astype(np.int32)  # [H,W]
-            # 构建 (t1,t2)->alpha 的映射（考虑双向）
-            pair_to_alpha = {}
-            for ei, e in enumerate(edges_data):
-                if isinstance(e, dict):
-                    tid = e.get('tri_ids', None)
-                    if tid is None:
-                        continue
-                    t1, t2 = int(tid[0]), int(tid[1])
-                else:
-                    t1, t2 = int(e[0]), int(e[1])
-                a = float(alphas[ei]) if ei < len(alphas) else 0.0
-                pair_to_alpha[(t1, t2)] = a
-                pair_to_alpha[(t2, t1)] = a
-            # 找横向和纵向邻接不等处
-            left = tri_id_map[:, :-1]; right = tri_id_map[:, 1:]
-            diff_r = (left != right)
-            if diff_r.any():
-                ys, xs = np.where(diff_r)
-                for y, x in zip(ys, xs):
-                    tL = int(left[y, x]); tR = int(right[y, x])
-                    a = pair_to_alpha.get((tL, tR), 0.0)
-                    alpha_map[y, x] = max(alpha_map[y, x], a)
-            up = tri_id_map[:-1, :]; down = tri_id_map[1:, :]
-            diff_d = (up != down)
-            if diff_d.any():
-                ys, xs = np.where(diff_d)
-                for y, x in zip(ys, xs):
-                    tU = int(up[y, x]); tD = int(down[y, x])
-                    a = pair_to_alpha.get((tU, tD), 0.0)
-                    alpha_map[y, x] = max(alpha_map[y, x], a)
+                # 两侧都非法，有问题
+                raise RuntimeError("一条直线没有相邻三角形")
 
-        # clamp
-        alpha_map = np.clip(alpha_map, 0.0, 1.0)
-
-        # 用 colormap 将 alpha_map -> RGB (float 0..1)
-        heat_rgb = cmap(alpha_map)[:, :, :3]  # shape [H,W,3] float 0..1
-
-        if ref_imgs is not None:
-            bg = imgs_np[b]
-            if bg.shape[0] == 1:
-                bg_rgb = np.stack([bg[0]]*3, axis=2)  # [H,W,3]
-            else:
-                bg_rgb = bg.transpose(1,2,0)  # [H,W,3]
-            if bg_rgb.max() > 1.1:
-                bg_rgb = bg_rgb / 255.0
-            overlay = np.clip(bg_rgb * (1.0 - overlay_alpha) + heat_rgb * overlay_alpha, 0.0, 1.0)
-            overlays[b] = overlay.transpose(2,0,1)  # CHW
-            pil_img = Image.fromarray((overlay * 255).astype(np.uint8))
+        if len(edge_ids) == 0:
+            edges_list.append(torch.zeros((0, 2), dtype=torch.long))
         else:
-            # 仅显示 heat map
-            pil_img = Image.fromarray((heat_rgb * 255).astype(np.uint8))
+            edges_list.append(torch.tensor(edge_ids, dtype=torch.long))
+        edges_pixels.append(pixels)
+        boundary_local_idxs_per_batch.append(boundary_local_idxs)
 
-        pil_images.append(pil_img)
+    new_tri_infos = []
+    new_tri_infos.append({
+        'batch_num_tri': batch_num_tri,
+        'centers_list': centers_list,
+        'vertices_list': vertices_list,
+        'edges_list': edges_list,
+        'edges_pixels': edges_pixels,
+        'boundary_local_idxs_per_batch': boundary_local_idxs_per_batch
+    })
 
-    # 输出 overlay tensor
-    overlay_tensor = None
-    if ref_imgs is not None:
-        overlay_tensor = torch.from_numpy(overlays).float().to(device if device is not None else ref_imgs.device)
+    return new_tri_infos
 
-    return pil_images, overlay_tensor
-
-
-def normalized_loss_fusion(loss_depth, loss_alpha_sup, alpha_weight=3.0, beta_weight=1.0, eps=1e-8):
+# --------------------------------------------
+# 通用采样函数：对三角形的 (质心 + 3个顶点) 进行采样并取平均
+# sample_points: [B, N_max, 4, 2] -> reshape 为 [B, N*4, 1, 2] 供 grid_sample 使用
+# --------------------------------------------
+def _sample_map(map_tensor, centers, vertices):
     """
-    归一化损失融合：先消除量级差异，再按 alpha:beta = 3:1 加权
+    通用采样函数：对三角形的 (质心 + 3个顶点) 进行采样并取平均。
+
     Args:
-        loss_depth: 深度损失（范围大的损失）
-        loss_alpha_sup: alpha监督损失（范围小的损失）
-        alpha_weight: 深度损失权重（默认3）
-        beta_weight: alpha损失权重（默认1）
-        eps: 防止分母为0的微小值
+        map_tensor: [B, C, H, W] (可以是图像特征，也可以是深度图)
+        centers:    [B, N, 1, 2] (归一化坐标 -1 到 1)
+        vertices:   [B, N, 3, 2] (归一化坐标 -1 到 1)
+
     Returns:
-        total_loss: 归一化后融合的总损失
+        tri_feats:  [B, N, C] 采样并平均后的特征
     """
-    # 1. 动态归一化：用批次内的“均值+标准差”标准化（适配损失范围动态变化）
-    # 若损失是标量（单值），直接用自身做归一化；若为批量tensor，用批次统计
-    if loss_depth.dim() > 0:  # 批量tensor（如[B,]）
-        depth_mean = loss_depth.mean()
-        depth_std = loss_depth.std() + eps
-        loss_depth_norm = (loss_depth - depth_mean) / depth_std
-    else:  # 标量tensor
-        loss_depth_norm = loss_depth / (loss_depth.abs() + eps)  # 归一到[-1,1]附近
+    B_local = map_tensor.shape[0]
+    C_map = map_tensor.shape[1]
+    N = centers.shape[1]
 
-    if loss_alpha_sup.dim() > 0:
-        alpha_mean = loss_alpha_sup.mean()
-        alpha_std = loss_alpha_sup.std() + eps
-        loss_alpha_norm = (loss_alpha_sup - alpha_mean) / alpha_std
+    # 拼接 1 + 3 = 4 个点
+    sample_pts = torch.cat([centers, vertices], dim=2)  # [B, N, 4, 2]
+    # reshape 为 grid_sample 要求的 grid： [B, N*4, 1, 2]
+    grid = sample_pts.view(B_local, N * 4, 1, 2).contiguous()
+    # grid_sample -> out [B, C_map, N*4, 1]
+    sampled = F.grid_sample(map_tensor, grid, align_corners=False, mode='bilinear', padding_mode='border')
+    # 采样完之后恢复原状，变为每个三角形关于这个四点特征的矩阵 -> [B, C_map, N, 4]，
+    sampled = sampled.view(B_local, C_map, N, 4).contiguous()
+    # 将四个点特征取一个平均 -> [B, C_map, N] -> permute -> [B, N, C_map]
+    tri_feats = sampled.mean(dim=3).permute(0, 2, 1).contiguous()
+    return tri_feats  # [B, N, C_map]
+
+
+def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, device='cpu', overlay_alpha=0.7,
+                                 line_thickness=2):
+    """
+    基于真实边像素(edges_pixels)生成断裂预测热力图。
+
+    Args:
+        ref_imgs: [B, 3, H, W] 输入图像 Tensor (标准化过的或0-1)
+        edge_alphas_list: list len=B, 元素为 Tensor [E], 预测的断裂概率
+        edges_pixels_list: list len=B, 元素为 list len=E (每条边的像素集合).
+                           结构: batch_list[ edge_list[ pixel_list[(x,y),...] ] ]
+                           注意：假设 pixel 坐标是 (x, y) 格式，适配 OpenCV。
+        device: 输出 Tensor 的设备
+        overlay_alpha: 叠加透明度
+        line_thickness: 线条粗细 (建议设为2，看的更清楚)
+
+    Returns:
+        dict: {"ref_img_edge_alpha": tensor [B, 3, H, W] uint8}
+    """
+
+    batch_size = ref_imgs.shape[0]
+
+    # 结果容器
+    output_tensor_list = []
+
+    # 1. 预计算色盘 (0~255) -> BGR
+    # 使用 JET Colormap: 0(蓝) -> 0.5(青/黄) -> 1(红)
+    colormap_lut = np.zeros((256, 1, 3), dtype=np.uint8)
+    for i in range(256):
+        colormap_lut[i, 0] = np.array([i, i, i])
+    colormap_lut = cv2.applyColorMap(colormap_lut, cv2.COLORMAP_JET).squeeze(1)
+
+    for b in range(batch_size):
+        # --- A. 准备底图 ---
+        img_tensor = ref_imgs[b].detach().cpu()
+
+        # 反归一化处理 (简单 MinMax 归一化到 0-255，确保可视化正常)
+        if img_tensor.min() < 0:
+            img_tensor = img_tensor - img_tensor.min()
+            img_tensor = img_tensor / (img_tensor.max() + 1e-6)
+
+        # [C, H, W] -> [H, W, C] -> uint8 numpy
+        img_np = (img_tensor.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+        # 格式统转 BGR (OpenCV 默认)
+        if img_np.shape[2] == 1:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+        else:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        H, W, _ = img_np.shape
+
+        # --- B. 准备画板 ---
+        # 创建纯黑层用于画线
+        overlay_layer = np.zeros_like(img_np)
+
+        # 获取当前 Batch 数据
+        # edges_pixels: List[List[Tuple(x,y)]]
+        curr_pixels_list = edges_pixels_list[b]
+        # alphas: Tensor [E]
+        curr_alphas = edge_alphas_list[b].detach().cpu().numpy()
+
+        num_edges = len(curr_pixels_list)
+        # 安全检查：如果边数量和预测数量不一致，取最小值防止越界
+        safe_len = min(num_edges, len(curr_alphas))
+
+        # --- C. 遍历画线 ---
+        for i in range(safe_len):
+            prob = curr_alphas[i]
+            pixels = curr_pixels_list[i]  # [(x1,y1), (x2,y2), ...]
+
+            # 过滤：概率太小的边(完全连通)可以选择不画，或者画得很淡
+            # 这里设置 > 0.05 才画，保持画面干净
+            if prob < 0.05 or len(pixels) == 0:
+                continue
+
+            # 颜色映射: 0.0 -> Blue, 1.0 -> Red
+            color_idx = int(np.clip(prob * 255, 0, 255))
+            color = colormap_lut[color_idx].tolist()  # (B, G, R)
+
+            # 1. 转为 numpy float 数组
+            pts_norm = np.array(pixels, dtype=np.float32) # shape [N, 2]
+
+            # 2. 根据归一化类型转换
+            # 情况 A: 如果坐标范围是 [-1, 1] (PyTorch grid_sample 标准)
+            # x_real = (x_norm + 1) / 2 * (W - 1)
+            pts_x = (pts_norm[:, 0] + 1) * (W - 1) / 2.0
+            pts_y = (pts_norm[:, 1] + 1) * (H - 1) / 2.0
+
+            # 3. 组合并取整
+            pts_real = np.stack([pts_x, pts_y], axis=1).astype(np.int32)
+
+            # 4. Reshape 为 cv2.polylines 需要的 (N, 1, 2)
+            pts_to_draw = pts_real.reshape((-1, 1, 2))
+
+            # 绘制
+            cv2.polylines(overlay_layer, [pts_to_draw], isClosed=False, color=color, thickness=line_thickness,
+                          lineType=cv2.LINE_AA)
+
+        # --- D. 图像融合 ---
+        # 只有画了线的地方才有 mask
+        mask = np.any(overlay_layer > 0, axis=-1)
+
+        # 融合: Original * (1-alpha) + Overlay * alpha
+        final_img = img_np.copy()
+
+        # 使用 addWeighted 会让整体变暗，我们只混合 Mask 区域
+        weighted_overlay = cv2.addWeighted(img_np, 1.0 - overlay_alpha, overlay_layer, overlay_alpha, 0)
+
+        final_img[mask] = weighted_overlay[mask]
+
+        # --- E. 转回 Tensor ---
+        # HWC -> CHW
+        final_tensor = torch.from_numpy(final_img).permute(2, 0, 1).to(torch.float32)
+        output_tensor_list.append(final_tensor)
+
+    # 堆叠 Batch
+    if len(output_tensor_list) > 0:
+        output_stack = torch.stack(output_tensor_list).to(device)
     else:
-        loss_alpha_norm = loss_alpha_sup / (loss_alpha_sup.abs() + eps)
+        # 如果 batch 为空或出错，返回全黑
+        output_stack = torch.zeros_like(ref_imgs).to(torch.uint8).to(device)
 
-    # 2. 按 3:1 权重融合（此时两者量级一致，权重直接对应占比）
+    return {"ref_img_edge_alpha": output_stack}
 
-    return alpha_weight * loss_depth_norm,alpha_weight * loss_depth_norm
+# 检查tensor是否有问题，并报错
+def check_tensor(name, t):
+    if not isinstance(t, torch.Tensor):
+        return
+    if torch.isnan(t).any():
+        print(f"[NaN CHECK] {name} contains NaN; shape={tuple(t.shape)}")
+        # 打印少量元素供定位
+        print(getattr(t, 'detach', lambda : t)().cpu().flatten()[:20])
+        raise RuntimeError(f"NaN found in {name}")
+    if torch.isinf(t).any():
+        print(f"[NaN CHECK] {name} contains Inf; shape={tuple(t.shape)}")
+        raise RuntimeError(f"Inf found in {name}")

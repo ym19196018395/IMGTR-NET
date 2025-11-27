@@ -193,9 +193,10 @@ class MVSDataset(Dataset):
             depth_filename_hr = os.path.join(self.datapath, 'Depths/Depths/{}/depth_map_{:0>4}.pfm'.format(scan, vid))
             proj_mat_filename = os.path.join(self.datapath, 'Cameras_1/train/{:0>8}_cam.txt').format(vid)
 
+            # ym-modify 因为vid是从零开始 而图片是从1开始所以要加个1
             triangulation_filename = os.path.join(self.datapath,
                                                   'Rectified/{}_train/triangulation/CDTinfo/CDT_info_vlf_rect_{:03d}_1_r5000.txt'.format(
-                                                      scan, vid))
+                                                      scan, vid+1))
             imgs = self.read_img(img_filename)
             imgs_0.append(imgs['stage_0'])
             imgs_1.append(imgs['stage_1'])
@@ -242,11 +243,11 @@ class MVSDataset(Dataset):
                     depth[f'stage_{l}'] = np.expand_dims(depth[f'stage_{l}'],2)
                     depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
 
-                # ym-add 获取参考图三角网数据
-                img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid)
+                # ym-add 获取参考图三角网数据 这里vid需要加1 因为是从零开始
+                img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
                 W=imgs_0[0].shape[1]
                 H=imgs_0[0].shape[0]
-                print("{}--------{}".format(scan,vid))
+                print("{}--------{}".format(scan,vid+1))
                 cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
 
         # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致
