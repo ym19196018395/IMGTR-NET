@@ -53,75 +53,6 @@ class EdgeHead(nn.Module):
         # 可学习缩放，用来调节 sigmoid 输入尺度（训练稳定）
         self.register_parameter("edge_scale", nn.Parameter(torch.tensor(1.0)))
 
-    # todo:三角掩码图片大小问题要进行额外处理
-    def _masked_pool_triangles(self, feat_map, tri_masks):
-        """
-        对单张图做 tri_masks 的 masked average pool
-        聚合成一个向量tri_feat，类似于一个超像素
-        feat_resized → [128, 512, 512] → feat_flat → [262144, 128]；
-        tri_masks → [300, 262144] → tri_sum = [300, 128] → tri_mean = [300,128].
-        Args:
-          feat_map: [C', Hf, Wf]  单张图投影后的特征 (torch.Tensor)
-          tri_masks: [N, H, W]    三角掩码 (torch.Tensor 或 list)
-        Returns:
-          tri_feats: [N, C']  每个三角的 pooled 特征
-        注意：
-          - 若 feat_map 分辨率与 tri_masks 分辨率不同，会把 feat_map 先上/下采样到 tri_masks 大小
-        """
-        C = feat_map.shape[0]
-        # tri_masks 支持 list 或 tensor
-        if isinstance(tri_masks, list):
-            tri_masks = torch.stack([m.float() for m in tri_masks], dim=0)  # [N,H,W]
-        else:
-            tri_masks = tri_masks.float()
-
-        N, Hm, Wm = tri_masks.shape
-        # 把 feat_map resize 到 (Hm, Wm) ym-need-modify
-        _,H,W =feat_map.shape
-        # 如果三角掩码和特征大小不同，就进行一个适配
-        if Hm != H or Wm != W:
-            feat_map = F.interpolate(feat_map.unsqueeze(0), size=(Hm, Wm), mode='bilinear', align_corners=False)[0]  # [C,Hm,Wm]
-
-        feat_flat = feat_map.view(C, -1).permute(1,0)  # [Hm*Wm, C]
-        # ym-question对于一个像素点都没有的小三角形
-        mask_flat = tri_masks.view(N, -1).float()          # [N, Hm*Wm]
-        # tri_sum = mask_flat @ feat_flat  -> [N, C]
-        # 每个三角在空间维度对 feature 做加权求和
-        tri_sum = torch.matmul(mask_flat, feat_flat)       # [N, C]
-        counts = mask_flat.sum(dim=1).clamp(min=1.0).unsqueeze(1)  # [N,1]
-        tri_mean = tri_sum / counts                         # [N, C]
-        return tri_mean  # [N, C]
-
-    def _masked_pool_depth(self, depth_map, tri_masks):
-        """
-        对单张图的深度做 tri_masks 的平均，得到每个三角的 mean depth
-        Args:
-          depth_map: [1,H,W] 或 [H,W]
-          tri_masks: [N,H,W]
-        Returns:
-          tri_depths: [N] tensor
-        """
-        if depth_map.dim() == 3:
-            depth = depth_map[0]
-        else:
-            depth = depth_map
-        if isinstance(tri_masks, list):
-            tri_masks = torch.stack([m.float() for m in tri_masks], dim=0)
-        N, Hm, Wm = tri_masks.shape
-        # 把 depth_map resize 到 (Hm, Wm), 因为interpolate至少需要3d，要符合bchw的话需要变为四维
-
-        H,W =depth.shape
-        if Hm != H or Wm != W:
-            depth = depth.unsqueeze(0).unsqueeze(0)
-            depth = F.interpolate(depth,size=(Hm, Wm), mode='nearest')[0][0]
-
-        depth_flat = depth.contiguous().view(-1)  # [HW]
-        mask_flat = tri_masks.view(N, -1).float()  # [N, HW]
-        tri_sum = torch.matmul(mask_flat, depth_flat)  # [N]
-        counts = mask_flat.sum(dim=1).clamp(min=1.0)
-        tri_mean = tri_sum / counts
-        return tri_mean  # [N]
-
     def forward(self, feat, img, depth_map, tri_infos):
         """
         EdgeHead.forward（兼容原始 tri_infos 格式）
@@ -136,12 +67,25 @@ class EdgeHead(nn.Module):
                     'vertices_list': [B,n_tri,3,2] 每个三角形的顶点，已进行归一化处理
                     'edges_list' :每个边的邻接面，
                     'edges_pixels': 每个边的像素（归一化）集合，后续需要引入作为一个特征传入mlp中
-                    boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                    'boundary_local_idxs_per_batch': 存储着断裂边，也就是只有一个面的边
                 }
         Returns:
             output_alphas_list: list length B, 每项是 torch.Tensor shape [E_b]，类型 float，位于 feat.device 上
             tri_infos：已经处理完毕的数据
         """
+        # --------------------------------------------
+        # 0) 清洗数据
+        # --------------------------------------------
+        # 很多时候是 Backbone 炸了导致这里接收到 NaN
+        if torch.isnan(feat).any() or torch.isinf(feat).any():
+            print("Warning: Backbone features contain NaN/Inf. Cleaning...")
+            feat = feat.clone()
+            feat[torch.isnan(feat)] = 0.0
+            feat[feat == float('inf')] = 0.0
+            feat[feat == -float('inf')] = 0.0
+            # 截断特征值，防止过大导致 MLP 爆炸
+            feat = torch.clamp(feat, min=-100.0, max=100.0)
+
         # --------------------------------------------
         # 1) 基本准备：device / dims
         # --------------------------------------------
@@ -193,6 +137,19 @@ class EdgeHead(nn.Module):
         batch_centers = torch.stack(centers_padded, dim=0).to(device=device)  # float
         batch_vertices = torch.stack(vertices_padded, dim=0).to(device=device)  # float
 
+        # ym-modify 验证点数据是否有问题，没问题
+        # if torch.isnan(batch_centers).any() or torch.isinf(batch_centers).any():
+        #     print("Warning: centers features contain NaN/Inf. ")
+        #     # 这种情况下通常无法修复，只能报错或填充0
+        #     # 为了跑通，将其设为 0 (采样左上角)
+        #     batch_centers[torch.isnan(batch_centers)] = 0.0
+        #
+        # if torch.isnan(batch_vertices).any() or torch.isinf(batch_vertices).any():
+        #     print("Warning: vertices features contain NaN/Inf. ")
+        #     # 这种情况下通常无法修复，只能报错或填充0
+        #     # 为了跑通，将其设为 0 (采样左上角)
+        #     batch_vertices[torch.isnan(batch_vertices)] = 0.0
+
         # --------------------------------------------
         # 3) 采样三角特征和三角深度（在统一尺度 和设备上）
         # --------------------------------------------
@@ -213,6 +170,7 @@ class EdgeHead(nn.Module):
         clean_depth_map = torch.clamp(clean_depth_map, min=0.0, max=2000.0)
 
         check_tensor('clean_depth_map', clean_depth_map)
+        # check_tensor('feat-map',feat_proj)
 
         tri_feats_map = _sample_map(feat_proj, batch_centers, batch_vertices)  # [B, N_max, D]
         # 深度采样 ym-issue 之后替换成共享边
@@ -252,9 +210,10 @@ class EdgeHead(nn.Module):
         all_edges_indices = torch.cat(all_edges_global, dim=0).long().to(device=device)
 
         # ym-need-modify 11.26 后续可能要将断裂概率求完损失函数再固定，或者是预测头给面id为-1设置一个空的深度
-        # ym-issue 这里经过展平之后只有第一批次才会出现为-1的三角面，后面的根本就不会，因为加了一个之前的步长
+        # 这里不存在-1的id，只会存在两个id相同的情况，之前处理完毕，所以求特征差也是等于0
 
         # 分别取边的相邻两个三角面的编号
+
         idx1 = all_edges_indices[:, 0]
         idx2 = all_edges_indices[:, 1]
 
@@ -267,7 +226,11 @@ class EdgeHead(nn.Module):
         # --------------------------------------------
         # 5) 构造 MLP 输入并预测 alpha
         # --------------------------------------------
+
         depth_diff = torch.abs(d1 - d2)  # [Total_E, 1]
+        # 比如我们认为超过 1000 的差异和 10000 的差异对“断裂”来说是一样的
+        depth_diff = torch.clamp(depth_diff, max=500.0)
+
         # ym-need-modify 需要加入边特征，为了更好的求断裂边概率
         mlp_input = torch.cat([f1, f2, depth_diff], dim=1)  # [Total_E, 2D+1]
 

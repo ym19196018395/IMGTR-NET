@@ -162,14 +162,17 @@ def train():
             do_summary_image = global_step % (50*args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,global_step=global_step)
+            loss_depth=scalar_outputs['loss_depth']
+            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
             if do_summary_image:
                 save_images(logger, 'train', image_outputs, global_step)
             del scalar_outputs, image_outputs
+
             print(
-                'Epoch {}/{}, Iter {}/{}, train loss = {:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
-                                                                                     len(TrainImgLoader), loss,
+                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
+                                                                                     len(TrainImgLoader),loss_depth,loss_alpha_sup,loss,
                                                                                      time.time() - start_time))
 
         # checkpoint
@@ -256,37 +259,40 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask) # 深度损失
 
     # 1) EdgeConsistencyLoss（自监督 BCE）
-    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
-    loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
-        pred_alphas_list=outputs["edge_alphas"],
-        # 1/2分辨率图的深度图
-        gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
-        tri_infos=outputs["tri_infos"],
-        feat_map=None,
-    )
+    # edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
+    # loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
+    #     pred_alphas_list=outputs["edge_alphas"],
+    #     # 1/2分辨率图的深度图
+    #     gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+    #     tri_infos=outputs["tri_infos"],
+    #     feat_map=None,
+    # )
 
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
     weight_alpha=100
-    loss_alpha_sup=loss_alpha_sup*weight_alpha
+    # loss_alpha_sup=loss_alpha_sup*weight_alpha
+    loss_alpha_sup = 0.0
     loss=loss_depth+loss_alpha_sup
 
     # 边断裂损失
     loss.backward()
+
+    # 【新增】梯度裁剪 (必须加在 step 之前)
+    # max_norm 通常设为 0.1 到 1.0 之间，建议先试 1.0
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
     # 生成图
-    image_outputs_0 = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
-        edge_alphas_list=outputs["edge_alphas"],
-        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
-        device=device,
-        overlay_alpha=0.8,  # 线条显示的透明度
-        line_thickness=1  # 线条粗细
-    )
-
-    ref_img=sample["imgs"]['stage_1'][:, 0]
-    ref_img_edge_alpha_0=image_outputs_0["ref_img_edge_alpha"]
+    # image_outputs_0 = generate_edge_alpha_overlays(
+    #     ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+    #     edge_alphas_list=outputs["edge_alphas"],
+    #     edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+    #     device=device,
+    #     overlay_alpha=0.8,  # 线条显示的透明度
+    #     line_thickness=1  # 线条粗细
+    # )
 
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth,
@@ -297,8 +303,8 @@ def train_sample(sample, detailed_summary=False,global_step=0):
                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_1'][:, 0],
-                     "ref_img_edge_alpha_0": ref_img_edge_alpha_0
+                     "ref_img": sample["imgs"]['stage_1'][:, 0]
+                     # "ref_img_edge_alpha_0": ref_img_edge_alpha_0
                      }
 
     if detailed_summary:

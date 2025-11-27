@@ -693,6 +693,7 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
             if valid1 and valid2:
                 edge_ids.append([t1, t2])
             elif valid1 and not valid2:
+                # 这里进行一个处理，如果只有一个三角面，就将唯一的三角面赋值给两个id
                 edge_ids.append([t1, t1])
                 boundary_local_idxs.append(len(edge_ids) - 1)
             elif valid2 and not valid1:
