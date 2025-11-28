@@ -77,14 +77,14 @@ class EdgeHead(nn.Module):
         # 0) 清洗数据
         # --------------------------------------------
         # 很多时候是 Backbone 炸了导致这里接收到 NaN
-        if torch.isnan(feat).any() or torch.isinf(feat).any():
-            print("Warning: Backbone features contain NaN/Inf. Cleaning...")
-            feat = feat.clone()
-            feat[torch.isnan(feat)] = 0.0
-            feat[feat == float('inf')] = 0.0
-            feat[feat == -float('inf')] = 0.0
-            # 截断特征值，防止过大导致 MLP 爆炸
-            feat = torch.clamp(feat, min=-100.0, max=100.0)
+        # if torch.isnan(feat).any() or torch.isinf(feat).any():
+        #     print("Warning: Backbone features contain NaN/Inf. Cleaning...")
+        #     feat = feat.clone()
+        #     feat[torch.isnan(feat)] = 0.0
+        #     feat[feat == float('inf')] = 0.0
+        #     feat[feat == -float('inf')] = 0.0
+        #     # 截断特征值，防止过大导致 MLP 爆炸
+        #     feat = torch.clamp(feat, min=-100.0, max=100.0)
 
         # --------------------------------------------
         # 1) 基本准备：device / dims

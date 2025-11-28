@@ -148,7 +148,7 @@ class PatchmatchNet(nn.Module):
         self.upsample_net = Refinement()
 
         # ym—need-modify 后面可能需要加入传播里面
-        # self.edge_head = EdgeHead(num_features[1])
+        self.edge_head = EdgeHead(num_features[1])
 
     def forward(self, imgs, proj_matrices, depth_min, depth_max,vertexs,lines,triangles):
         
@@ -235,15 +235,15 @@ class PatchmatchNet(nn.Module):
         # 因为评估数据还没有进行处理，所以评估数据进行一个跳过,ym-need-modify
         tri_infos=[]
         edge_alphas,edge_mats=[],[]
-        # if self.training:
-        #     _, _, height, width = depth.size()
-        #     device = depth.get_device()
-        #     # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
-        #     # 因为传入的是原分辨率的三角信息，在里面会进行一个1/2的缩放
-        #     tri_infos = batch_convert_to_tri_infos(vertexs, lines, triangles, height*2 , width*2 , device)
-        #     # 操作是在1 / 2分辨率下面进行,少了一个edge—mat
-        #     ref_stage1_feature=ref_feature['stage_1'].detach()
-        #     edge_alphas = self.edge_head(ref_stage1_feature, img=None, depth_map=depth, tri_infos=tri_infos)
+        if self.training:
+            _, _, height, width = depth.size()
+            device = depth.get_device()
+            # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
+            # 因为传入的是原分辨率的三角信息，在里面会进行一个1/2的缩放
+            tri_infos = batch_convert_to_tri_infos(vertexs, lines, triangles, height*2 , width*2 , device)
+            # 操作是在1 / 2分辨率下面进行,少了一个edge—mat
+            ref_stage1_feature=ref_feature['stage_1'].detach()
+            edge_alphas = self.edge_head(ref_stage1_feature, img=None, depth_map=depth, tri_infos=tri_infos)
 
         # step 3. Refinement  
         depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
