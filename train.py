@@ -47,7 +47,7 @@ parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint
 parser.add_argument('--logdir', default='./checkpoints/debug', help='the directory to save checkpoints/logs')
 parser.add_argument('--resume', action='store_true', help='continue to train the model')
 
-parser.add_argument('--summary_freq', type=int, default=20, help='print and summary frequency')
+parser.add_argument('--summary_freq', type=int, default=10, help='print and summary frequency')
 parser.add_argument('--save_freq', type=int, default=1, help='save checkpoint frequency')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed')
 
@@ -96,7 +96,7 @@ MVSDataset = find_dataset_def(args.dataset)
 if args.dataset == 'dtu_yao':
     train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 5, robust_train=True)
     test_dataset = MVSDataset(args.valpath, args.vallist, "val", 5,  robust_train=False)
-
+# 进行了一个修改，对于有些数据不进行默认collate
 TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=8, drop_last=True)
 TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,num_workers=4, drop_last=False)
 
@@ -183,26 +183,26 @@ def train():
                 'optimizer': optimizer.state_dict()},
                 "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
 
-        # testing
-        avg_test_scalars = DictAverageMeter()
-        for batch_idx, sample in enumerate(TestImgLoader):
-            start_time = time.time()
-            global_step = len(TrainImgLoader) * epoch_idx + batch_idx
-            do_summary = global_step % args.summary_freq == 0
-            # do_summary_test = global_step % (10*args.summary_freq) == 0
-            do_summary_image = global_step % (50*args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
-            if do_summary:
-                save_scalars(logger, 'test', scalar_outputs, global_step)
-            if do_summary_image:
-                save_images(logger, 'test', image_outputs, global_step)
-            avg_test_scalars.update(scalar_outputs)
-            del scalar_outputs, image_outputs
-            print('Epoch {}/{}, Iter {}/{}, test loss = {:.3f}, time = {:3f}'.format(epoch_idx, args.epochs, batch_idx,
-                                                                                     len(TestImgLoader), loss,
-                                                                                     time.time() - start_time))
-        save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
-        print("avg_test_scalars:", avg_test_scalars.mean())
+        # testing  暂时不测试 ym-need-modify
+        # avg_test_scalars = DictAverageMeter()
+        # for batch_idx, sample in enumerate(TestImgLoader):
+        #     start_time = time.time()
+        #     global_step = len(TrainImgLoader) * epoch_idx + batch_idx
+        #     do_summary = global_step % args.summary_freq == 0
+        #     # do_summary_test = global_step % (10*args.summary_freq) == 0
+        #     do_summary_image = global_step % (50*args.summary_freq) == 0
+        #     loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
+        #     if do_summary:
+        #         save_scalars(logger, 'test', scalar_outputs, global_step)
+        #     if do_summary_image:
+        #         save_images(logger, 'test', image_outputs, global_step)
+        #     avg_test_scalars.update(scalar_outputs)
+        #     del scalar_outputs, image_outputs
+        #     print('Epoch {}/{}, Iter {}/{}, test loss = {:.3f}, time = {:3f}'.format(epoch_idx, args.epochs, batch_idx,
+        #                                                                              len(TestImgLoader), loss,
+        #                                                                              time.time() - start_time))
+        # save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
+        # print("avg_test_scalars:", avg_test_scalars.mean())
         # gc.collect()
 
 
@@ -290,7 +290,7 @@ def train_sample(sample, detailed_summary=False,global_step=0):
         edge_alphas_list=outputs["edge_alphas"],
         edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
         device=device,
-        overlay_alpha=0.8,  # 线条显示的透明度
+        overlay_alpha=0.6,  # 线条显示的透明度
         line_thickness=1  # 线条粗细
     )
     ref_img_edge_alpha_0 = image_outputs_0["ref_img_edge_alpha"]

@@ -145,9 +145,6 @@ class MVSDataset(Dataset):
         return depth_lr_ms
 
 
-
-
-
     def __getitem__(self, idx):
         # 这里是对应的一组数据包括一张参考图加几张源图
         meta = self.metas[idx]
