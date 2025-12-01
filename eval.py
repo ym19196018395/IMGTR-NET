@@ -1,6 +1,9 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+
+from datasets.dtu_yao import collate_keep_list
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -27,6 +30,7 @@ parser = argparse.ArgumentParser(description='Predict depth, filter, and fuse')
 parser.add_argument('--model', default='PatchmatchNet', help='select model')
 
 parser.add_argument('--dataset', default='dtu_yao_eval', help='select dataset')
+# ym-modify 11.30 测试路径和训练路径一样
 parser.add_argument('--testpath', help='testing data path')
 parser.add_argument('--testlist', help='testing scan list')
 
@@ -112,7 +116,8 @@ def save_depth():
     # dataset, dataloader
     MVSDataset = find_dataset_def(args.dataset)
     test_dataset = MVSDataset(args.testpath, args.testlist, "test", args.n_views)
-    TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+    # 进行了一个修改，对于有些数据不进行默认collate
+    TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4,collate_fn=collate_keep_list, drop_last=False)
 
     # model
     model = PatchmatchNet(patchmatch_interval_scale=args.patchmatch_interval_scale,
@@ -133,22 +138,66 @@ def save_depth():
     with torch.no_grad():
         for batch_idx, sample in enumerate(TestImgLoader):
             start_time = time.time()
-            sample_cuda = tocuda(sample)
+
+            # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
+            # ym-issue 是不是可以不用这么早进行一个处理
+            # vertexs/list-of-arrays -> 转 tensor 并 to(device)
+            vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+            lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+            triangles_batch = []
+            for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+                tri_processed = []
+                for t in tri_list:
+                    v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+                    l_ids = torch.from_numpy(t['line_ids']).to(device)
+                    pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+                    tri_processed.append((v_ids, l_ids, pts))
+                triangles_batch.append(tri_processed)
+
+            # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
+            skip = ["vertexs", "lines", "triangles"]
+            sample_cuda = tocuda(sample, device=device, skip_keys=skip)
+
             outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], 
-                            sample_cuda["depth_min"], sample_cuda["depth_max"])
+                            sample_cuda["depth_min"], sample_cuda["depth_max"],
+                            vertexs_batch, lines_batch,triangles_batch)
             
             outputs = tensor2numpy(outputs)
             del sample_cuda
             print('Iter {}/{}, time = {:.3f}'.format(batch_idx, len(TestImgLoader), time.time() - start_time))
             filenames = sample["filename"]
 
-            
-            
+            # 【新增】获取原图数据 (CPU numpy)
+            # sample["imgs"]['stage_1'] 通常是 [B, 3, H, W] 的 Tensor
+            # 取出当前 batch 的所有图片，并转为 numpy
+            ref_imgs_cpu = sample["imgs"]['stage_1'][:, 0].cpu().numpy()
+
+            # 获取 edge 相关数据
+            edge_alphas_batch = outputs["edge_alphas"] # list of arrays
+            tri_infos_batch = outputs["tri_infos"]     # list of dicts
+            # 【新增】PNG 保存路径
+            edge_alphas_filename = os.path.join(args.outdir, filenames[0].format('edge_prob', '.png'))
+            os.makedirs(edge_alphas_filename.rsplit('/', 1)[0], exist_ok=True)
+            # 【新增】保存断裂预测图 (PNG)
+            # 获取当前这张图的数据
+            curr_ref_img = ref_imgs_cpu[0]  # [3, H, W] numpy
+            curr_edge_alphas = edge_alphas_batch[0]  # [E] numpy
+            # 你的 tri_infos 可能是 Tensor 结构，tensor2numpy 后可能要把 list 里的 tensor 也转了
+            curr_edge_pixels = tri_infos_batch[0]['edges_pixels'][0]
+
+            save_edge_prob_map(
+                save_path=edge_alphas_filename, ref_img=curr_ref_img,
+                edge_alphas=curr_edge_alphas, edge_pixels=curr_edge_pixels,
+                overlay_alpha=0.7, line_thickness=1
+            )
+
             # save depth maps and confidence maps
-            for filename, depth_est, photometric_confidence in zip(filenames, outputs["refined_depth"]['stage_0'],
+            for (filename, depth_est, photometric_confidence) in zip(filenames, outputs["refined_depth"]['stage_0'],
                                                                 outputs["photometric_confidence"]):
                 depth_filename = os.path.join(args.outdir, filename.format('depth_est', '.pfm'))
                 confidence_filename = os.path.join(args.outdir, filename.format('confidence', '.pfm'))
+
+                # 保存 depth 和 confidence
                 os.makedirs(depth_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(confidence_filename.rsplit('/', 1)[0], exist_ok=True)
                 # save depth maps
@@ -156,6 +205,8 @@ def save_depth():
                 save_pfm(depth_filename, depth_est)
                 # save confidence maps
                 save_pfm(confidence_filename, photometric_confidence)
+
+
                 
 
 
@@ -222,28 +273,29 @@ def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth
     return mask, depth_reprojected, x2d_src, y2d_src
 
 
-def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_depth_thres, photo_thres, img_wh):
+def filter_depth(root_folder, out_folder,plyfilename, geo_pixel_thres, geo_depth_thres, photo_thres, img_wh,scan):
     # the pair file
-    pair_file = os.path.join(scan_folder, "pair.txt")
+    pair_file = os.path.join(root_folder, "Cameras_1/pair.txt")
     # for the final point cloud
     vertexs = []
     vertex_colors = []
 
     pair_data = read_pair_file(pair_file)
     nviews = len(pair_data)
-    original_w = 1600
-    original_h = 1200
+    # ym-modify 暂时用低分辨率图
+    original_w = 640
+    original_h = 512
     
 
     # for each reference view and the corresponding source views
     for ref_view, src_views in pair_data:
         # load the camera parameters
         ref_intrinsics, ref_extrinsics = read_camera_parameters(
-            os.path.join(scan_folder, 'cams_1/{:0>8}_cam.txt'.format(ref_view)))
+            os.path.join(root_folder, 'Cameras_1/train/{:0>8}_cam.txt'.format(ref_view)))
         ref_intrinsics[0] *= img_wh[0]/original_w
         ref_intrinsics[1] *= img_wh[1]/original_h
         # load the reference image
-        ref_img = read_img(os.path.join(scan_folder, 'images/{:0>8}.jpg'.format(ref_view)), img_wh)
+        ref_img = read_img(os.path.join(root_folder, 'Rectified/{}_train/urd/rect_{:0>3}_{}_r5000.png'.format(scan,ref_view+1,1)), img_wh)
         # load the estimated depth of the reference view
         ref_depth_est = read_pfm(os.path.join(out_folder, 'depth_est/{:0>8}.pfm'.format(ref_view)))[0]
         ref_depth_est = np.squeeze(ref_depth_est, 2)
@@ -262,7 +314,7 @@ def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_dept
         for src_view in src_views:
             # camera parameters of the source view
             src_intrinsics, src_extrinsics = read_camera_parameters(
-                os.path.join(scan_folder, 'cams_1/{:0>8}_cam.txt'.format(src_view)))
+                os.path.join(root_folder, 'Cameras_1/train/{:0>8}_cam.txt'.format(src_view)))
             src_intrinsics[0] *= img_wh[0]/original_w
             src_intrinsics[1] *= img_wh[1]/original_h
             # the estimated depth of the source view
@@ -282,9 +334,6 @@ def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_dept
         # large threshold, high accuracy, low completeness
         geo_mask = geo_mask_sum >= 3
         final_mask = np.logical_and(photo_mask, geo_mask)
-        
-
-        
 
         os.makedirs(os.path.join(out_folder, "mask"), exist_ok=True)
         save_mask(os.path.join(out_folder, "mask/{:0>8}_photo.png".format(ref_view)), photo_mask)
@@ -292,9 +341,7 @@ def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_dept
         save_mask(os.path.join(out_folder, "mask/{:0>8}_final.png".format(ref_view)), final_mask)
         os.makedirs(os.path.join(out_folder, "depth_img"), exist_ok=True)
 
-        
-
-        print("processing {}, ref-view{:0>2}, geo_mask:{:3f} photo_mask:{:3f} final_mask: {:3f}".format(scan_folder, ref_view,
+        print("processing {}, ref-view{:0>2}, geo_mask:{:3f} photo_mask:{:3f} final_mask: {:3f}".format(root_folder, ref_view,
                                                                 geo_mask.mean(), photo_mask.mean(), final_mask.mean()))
 
         if args.display:
@@ -341,7 +388,7 @@ def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_dept
 if __name__ == '__main__':
     # step1. save all the depth maps and the masks in outputs directory
     save_depth()
-    img_wh=(1600, 1200)
+    img_wh=(640, 512)
     
     with open(args.testlist) as f:
         scans = f.readlines()
@@ -350,8 +397,9 @@ if __name__ == '__main__':
 
     for scan in scans:
         scan_id = int(scan[4:])
-        scan_folder = os.path.join(args.testpath, scan)
+        # scan_folder = os.path.join(args.testpath, scan)
+        root_folder = args.testpath
         out_folder = os.path.join(args.outdir, scan)
         # step2. filter saved depth maps with geometric constraints
-        filter_depth(scan_folder, out_folder, os.path.join(args.outdir, 'patchmatchnet{:0>3}_l3.ply'.format(scan_id)), 
-                    args.geo_pixel_thres, args.geo_depth_thres, args.photo_thres, img_wh)
+        filter_depth(root_folder, out_folder, os.path.join(args.outdir, 'patchmatchnet{:0>3}_l3.ply'.format(scan_id)),
+                    args.geo_pixel_thres, args.geo_depth_thres, args.photo_thres, img_wh,scan=scan)

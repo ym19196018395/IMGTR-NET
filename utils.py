@@ -50,13 +50,28 @@ def tensor2float(vars):
 
 
 @make_recursive_func
-def tensor2numpy(vars):
-    if isinstance(vars, np.ndarray):
-        return vars
-    elif isinstance(vars, torch.Tensor):
-        return vars.detach().cpu().numpy().copy()
+def tensor2numpy(obj):
+    """
+    递归地将 Tensor 转换为 Numpy，同时保留 int, float, list, dict 等结构。
+    """
+    if isinstance(obj, dict):
+        # 递归处理字典的值
+        return {k: tensor2numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        # 递归处理列表/元组的元素
+        return [tensor2numpy(v) for v in obj]
+    elif isinstance(obj, torch.Tensor):
+        # 核心：Tensor -> Numpy
+        return obj.detach().cpu().numpy()
+    elif isinstance(obj, np.ndarray):
+        # 已经是 Numpy，直接返回
+        return obj
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        # 基础类型，直接返回 (解决了你的 'int' 报错)
+        return obj
     else:
-        raise NotImplementedError("invalid input type {} for tensor2numpy".format(type(vars)))
+        # 其他未知类型，原样返回，防止报错
+        return obj
 
 
 @make_recursive_func
@@ -826,9 +841,9 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
             pixels = curr_pixels_list[i]  # [(x1,y1), (x2,y2), ...]
 
             # 过滤：概率太小的边(完全连通)可以选择不画，或者画得很淡
-            # 这里设置 > 0.05 才画，保持画面干净
-            if prob < 0.05 or len(pixels) == 0:
-                continue
+            # 这里设置 > 0.05 才画，保持画面干净,全部都需要画
+            # if prob < 0.05 or len(pixels) == 0:
+            #     continue
 
             # 颜色映射: 0.0 -> Blue, 1.0 -> Red
             color_idx = int(np.clip(prob * 255, 0, 255))
@@ -878,6 +893,76 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
         output_stack = torch.zeros_like(ref_imgs).to(torch.uint8).to(device)
 
     return {"ref_img_edge_alpha": output_stack}
+
+
+def save_edge_prob_map(save_path, ref_img, edge_alphas, edge_pixels, overlay_alpha=0.7, line_thickness=1):
+    """
+    保存断裂边热力图为 PNG
+    Args:
+        save_path: 保存路径 (e.g., '.../000000_edge.png')
+        ref_img: [3, H, W] 或 [H, W, 3] 的 numpy 数组 (原始 RGB 图像)
+        edge_alphas: [E] numpy 数组 (预测概率)
+        edge_pixels: list of list [(x,y)...] (像素坐标，假设归一化 [-1, 1])
+    """
+    # 1. 处理底图 (Ref Image)
+    # 如果是 CHW 格式 (3, H, W)，转为 HWC
+    if ref_img.shape[0] == 3:
+        ref_img = np.transpose(ref_img, (1, 2, 0))
+
+    # 反归一化并转 uint8 (处理 ImageNet Norm 或 简单的 min-max)
+    if ref_img.dtype != np.uint8:
+        ref_img = ref_img - ref_img.min()
+        ref_img = ref_img / (ref_img.max() + 1e-8)
+        ref_img = (ref_img * 255.0).astype(np.uint8)
+
+    # RGB -> BGR (OpenCV使用)
+    ref_img_bgr = cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR)
+    H, W, _ = ref_img_bgr.shape
+
+    # 2. 准备画板
+    overlay_layer = np.zeros_like(ref_img_bgr)
+
+    # 3. 预计算色盘 (蓝->红)
+    colormap_lut = np.zeros((256, 1, 3), dtype=np.uint8)
+    for i in range(256):
+        colormap_lut[i, 0] = np.array([i, i, i])
+    colormap_lut = cv2.applyColorMap(colormap_lut, cv2.COLORMAP_JET).squeeze(1)
+
+    # 4. 遍历画线
+    safe_len = min(len(edge_pixels), len(edge_alphas))
+
+    for i in range(safe_len):
+        prob = edge_alphas[i]
+        pixels = edge_pixels[i]  # 归一化坐标点列表
+
+        # 过滤掉概率太小的，保持画面干净 (可选)
+        # if prob < 0.05 or len(pixels) == 0:
+        #     continue
+
+        # 获取颜色
+        color_idx = int(np.clip(prob * 255, 0, 255))
+        color = colormap_lut[color_idx].tolist()
+
+        # 坐标反归一化 [-1, 1] -> [0, W]
+        # 注意：这里假设 pixel 是 (x, y) 格式
+        pts_norm = np.array(pixels, dtype=np.float32)
+        pts_x = (pts_norm[:, 0] + 1) * (W - 1) / 2.0
+        pts_y = (pts_norm[:, 1] + 1) * (H - 1) / 2.0
+
+        pts_real = np.stack([pts_x, pts_y], axis=1).astype(np.int32)
+        pts_to_draw = pts_real.reshape((-1, 1, 2))
+
+        cv2.polylines(overlay_layer, [pts_to_draw], isClosed=False, color=color,
+                      thickness=line_thickness, lineType=cv2.LINE_AA)
+
+    # 5. 叠加与保存
+    mask = np.any(overlay_layer > 0, axis=-1)
+    final_img = ref_img_bgr.copy()
+    weighted_overlay = cv2.addWeighted(ref_img_bgr, 1.0 - overlay_alpha, overlay_layer, overlay_alpha, 0)
+    final_img[mask] = weighted_overlay[mask]
+
+    # 保存
+    cv2.imwrite(save_path, final_img)
 
 # 检查tensor是否有问题，并报错
 def check_tensor(name, t):
