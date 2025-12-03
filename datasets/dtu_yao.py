@@ -244,7 +244,7 @@ class MVSDataset(Dataset):
                 img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
                 W=imgs_0[0].shape[1]
                 H=imgs_0[0].shape[0]
-                print("{}--------{}".format(scan,vid+1))
+                # print("{}--------{}".format(scan,vid+1))
                 cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
 
         # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致

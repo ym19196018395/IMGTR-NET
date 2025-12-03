@@ -50,13 +50,28 @@ def tensor2float(vars):
 
 
 @make_recursive_func
-def tensor2numpy(vars):
-    if isinstance(vars, np.ndarray):
-        return vars
-    elif isinstance(vars, torch.Tensor):
-        return vars.detach().cpu().numpy().copy()
+def tensor2numpy(obj):
+    """
+    递归地将 Tensor 转换为 Numpy，同时保留 int, float, list, dict 等结构。
+    """
+    if isinstance(obj, dict):
+        # 递归处理字典的值
+        return {k: tensor2numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        # 递归处理列表/元组的元素
+        return [tensor2numpy(v) for v in obj]
+    elif isinstance(obj, torch.Tensor):
+        # 核心：Tensor -> Numpy
+        return obj.detach().cpu().numpy()
+    elif isinstance(obj, np.ndarray):
+        # 已经是 Numpy，直接返回
+        return obj
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        # 基础类型，直接返回 (解决了你的 'int' 报错)
+        return obj
     else:
-        raise NotImplementedError("invalid input type {} for tensor2numpy".format(type(vars)))
+        # 其他未知类型，原样返回，防止报错
+        return obj
 
 
 @make_recursive_func

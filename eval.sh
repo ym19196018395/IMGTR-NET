@@ -2,7 +2,7 @@
 
 # test on DTU's evaluation set
 DTU_TESTING="/home/ym/Experiment/Datas/dtu_eval"
-CKPT_FILE="/home/ym/Experiment/PatchmatchNet-new/checkpoints/model_000007.ckpt"
+CKPT_FILE="./checkpoints/tensorboard/model_000001.ckpt"
 python eval.py --dataset=dtu_yao_eval --batch_size=1 --n_views 5 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \

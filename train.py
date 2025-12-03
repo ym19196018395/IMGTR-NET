@@ -95,7 +95,8 @@ print_args(args)
 MVSDataset = find_dataset_def(args.dataset)
 if args.dataset == 'dtu_yao':
     train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 5, robust_train=True)
-    test_dataset = MVSDataset(args.valpath, args.vallist, "val", 5,  robust_train=False)
+    # ym-modify 12.1 因为测试集里面没有这个数据
+    test_dataset = MVSDataset(args.trainpath, args.vallist, "val", 5,  robust_train=False)
 # 进行了一个修改，对于有些数据不进行默认collate
 TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True,collate_fn=collate_keep_list, num_workers=8, drop_last=True)
 TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,num_workers=4, drop_last=False)
@@ -163,7 +164,7 @@ def train():
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,global_step=global_step)
             loss_depth=scalar_outputs['loss_depth']
-            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
+            # loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
             if do_summary_image:
@@ -171,9 +172,13 @@ def train():
             del scalar_outputs, image_outputs
 
             print(
-                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
-                                                                                     len(TrainImgLoader),loss_depth,loss_alpha_sup,loss,
+                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
+                                                                                     len(TrainImgLoader),loss_depth,loss,
                                                                                      time.time() - start_time))
+            # print(
+            #     'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
+            #                                                                          len(TrainImgLoader),loss_depth,loss_alpha_sup,loss,
+            #                                                                          time.time() - start_time))
 
         # checkpoint
         if (epoch_idx + 1) % args.save_freq == 0:
@@ -184,26 +189,26 @@ def train():
                 "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
 
         # testing  暂时不测试 ym-need-modify
-        # avg_test_scalars = DictAverageMeter()
-        # for batch_idx, sample in enumerate(TestImgLoader):
-        #     start_time = time.time()
-        #     global_step = len(TrainImgLoader) * epoch_idx + batch_idx
-        #     do_summary = global_step % args.summary_freq == 0
-        #     # do_summary_test = global_step % (10*args.summary_freq) == 0
-        #     do_summary_image = global_step % (50*args.summary_freq) == 0
-        #     loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
-        #     if do_summary:
-        #         save_scalars(logger, 'test', scalar_outputs, global_step)
-        #     if do_summary_image:
-        #         save_images(logger, 'test', image_outputs, global_step)
-        #     avg_test_scalars.update(scalar_outputs)
-        #     del scalar_outputs, image_outputs
-        #     print('Epoch {}/{}, Iter {}/{}, test loss = {:.3f}, time = {:3f}'.format(epoch_idx, args.epochs, batch_idx,
-        #                                                                              len(TestImgLoader), loss,
-        #                                                                              time.time() - start_time))
-        # save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
-        # print("avg_test_scalars:", avg_test_scalars.mean())
-        # gc.collect()
+        avg_test_scalars = DictAverageMeter()
+        for batch_idx, sample in enumerate(TestImgLoader):
+            start_time = time.time()
+            global_step = len(TrainImgLoader) * epoch_idx + batch_idx
+            do_summary = global_step % args.summary_freq == 0
+            # do_summary_test = global_step % (10*args.summary_freq) == 0
+            do_summary_image = global_step % (50*args.summary_freq) == 0
+            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
+            if do_summary:
+                save_scalars(logger, 'test', scalar_outputs, global_step)
+            if do_summary_image:
+                save_images(logger, 'test', image_outputs, global_step)
+            avg_test_scalars.update(scalar_outputs)
+            del scalar_outputs, image_outputs
+            print('Epoch {}/{}, Iter {}/{}, test loss = {:.3f}, time = {:3f}'.format(epoch_idx, args.epochs, batch_idx,
+                                                                                     len(TestImgLoader), loss,
+                                                                                     time.time() - start_time))
+        save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
+        print("avg_test_scalars:", avg_test_scalars.mean())
+        gc.collect()
 
 
 def test():
@@ -258,21 +263,22 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     # 总损失：深度损失+边断裂损失+连续性损失
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask) # 深度损失
 
-    # 1) EdgeConsistencyLoss（自监督 BCE）
-    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
-    loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
-        pred_alphas_list=outputs["edge_alphas"],
-        # 1/2分辨率图的深度图
-        gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
-        tri_infos=outputs["tri_infos"],
-        feat_map=None,
-    )
+    # # 1) EdgeConsistencyLoss（自监督 BCE）
+    # edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
+    # loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
+    #     pred_alphas_list=outputs["edge_alphas"],
+    #     # 1/2分辨率图的深度图
+    #     gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+    #     tri_infos=outputs["tri_infos"],
+    #     feat_map=None,
+    # )
+    #
+    # # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
+    # weight_alpha=100
+    # loss_alpha_sup=loss_alpha_sup*weight_alpha
+    # # loss_alpha_sup = 0.0
 
-    # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
-    weight_alpha=100
-    loss_alpha_sup=loss_alpha_sup*weight_alpha
-    # loss_alpha_sup = 0.0
-    loss=loss_depth+loss_alpha_sup
+    loss=loss_depth
 
     # 边断裂损失
     loss.backward()
@@ -284,28 +290,29 @@ def train_sample(sample, detailed_summary=False,global_step=0):
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
-    # 生成图
-    image_outputs_0 = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
-        edge_alphas_list=outputs["edge_alphas"],
-        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
-        device=device,
-        overlay_alpha=0.6,  # 线条显示的透明度
-        line_thickness=1  # 线条粗细
-    )
-    ref_img_edge_alpha_0 = image_outputs_0["ref_img_edge_alpha"]
+    # # 生成图
+    # image_outputs_0 = generate_edge_alpha_overlays(
+    #     ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+    #     edge_alphas_list=outputs["edge_alphas"],
+    #     edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+    #     device=device,
+    #     overlay_alpha=0.6,  # 线条显示的透明度
+    #     line_thickness=1  # 线条粗细
+    # )
+
+    # ref_img_edge_alpha_0 = image_outputs_0["ref_img_edge_alpha"]
 
     scalar_outputs = {"loss": loss,
-                      "loss_depth": loss_depth,
-                      "loss_alpha_sup": loss_alpha_sup}
+                      "loss_depth": loss_depth}
+                      # "loss_alpha_sup": loss_alpha_sup}
 
     image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'], 
                     "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_1'][:, 0],
-                     "ref_img_edge_alpha_0": ref_img_edge_alpha_0
+                     "ref_img": sample["imgs"]['stage_1'][:, 0]
+                     # "ref_img_edge_alpha_0": ref_img_edge_alpha_0
                      }
 
     if detailed_summary:
