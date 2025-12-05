@@ -1,5 +1,5 @@
-from typing import List, Tuple
-
+from typing import List, Tuple, Dict
+from .feature_map import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -164,7 +164,7 @@ class PatchmatchNet(nn.Module):
         self.imgs_3_ref = imgs_3[0]
         del imgs_1, imgs_2, imgs_3
 
-        # ym-issue 这个是已经处理好的投影矩阵，有时间看一下dataloader
+        # 这个是已经处理好的投影矩阵
         self.proj_matrices_0 = torch.unbind(proj_matrices['stage_0'].float(), 1)
         self.proj_matrices_1 = torch.unbind(proj_matrices['stage_1'].float(), 1)
         self.proj_matrices_2 = torch.unbind(proj_matrices['stage_2'].float(), 1)
@@ -181,6 +181,7 @@ class PatchmatchNet(nn.Module):
             output_feature = self.feature(img)
             features.append(output_feature)
             # ym_need_add 打印出特征图的样子以及特征数据
+            # features_to_tensorboard(features,img[0])
         del imgs_0
         ref_feature, src_features = features[0], features[1:]
         
@@ -330,3 +331,33 @@ def adjust_image_dims(
                 images[i], size=[new_height, new_width], mode='bilinear', align_corners=False)
 
     return images, intrinsics, ref_height, ref_width
+
+def features_to_tensorboard(features:List[Dict[int, torch.Tensor]],input_image_tensor):
+    """
+    ym_add 将特征打印到tensorboard
+    :param features: 特征图
+    :return:
+    """
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir='/home/ym/Experiment/PatchmatchNet-new/checkpoints/featuremap')
+
+    step = 0
+    for i, feat_dict in enumerate(features):
+        for layer_id, feat in feat_dict.items():
+            f = feat.detach().cpu()
+            # 把每个channel当作一张图片 -> 将 C 作为 batch 维
+            if f.dim() == 3:  # C,H,W
+                imgs = f.unsqueeze(1)  # C,1,H,W
+            elif f.dim() == 4:
+                imgs = f.squeeze(0)  # C,H,W -> C,1,H,W
+                imgs = imgs.unsqueeze(1)
+            else:
+                continue
+            # normalize=True 会把每张小图独立归一化到0-1
+            grid = vutils.make_grid(imgs, nrow=8, normalize=True, scale_each=True)
+            writer.add_image(f"features/sample{i}/layer{layer_id}", grid, global_step=step)
+        step += 1
+
+    # 如果想把原始输入图也写进去（CHW, float 0-1）
+    writer.add_image('input/sample0', input_image_tensor, 0, dataformats='CHW')
+    writer.close()

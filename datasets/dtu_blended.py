@@ -19,7 +19,9 @@ class MVSDataset(Dataset):
         self.listfile = listfile
         self.mode = mode
         self.nviews = nviews # 每个样本使用的视图数量（参考视图+源视图）
-        
+        # BlendedMVS 的场景尺度跨度极大（有的场景是几米的物体，有的是几百米的城市），直接使用原始数值会导致网络难以收敛。
+        # 最简单且标准的做法是复用官方代码的 Scaling 策略：将所有场景的最近深度（depth_min）统一缩放到一个固定值（例如 100 或 1），并据此缩放相机位移和深度图。
+        self.scale_factors = {}  # depth scale factors for each scan
         self.robust_train = robust_train # 是否使用鲁棒训练策略（随机选择源视图）
         
 
@@ -38,10 +40,10 @@ class MVSDataset(Dataset):
 
         for scan in scans:
             # 存储着一共多少视角图，以及选中该视角图为参考图之后对应的源图
-            pair_file = "Cameras_1/pair.txt"
+            pair_file = os.path.join(self.datapath,"{}/cams/pair.txt".format(scan))
             
-            with open(os.path.join(self.datapath, pair_file)) as f:
-                self.num_viewpoint = int(f.readline()) # 视图数
+            with open(pair_file) as f:
+                self.num_viewpoint = int(f.readline()) # 视图总数
                 # viewpoints (49)
                 for view_idx in range(self.num_viewpoint):
                     # ref_view：直接从那一行读取参考视角 id
@@ -49,16 +51,14 @@ class MVSDataset(Dataset):
                     # 把第二行按空格拆成token列表，形式像['k', 'view1', 'score1',  ...]
                     # [1::2] 这个意味着从索引 1 开始、步长 2，取出 view1, view2
                     src_views = [int(x) for x in f.readline().rstrip().split()[1::2]]
-                    # light conditions 0-6
-                    for light_idx in range(7):
-                        metas.append((scan, light_idx, ref_view, src_views))
+                    metas.append((scan, ref_view, src_views))
         print("dataset", self.mode, "metas:", len(metas))
         return metas
 
     def __len__(self):
         return len(self.metas)
 
-    def read_cam_file(self, filename):
+    def read_cam_file(self, filename,override_scale=None):
         with open(filename) as f:
             lines = f.readlines()
             lines = [line.rstrip() for line in lines]
@@ -66,10 +66,26 @@ class MVSDataset(Dataset):
         extrinsics = np.fromstring(' '.join(lines[1:5]), dtype=np.float32, sep=' ').reshape((4, 4))
         # intrinsics: line [7-10), 3x3 matrix
         intrinsics = np.fromstring(' '.join(lines[7:10]), dtype=np.float32, sep=' ').reshape((3, 3))
-        
-        depth_min = float(lines[11].split()[0])
-        depth_max = float(lines[11].split()[1])
-        return intrinsics, extrinsics, depth_min, depth_max
+
+        # 3. Depth Min ym-issue
+        depth_min_raw = float(lines[11].split()[0])
+
+        # --- 【修改逻辑】 ---
+        if override_scale is not None:
+            # 如果外界指定了缩放因子（源图），直接用
+            scale_factor = override_scale
+        else:
+            # 如果没指定（参考图），现场计算
+            # 这里的 100.0 是为了把深度拉到 PatchMatchNet 喜欢的范围，也可以设为 1.0
+            scale_factor = 100.0 / (depth_min_raw + 1e-5)
+
+            # 4. 应用缩放
+        depth_min = depth_min_raw * scale_factor
+
+        # 只缩放平移向量 (x, y, z)，旋转矩阵 R 不变
+        extrinsics[:3, 3] *= scale_factor
+
+        return intrinsics, extrinsics, depth_min, scale_factor
 
     def read_img(self, filename):
         """
@@ -126,29 +142,56 @@ class MVSDataset(Dataset):
         return np_img_ms
         
 
-    def read_depth_hr(self, filename):
+    def read_depth_hr(self, filename, scale_factor,depth_min):
         """
-        读取高分辨率深度图，预处理后生成多尺度深度图（作为模型训练的真值）
-        """
+              读取高分辨率深度图，应用缩放，生成多尺度掩码，并计算 depth_max
+              """
+        # 1. 读取 PFM
         depth_hr = np.array(read_pfm(filename)[0], dtype=np.float32)
-        depth_hr = np.squeeze(depth_hr,2)
-        depth_lr = self.prepare_img(depth_hr)
+        # 2. 维度处理
+        if depth_hr.ndim == 3:
+            depth_hr = np.squeeze(depth_hr, 2)
 
-        h, w = depth_lr.shape
+        # 3. 【核心修改】应用缩放因子
+        depth_hr = depth_hr * scale_factor
+
+        # 4. 数据清洗 (NaN/Inf -> 0)
+        depth_hr = np.nan_to_num(depth_hr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 5. 生成掩码 (基于缩放后的深度)
+        mask_hr = (depth_hr > depth_min).astype(np.float32)
+
+        # 6. 【核心修改】从真实的深度图中计算 depth_max
+        # 我们只计算有效区域的最大值
+        if mask_hr.sum() > 0:
+            depth_max = depth_hr.max()
+        else:
+            # 如果全黑，给一个默认值防止报错
+            depth_max = 100.0
+
+            # 7. 多尺度下采样 (保持不变)
+        h, w = depth_hr.shape
         depth_lr_ms = {
-            
-            "stage_3": cv2.resize(depth_lr, (w//8, h//8), interpolation=cv2.INTER_NEAREST),
-            "stage_2": cv2.resize(depth_lr, (w//4, h//4), interpolation=cv2.INTER_NEAREST),
-            "stage_1": cv2.resize(depth_lr, (w//2, h//2), interpolation=cv2.INTER_NEAREST),
-            "stage_0": depth_lr
+            "stage_3": cv2.resize(depth_hr, (w // 8, h // 8), interpolation=cv2.INTER_NEAREST),
+            "stage_2": cv2.resize(depth_hr, (w // 4, h // 4), interpolation=cv2.INTER_NEAREST),
+            "stage_1": cv2.resize(depth_hr, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST),
+            "stage_0": depth_hr
         }
-        return depth_lr_ms
+
+        mask_lr_ms = {
+            "stage_3": cv2.resize(mask_hr, (w // 8, h // 8), interpolation=cv2.INTER_NEAREST),
+            "stage_2": cv2.resize(mask_hr, (w // 4, h // 4), interpolation=cv2.INTER_NEAREST),
+            "stage_1": cv2.resize(mask_hr, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST),
+            "stage_0": mask_hr
+        }
+
+        return depth_lr_ms, mask_lr_ms, depth_max
 
 
     def __getitem__(self, idx):
         # 这里是对应的一组数据包括一张参考图加几张源图
         meta = self.metas[idx]
-        scan, light_idx, ref_view, src_views = meta
+        scan, ref_view, src_views = meta
 
         # robust training strategy
         if self.robust_train:
@@ -169,7 +212,8 @@ class MVSDataset(Dataset):
         depth = None
         depth_min = None
         depth_max = None
-        
+        current_scale=1.0
+
         proj_matrices_0 = []
         proj_matrices_1 = []
         proj_matrices_2 = []
@@ -182,34 +226,62 @@ class MVSDataset(Dataset):
         cdt_data=[]
         # 读取源图和参考图的信息
         for i, vid in enumerate(view_ids):
-            # NOTE that the id in image file names is from 1 to 49 (not 0~48)
+            # 转为字符串后补前导零到8位
+            vid_str=str(vid).zfill(8)
             img_filename = os.path.join(self.datapath,
-                                        'Rectified/{}_train/urd/rect_{:0>3}_{}_r5000.png'.format(scan, vid + 1, light_idx))
-            
-            mask_filename_hr = os.path.join(self.datapath, 'Depths/Depths/{}/depth_visual_{:0>4}.png'.format(scan, vid))
-            depth_filename_hr = os.path.join(self.datapath, 'Depths/Depths/{}/depth_map_{:0>4}.pfm'.format(scan, vid))
-            proj_mat_filename = os.path.join(self.datapath, 'Cameras_1/train/{:0>8}_cam.txt').format(vid)
+                                        '{}/blended_images/{}.jpg'.format(scan, vid_str))
+            # ym-need-modify 掩码需要修改
+            # mask_filename_hr = os.path.join(self.datapath, '{}/blended_images/{}_masked.jpg'.format(scan, vid_str))
+            depth_filename_hr = os.path.join(self.datapath, '{}/rendered_depth_maps/{}.pfm'.format(scan, vid_str))
+            proj_mat_filename = os.path.join(self.datapath, '{}/cams/{}_cam.txt').format(scan,vid_str)
 
+            # 暂时不需要三角剖分
             # ym-modify 因为vid是从零开始 而图片是从1开始所以要加个1
-            triangulation_filename = os.path.join(self.datapath,
-                                                  'Rectified/{}_train/triangulation/CDTinfo/CDT_info_vlf_rect_{:03d}_1_r5000.txt'.format(
-                                                      scan, vid+1))
+            # triangulation_filename = os.path.join(self.datapath,
+            #                                       'Rectified/{}_train/triangulation/CDTinfo/CDT_info_vlf_rect_{:03d}_1_r5000.txt'.format(
+            #                                           scan, vid+1))
+
             imgs = self.read_img(img_filename)
             imgs_0.append(imgs['stage_0'])
             imgs_1.append(imgs['stage_1'])
             imgs_2.append(imgs['stage_2'])
             imgs_3.append(imgs['stage_3'])
 
-
+            intrinsics =[]
+            extrinsics =[]
             # here, the intrinsics from file is already adjusted to the downsampled size of feature 1/4H0 * 1/4W0
-            # 之前已经将深度图变为1/4了
-            intrinsics, extrinsics, depth_min_, depth_max_ = self.read_cam_file(proj_mat_filename)
+            # BlendedMVS 的场景尺度跨度极大（有的场景是几米的物体，有的是几百米的城市），直接使用原始数值会导致网络难以收敛
+            # 所以使深度进行一个缩放
+            if i == 0:  # reference view
+                # 参考图：不传 override_scale，让它自己算，并返回算出来的 scale_factor
+                # 保证参考图和源图都进行一个缩放
+                intrinsics, extrinsics, depth_min_, current_scale = self.read_cam_file(proj_mat_filename, override_scale=None)
+                # 对掩码和深度图进行一个下采样，深度掩码通过pfm得到
+                depth,mask,depth_max_ = self.read_depth_hr(depth_filename_hr,current_scale,depth_min_)
+                depth_min = depth_min_
+                depth_max = depth_max_
+
+                for l in range(self.stages):
+                    mask[f'stage_{l}'] = np.expand_dims(mask[f'stage_{l}'],2)
+                    mask[f'stage_{l}'] = mask[f'stage_{l}'].transpose([2,0,1])
+                    depth[f'stage_{l}'] = np.expand_dims(depth[f'stage_{l}'],2)
+                    depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
+
+                # ym-add 获取参考图三角网数据 这里vid需要加1 因为是从零开始
+                # img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
+                # W=imgs_0[0].shape[1]
+                # H=imgs_0[0].shape[0]
+                # # print("{}--------{}".format(scan,vid+1))
+                # cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
+
+            else: # source view
+                # 强制源图使用和参考图完全一样的缩放比例，否则几何关系就断了！
+                intrinsics, extrinsics, _, _ = self.read_cam_file(proj_mat_filename,override_scale=current_scale)
 
             # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
             proj_mat = extrinsics.copy()
-            # ym-issue 这是专门针对于dtu这个训练数据集进行的处理
             # 将1，2行的系数*scale
-            intrinsics[:2,:] *= 0.5
+            intrinsics[:2,:] *= 0.125
             # 求得是投影矩阵 P = K [R|t]  外参矩阵是取三行四列大小的数据
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_3.append(proj_mat)
@@ -229,24 +301,6 @@ class MVSDataset(Dataset):
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_0.append(proj_mat)
 
-            if i == 0:  # reference view
-                depth_min = depth_min_
-                depth_max = depth_max_
-                
-                mask = self.read_mask_hr(mask_filename_hr)
-                depth = self.read_depth_hr(depth_filename_hr)
-                for l in range(self.stages):
-                    mask[f'stage_{l}'] = np.expand_dims(mask[f'stage_{l}'],2)
-                    mask[f'stage_{l}'] = mask[f'stage_{l}'].transpose([2,0,1])
-                    depth[f'stage_{l}'] = np.expand_dims(depth[f'stage_{l}'],2)
-                    depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
-
-                # ym-add 获取参考图三角网数据 这里vid需要加1 因为是从零开始
-                img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
-                W=imgs_0[0].shape[1]
-                H=imgs_0[0].shape[0]
-                # print("{}--------{}".format(scan,vid+1))
-                cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
 
         # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致
         # imgs: N*3*H0*W0, N is number of images
@@ -274,15 +328,19 @@ class MVSDataset(Dataset):
         proj['stage_0']=proj_matrices_0
 
         # todo：将数据转化为list or ndarray，为的是后续可以使用，如果之后要进行并行运算还需要修改
-        vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
-        lines = np.asarray(cdt_data.lines, dtype=np.int64)
-        # 每个 triangle 分开处理，保留 list，
-        triangles = []
-        for t in cdt_data.triangles:
-            tri_v = np.asarray(t.vertex_ids, dtype=np.int64)
-            tri_l = np.asarray(t.line_ids, dtype=np.int64)
-            tri_pts = np.asarray(t.valid_points, dtype=np.int64)  # 变长，允许不同长度
-            triangles.append({'vertex_ids': tri_v, 'line_ids': tri_l, 'valid_points': tri_pts})
+        # vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
+        # lines = np.asarray(cdt_data.lines, dtype=np.int64)
+        # # 每个 triangle 分开处理，保留 list，
+        # triangles = []
+        # for t in cdt_data.triangles:
+        #     tri_v = np.asarray(t.vertex_ids, dtype=np.int64)
+        #     tri_l = np.asarray(t.line_ids, dtype=np.int64)
+        #     tri_pts = np.asarray(t.valid_points, dtype=np.int64)  # 变长，允许不同长度
+        #     triangles.append({'vertex_ids': tri_v, 'line_ids': tri_l, 'valid_points': tri_pts})
+
+        vertexs=[]
+        lines=[]
+        triangles=[]
 
         # data is numpy array
         return {"imgs": imgs,                   # N*3*H0*W0
