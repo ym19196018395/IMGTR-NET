@@ -19,9 +19,6 @@ class MVSDataset(Dataset):
         self.listfile = listfile
         self.mode = mode
         self.nviews = nviews # 每个样本使用的视图数量（参考视图+源视图）
-        # BlendedMVS 的场景尺度跨度极大（有的场景是几米的物体，有的是几百米的城市），直接使用原始数值会导致网络难以收敛。
-        # 最简单且标准的做法是复用官方代码的 Scaling 策略：将所有场景的最近深度（depth_min）统一缩放到一个固定值（例如 100 或 1），并据此缩放相机位移和深度图。
-        self.scale_factors = {}  # depth scale factors for each scan
         self.robust_train = robust_train # 是否使用鲁棒训练策略（随机选择源视图）
         
 
@@ -103,9 +100,7 @@ class MVSDataset(Dataset):
             "stage_0": np_img
         }
         return np_img_ms
-        
-    def read_depth(self, filename):
-        return np.array(read_pfm(filename)[0], dtype=np.float32)
+
 
     def prepare_img(self, hr_img):
         """
@@ -122,25 +117,6 @@ class MVSDataset(Dataset):
         hr_img_crop = hr_img_ds[start_h: start_h + target_h, start_w: start_w + target_w]
 
         return hr_img_crop
-
-    def read_mask_hr(self, filename):
-        """
-        读取掩码图像（用于过滤无效深度区域），预处理后生成多尺度掩码
-        """
-        img = Image.open(filename)
-        np_img = np.array(img, dtype=np.float32)
-        np_img = (np_img > 10).astype(np.float32)
-        np_img = self.prepare_img(np_img)
-
-        h, w = np_img.shape
-        np_img_ms = {
-            "stage_3": cv2.resize(np_img, (w//8, h//8), interpolation=cv2.INTER_NEAREST),
-            "stage_2": cv2.resize(np_img, (w//4, h//4), interpolation=cv2.INTER_NEAREST),
-            "stage_1": cv2.resize(np_img, (w//2, h//2), interpolation=cv2.INTER_NEAREST),
-            "stage_0": np_img
-        }
-        return np_img_ms
-        
 
     def read_depth_hr(self, filename, scale_factor,depth_min):
         """
@@ -212,6 +188,7 @@ class MVSDataset(Dataset):
         depth = None
         depth_min = None
         depth_max = None
+        # BlendedMVS 的场景尺度跨度极大（有的场景是几米的物体，有的是几百米的城市），直接使用原始数值会导致网络难以收敛。
         current_scale=1.0
 
         proj_matrices_0 = []
@@ -230,8 +207,6 @@ class MVSDataset(Dataset):
             vid_str=str(vid).zfill(8)
             img_filename = os.path.join(self.datapath,
                                         '{}/blended_images/{}.jpg'.format(scan, vid_str))
-            # ym-need-modify 掩码需要修改
-            # mask_filename_hr = os.path.join(self.datapath, '{}/blended_images/{}_masked.jpg'.format(scan, vid_str))
             depth_filename_hr = os.path.join(self.datapath, '{}/rendered_depth_maps/{}.pfm'.format(scan, vid_str))
             proj_mat_filename = os.path.join(self.datapath, '{}/cams/{}_cam.txt').format(scan,vid_str)
 

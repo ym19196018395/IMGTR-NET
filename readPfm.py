@@ -26,6 +26,6 @@ def read_pfm(filename):
 
 import matplotlib.pyplot as plt
 
-image = read_pfm('/home/ym/Experiment/Datas/blendmvs-data/scan_11/rendered_depth_maps/00000245.pfm')
+image = read_pfm('/home/ym/Experiment/PatchmatchNet-new/outputs/scan_20/depth_est/00000000.pfm')
 plt.imshow(image)
 plt.show()
