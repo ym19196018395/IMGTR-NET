@@ -78,7 +78,7 @@ if __name__ == "__main__":
     downsample_ply_point_cloud(
         input_ply_path=INPUT_PLY,
         output_ply_path=OUTPUT_PLY,
-        voxel_size=0.3  # 核心参数，按需调整
+        voxel_size=0.2  # 核心参数，按需调整
     )
 
     # 方案2：备用随机下采样（极度压缩时用，比如只想保留100万点）

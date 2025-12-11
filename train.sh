@@ -19,7 +19,7 @@
 MVS_TRAINING="/home/ym/Experiment/Datas/blendmvs-data"
 timestamp=$(date +%Y%m%d_%H%M%S)
 
-python train_blended.py --dataset dtu_blended --batch_size 3 --epochs 4 \
+python train_blended.py --dataset dtu_blended --batch_size 3 --epochs 8 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \

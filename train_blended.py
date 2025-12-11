@@ -45,7 +45,7 @@ parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 parser.add_argument('--batch_size', type=int, default=12, help='train batch size')
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
 parser.add_argument('--logdir', default='./checkpoints/debug', help='the directory to save checkpoints/logs')
-parser.add_argument('--resume', action='store_true', help='continue to train the model')
+parser.add_argument('--resume', default=False,action='store_true', help='continue to train the model')
 
 parser.add_argument('--summary_freq', type=int, default=2, help='print and summary frequency')
 parser.add_argument('--save_freq', type=int, default=1, help='save checkpoint frequency')
@@ -208,6 +208,7 @@ def train():
                                                                                      time.time() - start_time))
         save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
         print("avg_test_scalars:", avg_test_scalars.mean())
+        print("当前时间（time模块）：", time.ctime())
         gc.collect()
 
 
