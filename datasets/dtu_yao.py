@@ -205,7 +205,7 @@ class MVSDataset(Dataset):
             # 之前已经将深度图变为1/4了
             intrinsics, extrinsics, depth_min_, depth_max_ = self.read_cam_file(proj_mat_filename)
 
-            # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
+ # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
             proj_mat = extrinsics.copy()
             # ym-issue 这是专门针对于dtu这个训练数据集进行的处理
             # 将1，2行的系数*scale
@@ -241,12 +241,11 @@ class MVSDataset(Dataset):
                     depth[f'stage_{l}'] = np.expand_dims(depth[f'stage_{l}'],2)
                     depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
 
-                # ym-add 获取参考图三角网数据 这里vid需要加1 因为是从零开始
-                img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
+                # ym-add 获取参考图三角网数据
                 W=imgs_0[0].shape[1]
                 H=imgs_0[0].shape[0]
                 # print("{}--------{}".format(scan,vid+1))
-                cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
+                cdt_data = get_cdt_datas(triangulation_filename,H=H,W=W)
 
         # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致
         # imgs: N*3*H0*W0, N is number of images

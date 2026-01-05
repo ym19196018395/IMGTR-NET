@@ -70,7 +70,7 @@ def downsample_ply_point_cloud(
 # ------------------------------
 if __name__ == "__main__":
     # 配置参数（根据你的实际路径调整）
-    INPUT_PLY = "/home/ym/Experiment/PatchmatchNet-new/outputs/patchmatchnetscan_20_l3.ply"  # 2G的原始点云路径
+    INPUT_PLY = "../outputs/full_3.ply"  # 2G的原始点云路径
     OUTPUT_PLY = "/home/ym/Experiment/PatchmatchNet-new/outputs/downsampled_point_cloud.ply"  # 输出路径
 
     # 方案1：推荐体素下采样（优先选这个！）

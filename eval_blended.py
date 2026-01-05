@@ -291,8 +291,6 @@ def filter_depth(scan_folder, out_folder, plyfilename, geo_pixel_thres, geo_dept
         final_mask = np.logical_and(photo_mask, geo_mask)
         
 
-        
-
         os.makedirs(os.path.join(out_folder, "mask"), exist_ok=True)
         save_mask(os.path.join(out_folder, "mask/{:0>8}_photo.png".format(ref_view)), photo_mask)
         save_mask(os.path.join(out_folder, "mask/{:0>8}_geo.png".format(ref_view)), geo_mask)

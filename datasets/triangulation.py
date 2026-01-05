@@ -162,10 +162,9 @@ def draw_mesh_on_image(image_path: str,
     return result
 
 
-def get_cdt_datas(img_id: str, cdt_file_path: str,H:int,W:int) -> Cdt_data:
+def get_cdt_datas(cdt_file_path: str,H:int,W:int) -> Cdt_data:
     '''
     获取三角剖完的数据
-    :param img_id:
     :param cdt_file_path:
     :return: 返回顶点数据和三角关系,vertices,triangles
     '''
@@ -282,12 +281,12 @@ def get_cdt_datas(img_id: str, cdt_file_path: str,H:int,W:int) -> Cdt_data:
             if len(triangles) != num_triangles:
                 errors.append(f"三角形数量不匹配，预期{num_triangles}个，实际{len(triangles)}个")
             # 量化处理将亚像素级像素转化为图像像素 ym-issue-11.29 因为后面是双线性插值提取不需要化为整数
-            vertices_int = quantize_vertices(vertices_float, (W, H), method='round')
+            # vertices_int = quantize_vertices(vertices_float, (W, H), method='round')
 
     except Exception as e:
         errors.append(f"读取文件时发生错误：{str(e)}\n{traceback.format_exc()}")
 
-    cdt_data=(Cdt_data(vertices_int,lines, triangles))
+    cdt_data=(Cdt_data(vertices_float,lines, triangles))
     return cdt_data
 
 

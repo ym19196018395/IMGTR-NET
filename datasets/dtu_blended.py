@@ -145,7 +145,7 @@ class MVSDataset(Dataset):
             # 如果全黑，给一个默认值防止报错
             depth_max = 100.0
 
-            # 7. 多尺度下采样 (保持不变)
+        # 7. 多尺度下采样 (保持不变)
         h, w = depth_hr.shape
         depth_lr_ms = {
             "stage_3": cv2.resize(depth_hr, (w // 8, h // 8), interpolation=cv2.INTER_NEAREST),
@@ -243,11 +243,10 @@ class MVSDataset(Dataset):
                     depth[f'stage_{l}'] = depth[f'stage_{l}'].transpose([2,0,1])
 
                 # ym-add 获取参考图三角网数据 这里vid需要加1 因为是从零开始
-                # img_id="CDT_info_vlf_rect_{:03d}_1_r5000".format(vid+1)
                 # W=imgs_0[0].shape[1]
                 # H=imgs_0[0].shape[0]
                 # # print("{}--------{}".format(scan,vid+1))
-                # cdt_data = get_cdt_datas(img_id, triangulation_filename,H=H,W=W)
+                # cdt_data = get_cdt_datas(triangulation_filename,H=H,W=W)
 
             else: # source view
                 # 强制源图使用和参考图完全一样的缩放比例，否则几何关系就断了！
