@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import numpy as np
 import torchvision.utils as vutils
@@ -296,6 +298,136 @@ def norm_pixel_coords(pixels, old_W, old_H):
 
     return scaled_pixels
 
+
+def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, scale_ratio=1.0):
+    """
+    适配数组/张量格式的lines，生成三角形的【原始】顶点、质心，以及缩放/归一化后的边信息。
+    优化：移除了对顶点和质心的缩放操作，直接返回原始坐标。
+    参数:
+           vertexs: np.ndarray, 形状 (Nv, 2)，顶点坐标 (x, y)（x=列，y=行）
+           lines: np.ndarray/torch.Tensor, 形状 (Ne, 4)，每行对应[ p1, p2, face1, face2 ]
+                  - 若为torch.Tensor，会自动转numpy处理
+           triangles: list, 每个元素为dict:
+               {
+                   'vertex_ids': np.ndarray (3,), 三角形顶点ID
+                   'line_ids': np.ndarray (3,), 三角形边ID
+                   'valid_points': np.ndarray (M, 2), 三角形内像素 (x, y)
+               }
+           H/W: 原始图像尺寸（高/宽）
+           device: 计算设备（此处仅为兼容参数，实际未使用）
+           scale_ratio: 缩放比例（默认0.5）
+
+       返回:
+           tri_infos: dict
+               {
+                   'num_tri': 三角形数量,
+                   'centroids': list of np.ndarray, 每个元素为(2,)，三角形缩放后的质心坐标 (x, y)
+                   'vertices': list of np.ndarray, 每个元素为(3,2)，三角形缩放后的三个顶点坐标
+                   'edges': list of dict, 每条边的缩放后信息（含tri_ids和edge_pixels）
+               }
+    """
+    tri_infos = {
+        'num_tri': len(triangles),
+        'centroids': [],
+        'vertices': [],
+        'edges': []
+    }
+
+    # -------------------------- 1. 获取原始顶点和质心 (不缩放) --------------------------
+    # 预先将所有顶点转换为 float32 方便计算
+    # vertexs 是 (Nv, 2)
+    # 不进行缩放
+    if(scale_ratio==1.0):
+        for tri in triangles:
+            # 1.1 获取三角形原始顶点
+            vertex_ids = tri['vertex_ids']  # (3,)
+            tri_vertices_original = vertexs[vertex_ids].astype(np.float32)  # (3, 2) 原始顶点坐标 (x, y)
+
+            # 1.2 计算原始质心
+            centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,)
+
+            # 1.3 直接存入，不做 scale_ratio 处理
+            # 统一归一化会在 batch_convert_to_tri_infos 中进行
+            tri_infos['vertices'].append(tri_vertices_original)
+            tri_infos['centroids'].append(centroid_original)
+    else:
+        new_H = int(H * scale_ratio)
+        new_W = int(W * scale_ratio)
+
+        scale_x = scale_ratio  # x方向缩放因子
+        scale_y = scale_ratio  # y方向缩放因子
+
+        for tri in triangles:
+            # 1.1 获取三角形的三个顶点ID对应的原始坐标
+            vertex_ids = tri['vertex_ids']  # (3,) 顶点ID数组
+            tri_vertices_original = vertexs[vertex_ids]  # (3, 2) 原始顶点坐标 (x, y)
+
+            # 1.2 缩放顶点坐标（与边像素缩放逻辑一致）
+            tri_vertices_scaled = np.zeros_like(tri_vertices_original, dtype=np.float32)
+            tri_vertices_scaled[:, 0] = tri_vertices_original[:, 0] * scale_x  # x坐标缩放
+            tri_vertices_scaled[:, 1] = tri_vertices_original[:, 1] * scale_y  # y坐标缩放
+            # 可选：裁剪到目标尺寸范围内（防止越界）
+            # tri_vertices_scaled[:, 0] = np.clip(tri_vertices_scaled[:, 0], 0, new_W - 1)
+            # tri_vertices_scaled[:, 1] = np.clip(tri_vertices_scaled[:, 1], 0, new_H - 1)
+
+            # 1.3 计算三角形质心（质点）：三个顶点坐标的平均值
+            centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,) 原始质心
+            # 缩放质心坐标
+            centroid_scaled = np.array([
+                centroid_original[0] * scale_x,
+                centroid_original[1] * scale_y
+            ], dtype=np.float32)
+            # 可选：裁剪质心坐标
+            # centroid_scaled[0] = np.clip(centroid_scaled[0], 0, new_W - 1)
+            # centroid_scaled[1] = np.clip(centroid_scaled[1], 0, new_H - 1)
+
+            # 1.4 存入tri_infos
+            tri_infos['vertices'].append(tri_vertices_scaled)
+            tri_infos['centroids'].append(centroid_scaled)
+
+    # -------------------------- 2. 处理边信息 --------------------------
+    # 注意：边像素的处理通常依赖于 bresenham 和 norm_pixel_coords
+    # 如果 norm_pixel_coords 内部依赖 H/W 进行归一化，这里保持不变
+
+    if isinstance(lines, torch.Tensor):
+        lines_np = lines.cpu().numpy()
+    else:
+        lines_np = lines
+
+    for line_arr in lines_np:
+        v1_id = int(line_arr[0]) # 索引0 = p1
+        v2_id = int(line_arr[1]) # 索引1 = p2
+        face1 = int(line_arr[2]) # 索引2 = face1
+        face2 = int(line_arr[3]) # 索引3 = face2
+
+        #  处理face为无效值的情况（如None转成的-1或0）
+        tri_ids = []
+        # 简化逻辑：-1 或 None 都视为无效,假设-1表示无相邻面
+        tri_ids.append(face1 if (face1 != -1 and face1 is not None) else -1)
+        tri_ids.append(face2 if (face2 != -1 and face2 is not None) else -1)
+        tri_ids = tuple(tri_ids)
+
+        # 计算边的像素坐标 (使用原始顶点坐标进行 Bresenham)
+        # 注意：这里得到的是原始分辨率下的像素点
+        p1 = (vertexs[v1_id][0], vertexs[v1_id][1])
+        p2 = (vertexs[v2_id][0], vertexs[v2_id][1])
+
+        # 假设 bresenham_line 返回的是 list of (x,y)
+        edge_pixels_original = bresenham_line(p1, p2)
+
+        # 归一化像素坐标 (依赖外部函数 norm_pixel_coords)
+        # 这里的 H, W 是原图尺寸，norm_pixel_coords 应该将其映射到特定区间(如 [-1,1] 或 [0,1])
+        # 这部分保持你原有的逻辑，因为它通常用于 EdgeHead 的 grid_sample
+        edge_pixels_scaled = norm_pixel_coords(edge_pixels_original, W, H)
+
+        # 添加边信息
+        tri_infos['edges'].append({
+            'tri_ids': tri_ids,
+            'edge_pixels': edge_pixels_scaled,
+        })
+
+    return tri_infos
+
 def convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device, scale_ratio=0.5):
     """
        适配数组/张量格式的lines，生成三角形的缩放后顶点、质心，以及缩放后的边信息
@@ -336,6 +468,8 @@ def convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device, scale_r
     scale_y = scale_ratio       # y方向缩放因子
 
     # -------------------------- 1. 每个三角形的顶点和和三角形的质点，并进行一个缩放 --------------------------
+
+
     for tri in triangles:
         # 1.1 获取三角形的三个顶点ID对应的原始坐标
         vertex_ids = tri['vertex_ids']  # (3,) 顶点ID数组
@@ -346,8 +480,8 @@ def convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device, scale_r
         tri_vertices_scaled[:, 0] = tri_vertices_original[:, 0] * scale_x  # x坐标缩放
         tri_vertices_scaled[:, 1] = tri_vertices_original[:, 1] * scale_y  # y坐标缩放
         # 可选：裁剪到目标尺寸范围内（防止越界）
-        tri_vertices_scaled[:, 0] = np.clip(tri_vertices_scaled[:, 0], 0, new_W - 1)
-        tri_vertices_scaled[:, 1] = np.clip(tri_vertices_scaled[:, 1], 0, new_H - 1)
+        # tri_vertices_scaled[:, 0] = np.clip(tri_vertices_scaled[:, 0], 0, new_W - 1)
+        # tri_vertices_scaled[:, 1] = np.clip(tri_vertices_scaled[:, 1], 0, new_H - 1)
 
         # 1.3 计算三角形质心（质点）：三个顶点坐标的平均值
         centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,) 原始质心
@@ -357,8 +491,8 @@ def convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device, scale_r
             centroid_original[1] * scale_y
         ], dtype=np.float32)
         # 可选：裁剪质心坐标
-        centroid_scaled[0] = np.clip(centroid_scaled[0], 0, new_W - 1)
-        centroid_scaled[1] = np.clip(centroid_scaled[1], 0, new_H - 1)
+        # centroid_scaled[0] = np.clip(centroid_scaled[0], 0, new_W - 1)
+        # centroid_scaled[1] = np.clip(centroid_scaled[1], 0, new_H - 1)
 
         # 1.4 存入tri_infos
         tri_infos['vertices'].append(tri_vertices_scaled)
@@ -569,6 +703,150 @@ def visualize_centroids_and_edges(tri_infos, H, W, save_path):
     img.save(save_path)
     print(f"质心+边可视化图片已保存至: {save_path}")
 
+
+def visualize_tri_id_map(tri_id_map, save_dir="outputs/debug_tri_maps", prefix="tri_id"):
+    """
+    将三角形 ID 索引图可视化为彩色分割图。
+    相邻 ID 会被分配完全不同的随机颜色，以便于肉眼区分。
+
+    Args:
+        tri_id_map: [B, H, W] 或 [H, W] 的 Tensor (long/int).
+                    值域: 0 ~ N-1 (三角形ID), -1 (无效/背景)
+        save_dir: 图片保存目录
+        prefix: 保存文件的前缀 (e.g., "batch0_stage1")
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    # 1. 确保输入是 CPU numpy 格式
+    if isinstance(tri_id_map, torch.Tensor):
+        tri_id_map = tri_id_map.detach().cpu().numpy()
+
+    # 兼容 [H, W] 输入，自动扩展为 [1, H, W]
+    if tri_id_map.ndim == 2:
+        tri_id_map = tri_id_map[np.newaxis, ...]
+
+    B, H, W = tri_id_map.shape
+
+    # 2. 获取最大 ID 数，用于生成调色板
+    # 注意：我们要忽略 -1
+    valid_mask = (tri_id_map >= 0)
+    if not valid_mask.any():
+        print(f"Warning: {prefix} 中全是无效区域 (-1)，跳过可视化。")
+        return
+
+    max_id = tri_id_map.max()
+    num_colors = max_id + 1
+
+    # 3. 生成随机调色板 (N, 3)
+    # 使用随机种子确保颜色在同一批次内是确定的，但不同 ID 颜色差异大
+    np.random.seed(42)
+    # 生成 0-255 的随机颜色
+    colors = np.random.randint(0, 255, size=(num_colors, 3), dtype=np.uint8)
+
+    # 4. 逐张处理
+    for b in range(B):
+        id_img = tri_id_map[b]  # [H, W]
+
+        # 初始化一张全黑图片 [H, W, 3]
+        vis_img = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # 获取当前图的有效 mask
+        mask = (id_img >= 0)
+
+        # --- 核心映射逻辑 ---
+        # 利用 numpy 的高级索引，直接将 ID 映射为颜色
+        # id_img[mask] 得到所有有效的 ID
+        # colors[...] 得到对应的 RGB
+        if mask.any():
+            valid_ids = id_img[mask]
+            # 这里的 valid_ids 必须是整数索引
+            vis_img[mask] = colors[valid_ids]
+
+        # 5. 保存
+        save_path = os.path.join(save_dir, f"{prefix}_b{b}.png")
+        cv2.imwrite(save_path, vis_img)
+        print(f"✅ 已保存三角形索引可视化: {save_path}")
+
+
+def visualize_downsampled_tri_id(tri_id_map, scale_factor=0.5, save_dir="outputs/debug_tri_maps",
+                                 prefix="tri_id_downsampled"):
+    """
+    对三角形 ID 索引图进行下采样，并可视化保存。
+    注意：ID图必须使用 'nearest' 插值，不能使用 bilinear。
+
+    Args:
+        tri_id_map (torch.Tensor): 原始分辨率的 ID 图 [B, H, W]
+        scale_factor (float): 下采样倍率 (e.g., 0.5 表示 1/2 分辨率)
+        save_dir (str): 保存路径
+        prefix (str): 文件名前缀
+
+    Returns:
+        tri_id_map_down (torch.Tensor): 下采样后的 ID 图 [B, H_new, W_new] (LongTensor)
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    # 1. 确保输入维度正确 [B, 1, H, W] 用于 interpolate
+    if tri_id_map.dim() == 2:
+        tri_id_map = tri_id_map.unsqueeze(0)  # [1, H, W]
+
+    # 转换为 Float 才能进 interpolate，但在 nearest 模式下数值不会变
+    input_tensor = tri_id_map.unsqueeze(1).float()
+
+    # 2. 执行下采样 (关键: mode='nearest')
+    # warning: recompute_scale_factor=False 是为了兼容新版 PyTorch
+    tri_id_map_down = F.interpolate(
+        input_tensor,
+        scale_factor=scale_factor,
+        mode='nearest',
+        recompute_scale_factor=False
+    )
+
+    # 转回 [B, H_new, W_new] 和 Long 类型
+    tri_id_map_down = tri_id_map_down.squeeze(1).long()
+
+    # ================= VISUALIZATION =================
+    # 转 numpy 处理图片
+    id_map_np = tri_id_map_down.detach().cpu().numpy()
+    B, H_new, W_new = id_map_np.shape
+
+    # 获取最大 ID 用于生成颜色表 (忽略 -1)
+    max_id = id_map_np.max()
+    # 避免全是 -1 的情况
+    if max_id < 0:
+        print(f"Warning: {prefix} 全是无效区域 (-1)")
+        return tri_id_map_down
+
+    # 生成随机调色板
+    # 技巧：为了让颜色在多次运行中保持一致以便对比，可以固定 seed
+    # 但为了让不同 ID 区分度大，使用 randint
+    np.random.seed(42)
+    num_colors = max_id + 1
+    colors = np.random.randint(0, 255, size=(num_colors, 3), dtype=np.uint8)
+
+    for b in range(B):
+        # 取单张图
+        curr_map = id_map_np[b]
+
+        # 初始化画布 (黑色背景)
+        vis_img = np.zeros((H_new, W_new, 3), dtype=np.uint8)
+
+        # 掩码操作：只给有效区域上色
+        mask = (curr_map >= 0)
+        if mask.any():
+            valid_ids = curr_map[mask]
+            # 查表赋值颜色
+            vis_img[mask] = colors[valid_ids]
+
+        # 保存
+        filename = f"{prefix}_b{b}_{int(H_new)}x{int(W_new)}.png"
+        save_path = os.path.join(save_dir, filename)
+        cv2.imwrite(save_path, vis_img)
+        print(f"✅ [1/{int(1 / scale_factor)} Scale] ID Map saved: {save_path}")
+
+    return tri_id_map_down
+
 def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W, device,scale_ratio=0.5):
     """
     批量转换多个样本（适配顶点坐标为(x, y)格式）,
@@ -613,7 +891,7 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
             })
 
         # 3. 转换为tri_infos格式,并且进行一个缩放
-        scale_ratio = 0.5
+        scale_ratio = 1.0
         # 将边像素转化为normal，目的是给后面预测头用
         tri_info_normal = convert_to_tri_infos_normal(vertexs, lines, triangles, H, W, device,scale_ratio)
         tri_infos_batch_normal.append(tri_info_normal)
@@ -623,8 +901,9 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
         # tri_info=convert_to_tri_infos(vertexs, lines, triangles, H, W, device,scale_ratio)
         # visualize_centroids_and_edges(
         #     tri_info,int(H*scale_ratio),int(W*scale_ratio),
-        #     save_path="edges_visual_tensor{}.png".format(b)
+        #     save_path="outputs\edges_photo\edges_visual_tensor{}.png".format(b)
         # )
+        # tri_infos_batch_normal.append(tri_info)
 
     # 5) 将 tri_infos 的 centroids / vertices 转为统一的 padded tensor
     #    并做归一化到 后续的 grid_sample 要求的 [-1,1]（注意 x 对应宽 W，y 对应高 H）
@@ -737,6 +1016,214 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
 
     return new_tri_infos
 
+
+def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, H, W, device, scale_ratio=1.0):
+    """
+    批量转换多个样本。（适配顶点坐标为(x, y)格式）
+    优化点：合并循环，统一在最后一步进行 [-1, 1] 归一化，移除了中间冗余的缩放操作。
+
+    参数:
+        vertexs_batch: list of tensor, 每个元素为单个样本的顶点（已to(device)，形状(Nv, 2)，(x, y)）
+        lines_batch: list of tensor, 每个元素为单个样本的边（已to(device)，形状(Ne, 2)，(v1_id, v2_id)）
+        triangles_batch: list of list of tuple, 每个元素为单个样本的三角形数据:
+                        每个三角形是 (v_ids, l_ids, pts)，其中：
+                        - v_ids: tensor (3,) 顶点ID
+                        - l_ids: tensor (3,) 边ID
+                        - pts: tensor (M, 2) 有效像素坐标 (x, y)
+        H, W: 图像高度和宽度
+        device: 计算设备
+
+    返回:
+    tri_infos: list length B, 每项为 dict:
+                {
+                    'batch_num_tri': int,三角形的数量
+                    'centroids': [B,n_tri,2] 每个三角形的质点
+                    'vertices': [B,n_tri,3,2] 每个三角形的顶点
+                    'edges_list' :进行了一个归一化处理边像素点集合,以及其邻接面，去除掉了单邻接面的线段
+                    'tri_id_map': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效) <--- 新增
+                    boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                }
+    """
+    # 结果容器
+    batch_num_tri = []
+    centers_list = []
+    vertices_list = []
+    edges_list = []
+    edges_pixels = []
+    boundary_local_idxs_per_batch = []
+
+    # 新增：存储每个样本的 tri_id_map
+    tri_id_maps_list = []
+
+    # 合并后的单次遍历
+    for b in range(len(vertexs_batch)):
+        # 1. 提取单个样本数据
+        vertexs = vertexs_batch[b].cpu().numpy()  # (Nv, 2)
+        lines = lines_batch[b]  # tensor (Ne, 4)
+
+        # 新增：初始化当前样本的 tri_id_map (-1 表示无效/背景)
+        current_tri_id_map = torch.full((H, W), -1, dtype=torch.long, device=device)
+
+        # 2. 转换 triangles 格式 并 填充 Map
+        current_triangles_data = []
+
+        # 遍历当前样本的所有三角形
+        for tri_idx, tri in enumerate(triangles_batch[b]):
+            # 解析数据
+            v_ids = tri[0].cpu().numpy()
+            l_ids = tri[1].cpu().numpy()
+            pts = tri[2]  # tensor (M, 2) (x, y) on device
+
+            # === 🔥 核心新增逻辑：生成 tri_id_map ===
+            if pts.shape[0] > 0:
+                # pts 是 (x, y) -> 对应 (width, height)
+                xs = pts[:, 0].long()
+                ys = pts[:, 1].long()
+                # 边界安全检查 (clamp 防止越界崩溃)
+                xs = xs.clamp(0, W - 1)
+                ys = ys.clamp(0, H - 1)
+                # 填入 ID (tri_idx)
+                # 注意：PyTorch 的索引顺序是 [H, W] 即 [y, x]
+                current_tri_id_map[ys, xs] = tri_idx
+
+            # 收集数据给 helper 函数
+            current_triangles_data.append({
+                'vertex_ids': v_ids,
+                'line_ids': l_ids
+                # 'valid_points': pts.cpu().numpy() 不需要这个了
+            })
+
+        # 执行下采样 (关键: mode='nearest')
+        if current_tri_id_map.dim() == 2:
+            current_tri_id_map = current_tri_id_map.unsqueeze(0)  # [1, H, W]
+        # 转换为 Float 才能进 interpolate，但在 nearest 模式下数值不会变
+        input_tensor = current_tri_id_map.unsqueeze(1).float()
+
+        # warning: recompute_scale_factor=False 是为了兼容新版 PyTorch
+        tri_id_map_down = F.interpolate(
+            input_tensor,scale_factor=0.5,mode='nearest',recompute_scale_factor=False
+        )
+        # 转回 [B, H_new, W_new] 和 Long 类型
+        tri_id_map_down = tri_id_map_down.squeeze(1).long()
+
+        # 将下采样好的,map 加入列表
+        tri_id_maps_list.append(tri_id_map_down)
+
+        # 3. 获取原始坐标的三角形信息 (不进行缩放)
+        # 注意：这里我们传入 H, W 主要是为了 edge_pixels 的处理，vertex 不受 scale_ratio 影响
+        tri_info = convert_to_tri_infos_normal_new(vertexs, lines, current_triangles_data, H, W, device, scale_ratio)
+
+        # test 分别可视化边和三角图并保存，可视化正常=========================================
+        # scale_ratio=0.5
+        # tri_info=convert_to_tri_infos(vertexs, lines, current_triangles_data, H, W, device,scale_ratio)
+        # visualize_centroids_and_edges(
+        #     tri_info,int(H*scale_ratio),int(W*scale_ratio),
+        #     save_path="/home/ym/Experiment/PatchmatchNet-new/outputs/photo_test/edges_visual_tensor{}.png".format(b)
+        # )
+        # # 假设 tri_id_map 是原分辨率的 (H, W)
+        # # 原分辨率图
+        # visualize_tri_id_map(current_tri_id_map, save_dir="/home/ym/Experiment/PatchmatchNet-new/outputs/photo_test")
+        #
+        # # 调用函数生成 1/2 分辨率 map 并保存图片
+        # tri_id_map_half = visualize_downsampled_tri_id(
+        #     current_tri_id_map,
+        #     scale_factor=0.5,
+        #     save_dir="/home/ym/Experiment/PatchmatchNet-new/outputs/photo_test",
+        #     prefix="stage1_tri_ids"
+        # )
+
+        # 4. 处理从 convert_to_tri_infos_normal 返回的数据
+        centroids_py = tri_info['centroids']  # list of np.ndarray (2,) 原始坐标
+        vertices_py = tri_info['vertices']  # list of np.ndarray (3,2) 原始坐标
+        edges_py = tri_info['edges']  # list of dicts
+
+        n_tri = len(centroids_py)
+        batch_num_tri.append(n_tri)
+
+        # 5. 统一归一化处理：映射到 [-1, 1],分别对顶点和质点进行一个归一化，为了后续用双线性插值采样
+        # x_norm = (x / (W-1)) * 2 - 1
+        # y_norm = (y / (H-1)) * 2 - 1
+
+        # 预计算分母，防止除零
+        div_w = max(W - 1, 1)
+        div_h = max(H - 1, 1)
+
+
+        if n_tri > 0:
+            # 堆叠为 numpy 数组进行批量计算，比 list comprehension 更快
+            cent_np = np.stack(centroids_py, axis=0).astype(np.float32)  # [n_tri, 2]
+            vert_np = np.stack(vertices_py, axis=0).astype(np.float32)  # [n_tri, 3, 2]
+
+            # 归一化质心
+            cent_np[:, 0] = (cent_np[:, 0] / div_w) * 2.0 - 1.0
+            cent_np[:, 1] = (cent_np[:, 1] / div_h) * 2.0 - 1.0
+
+            # 归一化顶点
+            vert_np[:, :, 0] = (vert_np[:, :, 0] / div_w) * 2.0 - 1.0
+            vert_np[:, :, 1] = (vert_np[:, :, 1] / div_h) * 2.0 - 1.0
+        else:
+            cent_np = np.zeros((0, 2), dtype=np.float32)
+            vert_np = np.zeros((0, 3, 2), dtype=np.float32)
+
+        # 转 Tensor
+        centers_list.append(torch.from_numpy(cent_np).float())
+        vertices_list.append(torch.from_numpy(vert_np).float())
+
+        # 6. 处理 edges：把 tri_ids 提取成 (E_b,2) 的 LongTensor（局部索引）
+        edge_ids = []
+        boundary_local_idxs = []
+        current_pixels = []
+
+        for i, ed in enumerate(edges_py):
+            # 获取像素集合
+            current_pixels.append(ed.get('edge_pixels', None))
+
+            # 获取 tri_ids
+            tid = ed.get('tri_ids', None) if isinstance(ed, dict) else ed
+            if tid is None:
+                continue
+
+            t1, t2 = int(tid[0]), int(tid[1])
+
+            valid1 = (0 <= t1 < n_tri)
+            valid2 = (0 <= t2 < n_tri)
+
+            if valid1 and valid2:
+                # 两个面都存在，正常边
+                edge_ids.append([t1, t2])
+            elif valid1 and not valid2:
+                # 只有面1，断裂边/边界
+                edge_ids.append([t1, t1])
+                boundary_local_idxs.append(len(edge_ids) - 1)
+            elif valid2 and not valid1:
+                # 只有面2，断裂边/边界
+                edge_ids.append([t2, t2])
+                boundary_local_idxs.append(len(edge_ids) - 1)
+            else:
+                raise RuntimeError(f"Sample {b}, Edge {i}: 一条直线没有相邻三角形")
+
+        if len(edge_ids) == 0:
+            edges_list.append(torch.zeros((0, 2), dtype=torch.long))
+        else:
+            edges_list.append(torch.tensor(edge_ids, dtype=torch.long))
+
+        edges_pixels.append(current_pixels)
+        boundary_local_idxs_per_batch.append(boundary_local_idxs)
+
+    # 7. 组装返回结果
+    new_tri_infos = []
+    new_tri_infos.append({
+        'batch_num_tri': batch_num_tri,
+        'centers_list': centers_list,
+        'vertices_list': vertices_list,
+        'edges_list': edges_list,
+        'edges_pixels': edges_pixels,
+        'tri_id_map': tri_id_maps_list,
+        'boundary_local_idxs_per_batch': boundary_local_idxs_per_batch
+    })
+
+    return new_tri_infos
+
 # --------------------------------------------
 # 通用采样函数：对三角形的 (质心 + 3个顶点) 进行采样并取平均
 # sample_points: [B, N_max, 4, 2] -> reshape 为 [B, N*4, 1, 2] 供 grid_sample 使用
@@ -768,7 +1255,6 @@ def _sample_map(map_tensor, centers, vertices):
     # 将四个点特征取一个平均 -> [B, C_map, N] -> permute -> [B, N, C_map]
     tri_feats = sampled.mean(dim=3).permute(0, 2, 1).contiguous()
     return tri_feats  # [B, N, C_map]
-
 
 def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, device='cpu', overlay_alpha=0.7,
                                  line_thickness=2):
@@ -906,3 +1392,91 @@ def check_tensor(name, t):
     if torch.isinf(t).any():
         print(f"[NaN CHECK] {name} contains Inf; shape={tuple(t.shape)}")
         raise RuntimeError(f"Inf found in {name}")
+
+
+def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
+    """
+    在 GPU 上从深度图生成法向量图。
+
+    Args:
+        depth_tensor (torch.Tensor): 深度图，形状可以是 [B, 1, H, W] 或 [B, H, W]。
+                                     如果是 [B, 3, H, W]，会自动取第一个通道。
+        mask (torch.Tensor, optional): 有效像素掩码，形状同 depth_tensor。
+                                       无效区域的法向量会被置为 0 (黑色) 或特定颜色。
+        smooth (bool): 是否进行简单的高斯平滑以减少噪声（推荐 True）。
+
+    Returns:
+        normal_map (torch.Tensor): 形状 [B, 3, H, W]，数值范围 [0, 1]，用于 tensorboard 可视化。
+    """
+    # 1. 维度处理
+    if depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
+
+    if depth_tensor.shape[1] == 3:
+        # 如果输入是 3 通道 (比如已经是 RGB 渲染)，取均值或单通道作为深度
+        depth_tensor = depth_tensor.mean(dim=1, keepdim=True)
+
+    B, C, H, W = depth_tensor.shape
+    device = depth_tensor.device
+
+    # 2. 高斯平滑 (减少深度图噪声导致的法向量破碎)
+    if smooth:
+        # 简单的 3x3 高斯核
+        gaussian_kernel = torch.tensor([[1., 2., 1.],
+                                        [2., 4., 2.],
+                                        [1., 2., 1.]], device=device) / 16.0
+        gaussian_kernel = gaussian_kernel.view(1, 1, 3, 3)
+        # Reflect pad 避免边缘伪影
+        depth_tensor = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
+        depth_tensor = F.conv2d(depth_tensor, gaussian_kernel)
+
+    # 3. 定义 Sobel 算子 (计算梯度 dz/dx, dz/dy)
+    sobel_x = torch.tensor([[-1., 0., 1.],
+                            [-2., 0., 2.],
+                            [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1., -2., -1.],
+                            [0., 0., 0.],
+                            [1., 2., 1.]], device=device).view(1, 1, 3, 3)
+
+    # 4. 计算梯度
+    # Padding 保证尺寸不变
+    depth_pad = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
+    dzdx = F.conv2d(depth_pad, sobel_x)
+    dzdy = F.conv2d(depth_pad, sobel_y)
+
+    # 5. 构造法向量 (-dz/dx, -dz/dy, 1)
+    # 注意：这里 Z 轴设为 1，如果你想要更强的凹凸感，可以把 dzdx, dzdy 乘以一个系数 (sensitivity)
+    normal_x = -dzdx
+    normal_y = -dzdy
+    normal_z = torch.ones_like(normal_x)
+
+    # 堆叠通道 [B, 3, H, W]
+    normals = torch.cat([normal_x, normal_y, normal_z], dim=1)
+
+    # 6. 归一化 (Normalize)
+    # norm = sqrt(x^2 + y^2 + z^2)
+    norm = torch.norm(normals, dim=1, keepdim=True)
+    # 避免除 0
+    normals = normals / (norm + 1e-8)
+
+    # 7. 映射到 [0, 1] 区间用于可视化
+    # 原范围 [-1, 1] -> 新范围 [0, 1]
+    # RGB 对应关系: R:X(左右), G:Y(上下), B:Z(指向相机)
+    normal_map = (normals + 1.0) / 2.0
+
+    # 8. 应用 Mask (如果有)
+    if mask is not None:
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        if mask.shape[1] == 3:  # 如果 mask 是 3 通道，取单通道
+            mask = mask[:, :1, :, :]
+
+        # 确保 mask 大小匹配 (防止上采样带来的细微尺寸差异)
+        if mask.shape[-2:] != normal_map.shape[-2:]:
+            mask = F.interpolate(mask.float(), size=normal_map.shape[-2:], mode='nearest')
+
+        # 将无效区域设为黑色 (0,0,0) 或者灰色 (0.5, 0.5, 0.5)
+        normal_map = normal_map * mask
+
+    return normal_map
+

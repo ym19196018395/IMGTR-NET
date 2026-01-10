@@ -234,6 +234,11 @@ class MVSDataset(Dataset):
         proj_matrices_2 = []
         proj_matrices_3 = []
 
+        intrinsics_matrices_0 = []
+        intrinsics_matrices_1 = []
+        intrinsics_matrices_2 = []
+        intrinsics_matrices_3 = []
+
         # 装载cdt三角剖分数据
         # 顶点坐标集合：[(x1, y1), (x2, y2), ...]
         # 线集合：[Line(p1, p2, face1, face2), ...]
@@ -278,31 +283,41 @@ class MVSDataset(Dataset):
                 # ym-add 获取参考图三角网数据
                 W = imgs_0[0].shape[1]
                 H = imgs_0[0].shape[0]
-                # print("{}--------{}".format(scan,vid+1))
+
                 cdt_data = get_cdt_datas(triangulation_filename, H=H, W=W)
 
             # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
             proj_mat = extrinsics.copy()
+
             # 将1，2行的系数*scale
             intrinsics[:2, :] *= 0.125
+            # 复制在加入不然加入的是同一个元素
+            intrs_mat=intrinsics.copy()
             # 求得是投影矩阵 P = K [R|t]  外参矩阵是取三行四列大小的数据
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_3.append(proj_mat)
+            intrinsics_matrices_3.append(intrs_mat)
 
             proj_mat = extrinsics.copy()
             intrinsics[:2, :] *= 2
+            intrs_mat = intrinsics.copy()
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_2.append(proj_mat)
+            intrinsics_matrices_2.append(intrs_mat)
 
             proj_mat = extrinsics.copy()
             intrinsics[:2, :] *= 2
+            intrs_mat = intrinsics.copy()
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_1.append(proj_mat)
+            intrinsics_matrices_1.append(intrs_mat)
 
             proj_mat = extrinsics.copy()
             intrinsics[:2, :] *= 2
+            intrs_mat = intrinsics.copy()
             proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
             proj_matrices_0.append(proj_mat)
+            intrinsics_matrices_0.append(intrs_mat)
 
         # 对数据进行一个处理，因为多批次数处理需要保证每个样本的该字段的形状一致
         # imgs: N*3*H0*W0, N is number of images
@@ -329,6 +344,19 @@ class MVSDataset(Dataset):
         proj['stage_1'] = proj_matrices_1
         proj['stage_0'] = proj_matrices_0
 
+        # 相机内参矩阵 N*3*3
+
+        intrinsics_matrices_0 = np.stack(intrinsics_matrices_0)
+        intrinsics_matrices_1 = np.stack(intrinsics_matrices_1)
+        intrinsics_matrices_2 = np.stack(intrinsics_matrices_2)
+        intrinsics_matrices_3 = np.stack(intrinsics_matrices_3)
+
+        intrinsics_mats={}
+        intrinsics_mats['stage_3'] = intrinsics_matrices_3
+        intrinsics_mats['stage_2'] = intrinsics_matrices_2
+        intrinsics_mats['stage_1'] = intrinsics_matrices_1
+        intrinsics_mats['stage_0'] = intrinsics_matrices_0
+
         # todo：将数据转化为list or ndarray，为的是后续可以使用，如果之后要进行并行运算还需要修改
         vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
         lines = np.asarray(cdt_data.lines, dtype=np.int64)
@@ -343,6 +371,7 @@ class MVSDataset(Dataset):
         # data is numpy array
         return {"imgs": imgs,  # N*3*H0*W0
                 "proj_matrices": proj,  # N*4*4
+                "intrinsics_mats":intrinsics_mats,# N*3*3
                 "depth": depth,  # 1*H0 * W0
                 "depth_min": depth_min,  # scalar
                 "depth_max": depth_max,  # scalar

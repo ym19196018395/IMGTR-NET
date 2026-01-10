@@ -160,7 +160,7 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (50 * args.summary_freq) == 0
+            do_summary_image = global_step % (4 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,
                                                                global_step=global_step)
@@ -236,20 +236,22 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
     # ym-issue 是不是可以不用这么早进行一个处理
     # vertexs/list-of-arrays -> 转 tensor 并 to(device)
-    vertexs_batch = []
-    lines_batch = []
-    triangles_batch = []
-    # vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-    # lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+
+    # vertexs_batch = []
+    # lines_batch = []
     # triangles_batch = []
-    # for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
-    #     tri_processed = []
-    #     for t in tri_list:
-    #         v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-    #         l_ids = torch.from_numpy(t['line_ids']).to(device)
-    #         pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
-    #         tri_processed.append((v_ids, l_ids, pts))
-    #     triangles_batch.append(tri_processed)
+
+    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    triangles_batch = []
+    for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+        tri_processed = []
+        for t in tri_list:
+            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+            l_ids = torch.from_numpy(t['line_ids']).to(device)
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+            tri_processed.append((v_ids, l_ids, pts))
+        triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
     skip = ["vertexs", "lines", "triangles"]
@@ -258,7 +260,7 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
-    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch)
 
@@ -297,7 +299,7 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
-    # # 生成图
+    # ===== 生成断裂图 ===============================================
     # image_outputs_0 = generate_edge_alpha_overlays(
     #     ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
     #     edge_alphas_list=outputs["edge_alphas"],
@@ -309,27 +311,49 @@ def train_sample(sample, detailed_summary=False, global_step=0):
 
     # ref_img_edge_alpha_0 = image_outputs_0["ref_img_edge_alpha"]
 
+    # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
+    # 获取 Stage 1 的 GT 深度和 Mask
+    gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
+    gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
+
+    # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
+    pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
+
+    # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
+    normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
+
+    # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
+    normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
+
+    # ===== tensorboard显示图片和曲线 ======================================
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth}
     # "loss_alpha_sup": loss_alpha_sup}
 
-    image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
+    image_outputs = { # 暂时注释一些图片，输出的图片太多了
+                     # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
                      "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
                      "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                      "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
                      "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_1'][:, 0]
+                     "ref_img": sample["imgs"]['stage_1'][:, 0],
+                     # --- 新增：基于像素点的法向量图 ---
+                     "normal_gt_stage_1": normal_gt_s1,
+                     "normal_pred_stage_1": normal_pred_s1,
+                     # 新增：基于平面的深度图和法向量图
+                     "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
+                     "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred']
                      # "ref_img_edge_alpha_0": ref_img_edge_alpha_0
                      }
 
     if detailed_summary:
-        image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
+        # image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
         image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
                                                        mask['stage_1']
-        image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
-                                                       mask['stage_2']
-        image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
-                                                       mask['stage_3']
+        # image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
+        #                                                mask['stage_2']
+        # image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
+        #                                                mask['stage_3']
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
@@ -364,20 +388,20 @@ def test_sample(sample, detailed_summary=True, global_step=0):
 
     # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中
     # vertexs/list-of-arrays -> 转 tensor 并 to(device)
-    vertexs_batch = []
-    lines_batch = []
-    triangles_batch = []
-    # vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-    # lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    # vertexs_batch = []
+    # lines_batch = []
     # triangles_batch = []
-    # for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
-    #     tri_processed = []
-    #     for t in tri_list:
-    #         v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-    #         l_ids = torch.from_numpy(t['line_ids']).to(device)
-    #         pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
-    #         tri_processed.append((v_ids, l_ids, pts))
-    #     triangles_batch.append(tri_processed)
+    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
+    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    triangles_batch = []
+    for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
+        tri_processed = []
+        for t in tri_list:
+            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
+            l_ids = torch.from_numpy(t['line_ids']).to(device)
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+            tri_processed.append((v_ids, l_ids, pts))
+        triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
     skip = ["vertexs", "lines", "triangles"]

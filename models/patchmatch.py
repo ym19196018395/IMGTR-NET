@@ -8,7 +8,7 @@ from .edge_head import EdgeHead
 from .module import *
 import cv2
 import numpy as np
-
+from .PlaneTools import *
 
 class DepthInitialization(nn.Module):
     def __init__(self, patchmatch_num_sample = 1):
@@ -72,12 +72,110 @@ class DepthInitialization(nn.Module):
                 return depth_sample
 
 
+class PlanePatchMatchModule(nn.Module):
+    def __init__(self, fitter_module, propagation_iters=2):
+        super().__init__()
+        self.fitter = fitter_module  # 你传入的 DensePlaneFitter 实例
+        self.generator = PlaneHypothesisGenerator()
+        self.warper = PlaneHomographyWarper()
+        self.prop_iters = propagation_iters
+
+        # Group Correlation 也就是你说的球平面扭曲代价计算网络
+        # 假设你复用了原 PatchMatchNet 的 group_correlation_core 或者类似逻辑
+
+    def forward(self, stage2_depth, stage1_tri_info, ref_feature, src_features, proj_matrices):
+        """
+        Args:
+            stage2_depth: [B, 1, H/4, W/4]
+            stage1_tri_info: dict (含 tri_id_map, vertices 等)
+            ref_feature: [B, C, H/2, W/2]
+            src_features: list of [B, C, H/2, W/2]
+            proj_matrices: 包含 K, R, t
+        """
+        B, _, H, W = ref_feature.shape
+        tri_id_map = stage1_tri_info['tri_id_map']  # [B, H, W]
+        num_tri = stage1_tri_info['num_tri']
+
+        # 1. 拟合平面 (Keep your code!)
+        # fitted_planes: [B, N_tri, 4]
+        fitted_planes = self.fitter(stage2_depth, tri_id_map, ...)
+
+        # 计算三角形平均深度用于生成 Hypothesis 1
+        # (简单起见这里假设你已经有或者能从 fitted_planes 算出来 d)
+        avg_depths = -fitted_planes[..., 3:]  # 近似 d = -z
+
+        # 2. 生成假设池
+        # hypotheses: [B, N_tri, K, 4]
+        hypotheses = self.generator(fitted_planes, avg_depths)
+
+        # 将假设从三角形映射到像素 (Broadcasting)
+        # 这一步是为了方便并行 Warping 和 Cost 计算
+        # pixel_hypotheses: [B, H, W, K, 4]
+        pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map)
+
+        current_hypotheses = pixel_hypotheses
+
+        # 3. PatchMatch 迭代 (传播 -> 评估 -> 选择)
+        for i in range(self.prop_iters):
+            # --- A. 传播 (Spatial Propagation) ---
+            # 这里融合你的 Edge Break 思想
+            # 如果 tri_id 不同，且 Edge Predictor 说断裂，则不传播
+            propagated_hypotheses = self.spatial_propagation(current_hypotheses, tri_id_map)
+
+            # --- B. 评估 (Warping & Cost) ---
+            # 形状变换 [B*H*W, K, 4] -> 方便批量 Warp
+            all_costs = []
+            for src_idx, src_feat in enumerate(src_features):
+                # 计算 H 并 warp
+                # 注意：这里需要为 K 个假设分别计算 H，计算量较大
+                # 优化：只对当前最优的和采样到的邻居计算
+
+                # 假设我们只评估当前的 current_hypotheses (简化逻辑)
+                # [B, H, W, K, 3, 3]
+                H_mats = self.warper.get_homography(current_hypotheses, ...)
+
+                # Warp 并计算相似度 (Group Correlation)
+                cost = self.compute_cost(ref_feature, src_feat, H_mats)
+                all_costs.append(cost)
+
+            total_cost = torch.stack(all_costs).mean(0)
+
+            # --- C. 选择 (Selection) ---
+            # 选出 Cost 最小的平面参数更新 current_hypotheses
+            best_idx = torch.argmin(total_cost, dim=-1)  # [B, H, W]
+            current_hypotheses = torch.gather(current_hypotheses, 3,
+                                              best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 4))
+
+        # 4. 最终输出
+        # 将像素级平面转回深度图输出
+        final_depth = self.planes_to_depth(current_hypotheses)
+        return final_depth
+
+    def map_tri_to_pixel(self, tri_params, tri_id_map):
+        """
+        利用 tri_id_map 将 [B, N, K, 4] 映射为 [B, H, W, K, 4]
+        使用 F.embedding 或者 gather
+        """
+        B, N, K, C = tri_params.shape
+        flat_params = tri_params.view(B * N, K * C)  # Flatten for embedding constraint
+        # 需要处理 Batch 偏移，类似 Fitter 里的逻辑
+        # ... (Implementation detail)
+        # return mapped_params
+        return
+
+    def spatial_propagation(self, hypotheses, tri_id_map):
+        """
+        Checkerboard 传播
+        在此处加入你的 Edge Break 判断逻辑
+        """
+        # ...
+        # return prop_hypotheses
+        return hypotheses
+
 class Propagation(nn.Module):
     def __init__(self, neighbors = 16):
         super(Propagation, self).__init__()
         self.neighbors = neighbors
-
-
 
     def forward(self, batch, height, width, depth_sample, grid, depth_min, depth_max, depth_interval_scale):
         """Forward method of adaptive propagation
