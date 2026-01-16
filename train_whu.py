@@ -1,9 +1,10 @@
 import argparse
 import os
 
+from models.PlaneTools import *
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -160,12 +161,12 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (4 * args.summary_freq) == 0
+            do_summary_image = global_step % (1 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,
                                                                global_step=global_step)
             loss_depth = scalar_outputs['loss_depth']
-            # loss_alpha_sup=scalar_outputs['loss_alpha_sup']
+            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
             if do_summary_image:
@@ -173,16 +174,10 @@ def train():
             del scalar_outputs, image_outputs
 
             print(
-                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx,
-                                                                                                    args.epochs,
-                                                                                                    batch_idx,
-                                                                                                    len(TrainImgLoader),
-                                                                                                    loss_depth, loss,
-                                                                                                    time.time() - start_time))
-            # print(
-            #     'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},train loss:{:.3f}, time = {:.3f}'.format(epoch_idx, args.epochs, batch_idx,
-            #                                                                          len(TrainImgLoader),loss_depth,loss_alpha_sup,loss,
-            #                                                                          time.time() - start_time))
+                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
+                    epoch_idx, args.epochs, batch_idx,
+                    len(TrainImgLoader),loss_depth,loss_alpha_sup,loss,
+                    time.time() - start_time))
 
         # checkpoint
         if (epoch_idx + 1) % args.save_freq == 0:
@@ -200,15 +195,20 @@ def train():
             # do_summary_test = global_step % (10*args.summary_freq) == 0
             do_summary_image = global_step % (50 * args.summary_freq) == 0
             loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
+            loss_depth = scalar_outputs['loss_depth']
+            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
                 save_scalars(logger, 'test', scalar_outputs, global_step)
             if do_summary_image:
                 save_images(logger, 'test', image_outputs, global_step)
             avg_test_scalars.update(scalar_outputs)
             del scalar_outputs, image_outputs
-            print('Epoch {}/{}, Iter {}/{}, test loss = {:.3f}, time = {:3f}'.format(epoch_idx, args.epochs, batch_idx,
-                                                                                     len(TestImgLoader), loss,
-                                                                                     time.time() - start_time))
+            print(
+                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
+                    epoch_idx, args.epochs, batch_idx,
+                    len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
+                    time.time() - start_time))
+
         save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
         print("avg_test_scalars:", avg_test_scalars.mean())
         print("当前时间（time模块）：", time.ctime())
@@ -262,7 +262,7 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
-                    vertexs_batch, lines_batch, triangles_batch)
+                    vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'])
 
     depth_est = outputs["refined_depth"]
 
@@ -272,44 +272,49 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     # 总损失：深度损失+边断裂损失+连续性损失
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
 
-    # # 1) EdgeConsistencyLoss（自监督 BCE）
-    # edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.05, feat_weight=0.0, smooth_weight=0.0)
-    # loss_alpha_sup, diag_alpha = edge_consistency_loss_fn(
-    #     pred_alphas_list=outputs["edge_alphas"],
-    #     # 1/2分辨率图的深度图
-    #     gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
-    #     tri_infos=outputs["tri_infos"],
-    #     feat_map=None,
-    # )
-    #
-    # # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
-    # weight_alpha=100
-    # loss_alpha_sup=loss_alpha_sup*weight_alpha
-    # # loss_alpha_sup = 0.0
+    # EdgeConsistencyLoss（自监督 BCE）
+    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.1, sparsity_weight=1e-4)
+    loss_alpha_sup, info,edge_alphas_gt= edge_consistency_loss_fn(
+        pred_alphas_list=outputs["edge_alphas"],
+        # 1/2分辨率图的深度图
+        gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+        tri_infos=outputs["tri_infos"],
+        tri_id_map=outputs["output_plane"]['tri_id_map']
+    )
 
-    loss = loss_depth
+    # # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
+    weight_alpha=10
+    loss_alpha_sup=loss_alpha_sup*weight_alpha
+    loss = loss_depth+loss_alpha_sup
 
     # 边断裂损失
     loss.backward()
 
-    # 【新增】梯度裁剪 (必须加在 step 之前)
-    # max_norm 通常设为 0.1 到 1.0 之间，建议先试 1.0
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
-    # ===== 生成断裂图 ===============================================
-    # image_outputs_0 = generate_edge_alpha_overlays(
-    #     ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
-    #     edge_alphas_list=outputs["edge_alphas"],
-    #     edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
-    #     device=device,
-    #     overlay_alpha=0.6,  # 线条显示的透明度
-    #     line_thickness=1  # 线条粗细
-    # )
+    # ================ 生成断裂图 ===============================================
+    image_outputs_pre = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+        edge_alphas_list=outputs["edge_alphas"],
+        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+        device=device,
+        overlay_alpha=0.6,  # 线条显示的透明度
+        line_thickness=1  # 线条粗细
+    )
 
-    # ref_img_edge_alpha_0 = image_outputs_0["ref_img_edge_alpha"]
+    ref_img_edge_alpha_pre = image_outputs_pre["ref_img_edge_alpha"]
+
+    image_outputs_gt = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+        edge_alphas_list=edge_alphas_gt,
+        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+        device=device,
+        overlay_alpha=0.6,  # 线条显示的透明度
+        line_thickness=1  # 线条粗细
+    )
+
+    ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
 
     # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
     # 获取 Stage 1 的 GT 深度和 Mask
@@ -325,35 +330,48 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
     normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
 
+    # vis_depth = normalize_depth_for_display(depth_pred_phys, valid_mask=None)
+    # 2. 生成用于 TensorBoard 展示的数据 ym-need-delete 1.13
+    # 注意：这里我们手动归一化了，所以 save_images 里对 depth 的 normalize=True 其实就
+    # 变成了在 0~1 之间归一化，不会破坏我们做好的拉伸。
+    # vis_depth_gt_plane = normalize_depth_for_display(depth_gt_plane_stage_1)  # 传入 valid mask
+    #
+    # vis_depth_pre_plane = normalize_depth_for_display(outputs["output_plane"]['depth_pred'])  # 传入 valid mask
+
     # ===== tensorboard显示图片和曲线 ======================================
     scalar_outputs = {"loss": loss,
-                      "loss_depth": loss_depth}
-    # "loss_alpha_sup": loss_alpha_sup}
+                      "loss_depth": loss_depth,
+                      "loss_alpha_sup": loss_alpha_sup}
 
     image_outputs = { # 暂时注释一些图片，输出的图片太多了
                      # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
-                     "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
+                     "depth_gt_stage_1": depth_gt['stage_1'] * mask['stage_1'],
                      "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
-                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
-                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
+                     # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
+                     # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
                      "ref_img": sample["imgs"]['stage_1'][:, 0],
-                     # --- 新增：基于像素点的法向量图 ---
+                     # 新增：基于像素点的法向量图 
                      "normal_gt_stage_1": normal_gt_s1,
                      "normal_pred_stage_1": normal_pred_s1,
                      # 新增：基于平面的深度图和法向量图
                      "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
-                     "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred']
-                     # "ref_img_edge_alpha_0": ref_img_edge_alpha_0
+                     "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'],
+                     # 新增：基于平面的深度图和法向量图,真值
+                     "depth_gt_plane_stage_1": outputs["output_plane"]['depth_gt'],
+                     "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'],
+                     # 新增：边预测头预测值和真值
+                     "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
+                     "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
                      }
 
-    if detailed_summary:
-        # image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
-        image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
-                                                       mask['stage_1']
-        # image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
-        #                                                mask['stage_2']
-        # image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
-        #                                                mask['stage_3']
+    # if detailed_summary:
+    #     image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
+    #     image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
+    #                                                    mask['stage_1']
+    #     image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
+    #                                                    mask['stage_2']
+    #     image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
+    #                                                    mask['stage_3']
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
@@ -410,30 +428,104 @@ def test_sample(sample, detailed_summary=True, global_step=0):
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
 
-    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+    # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
+    outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
-                    vertexs_batch, lines_batch, triangles_batch)
+                    vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'])
 
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]
 
-    loss = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
-    scalar_outputs = {"loss": loss}
-    image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
-                     "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
-                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
-                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
-                     "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_0'][:, 0],
-                     }
-    if detailed_summary:
-        image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
-        image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
-                                                       mask['stage_1']
-        image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
-                                                       mask['stage_2']
-        image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
-                                                       mask['stage_3']
+    # 通过计算最终的损失
+    # 总损失：深度损失+边断裂损失+连续性损失
+    loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
+
+    # EdgeConsistencyLoss（自监督 BCE）
+    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.1, sparsity_weight=1e-4)
+    loss_alpha_sup, info, edge_alphas_gt = edge_consistency_loss_fn(
+        pred_alphas_list=outputs["edge_alphas"],
+        # 1/2分辨率图的深度图
+        gt_depth_map=depth_gt[f'stage_1'],
+        # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+        tri_infos=outputs["tri_infos"],
+        tri_id_map=outputs["output_plane"]['tri_id_map']
+    )
+
+    # # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
+    weight_alpha = 10
+    loss_alpha_sup = loss_alpha_sup * weight_alpha
+    loss = loss_depth + loss_alpha_sup
+
+    # ================ 生成断裂图 ===============================================
+    image_outputs_pre = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+        edge_alphas_list=outputs["edge_alphas"],
+        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+        device=device,
+        overlay_alpha=0.6,  # 线条显示的透明度
+        line_thickness=1  # 线条粗细
+    )
+
+    ref_img_edge_alpha_pre = image_outputs_pre["ref_img_edge_alpha"]
+
+    image_outputs_gt = generate_edge_alpha_overlays(
+        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+        edge_alphas_list=edge_alphas_gt,
+        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+        device=device,
+        overlay_alpha=0.6,  # 线条显示的透明度
+        line_thickness=1  # 线条粗细
+    )
+
+    ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
+
+    # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
+    # 获取 Stage 1 的 GT 深度和 Mask
+    gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
+    gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
+
+    # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
+    pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
+
+    # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
+    normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
+
+    # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
+    normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
+
+    scalar_outputs = {"loss": loss,
+                      "loss_depth": loss_depth,
+                      "loss_alpha_sup": loss_alpha_sup}
+
+    image_outputs = {  # 暂时注释一些图片，输出的图片太多了
+        # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
+        "depth_gt_stage_1": depth_gt['stage_1'] * mask['stage_1'],
+        "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
+        # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
+        # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
+        "ref_img": sample["imgs"]['stage_1'][:, 0],
+        # 新增：基于像素点的法向量图
+        "normal_gt_stage_1": normal_gt_s1,
+        "normal_pred_stage_1": normal_pred_s1,
+        # 新增：基于平面的深度图和法向量图
+        "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
+        "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'],
+        # 新增：基于平面的深度图和法向量图,真值
+        "depth_gt_plane_stage_1": outputs["output_plane"]['depth_gt'],
+        "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'],
+        # 新增：边预测头预测值和真值
+        "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
+        "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
+    }
+
+    # if detailed_summary:
+    #     image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
+    #     image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
+    #                                                    mask['stage_1']
+    #     image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
+    #                                                    mask['stage_2']
+    #     image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
+    #                                                    mask['stage_3']
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)

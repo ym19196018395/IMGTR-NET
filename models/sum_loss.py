@@ -9,9 +9,14 @@ from utils import _sample_map
 class EdgeConsistencyLoss(nn.Module):
     """
     自监督 EdgeConsistencyLoss（BCE 形式），用于监督 edge alpha：
-      - 基于每条边两侧三角的 mean depth 差（可选融合特征差）生成 soft-label（consistency_score）
-      - 使用 BCE(pred_alpha, consistency_score) 作为主损失
-      - 可选 smoothness 正则（邻边 alpha 应相似）
+    目标：利用 GT 深度图动态生成“断裂真值 (Ground Truth Label)”进行监督。
+    逻辑流程：
+      1. 计算每条边的几何中点。
+      2. 在 GT 深度图上，围绕中点进行 3x3 局部采样。
+      3. 利用 tri_id_map 区分采样点属于 T1 还是 T2。
+      4. 计算 GT 深度差: diff = |Mean(T1) - Mean(T2)|。
+      5. 生成标签: Target = 1 if diff > threshold else 0。
+      6. 计算 BCE Loss。
     兼容输入：
       - pred_alpha_list: list 长度 B，每项 tensor [E_b]（EdgeHead 返回）
       - depth_map: [B,1,H,W]（用于内部 pool tri_depths，除非你提供 tri_depths_list）
@@ -29,26 +34,115 @@ class EdgeConsistencyLoss(nn.Module):
       loss (scalar tensor), diagnostics (dict)
     """
 
-    def __init__(self, depth_threshold=0.10, feat_weight=0.0, smooth_weight=0.0, device=None,feat_scale=1.0, sparsity_weight=0.0):
+    def __init__(self, depth_threshold=0.1, sparsity_weight=0.0):
         """
-        Args:
-            depth_threshold: 浮点，深度差归一化门限（用于 depth_diff_norm = clamp(depth_diff / depth_threshold, 0, 1)）
-            smooth_weight: 平滑项权重（越大越平滑）
-            feat_weight: 特征一致性在 combined target 中的权重（0.0 表示只用深度）
-            feat_scale: 特征差距归一化因子（将 L2 距离 / feat_scale -> clamp 到 [0,1]）
-            sparsity_weight: alpha 稀疏性权重（鼓励 alpha 小）
-        """
+                Args:
+                    depth_threshold (float): 判定断裂的深度阈值 (单位是m，超过0.1m就算断裂)。
+                                             如果 GT 深度差大于此值，认为该边是断裂的 (Label=1)。
+                    sparsity_weight (float): 稀疏正则权重 (可选)。
+                """
         super().__init__()
         self.depth_threshold = float(depth_threshold)
-        self.feat_weight = float(feat_weight)
-        self.smooth_weight = float(smooth_weight)
-        self.feat_scale = float(feat_scale)
         self.sparsity_weight = float(sparsity_weight)
-        self.device = device if device is not None else (
-            torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+
+    def _compute_edge_midpoints(self, v1, v2):
+        """
+        计算两个三角形公共边的中点 (向量化实现)
+        Args:
+            v1: [E, 3, 2] 三角形1的三个顶点坐标 (归一化 [-1, 1])
+            v2: [E, 3, 2] 三角形2的三个顶点坐标
+        Returns:
+            midpoints: [E, 1, 2] 边的中点坐标
+        """
+        # 寻找公共点：计算 v1 和 v2 顶点之间的两两距离
+        # v1: [E, 3, 1, 2], v2: [E, 1, 3, 2]
+        dist = torch.norm(v1.unsqueeze(2) - v2.unsqueeze(1), p=2, dim=-1)  # [E, 3, 3]
+
+        # 判定重合点：距离小于极小值 (考虑浮点误差)
+        mask = dist < 1e-4  # [E, 3, 3] bool
+
+        # 对于标准的三角网格，两个邻接三角形应该恰好有2个公共顶点
+        # 我们需要找到这2个顶点并求平均
+
+        # 方法：利用 mask 提取 v1 中属于公共边的顶点
+        # mask.any(dim=2) -> [E, 3]，表示 v1 的第 i 个点是否在 v2 中出现过
+        is_shared_v1 = mask.any(dim=2).float().unsqueeze(-1)  # [E, 3, 1]
+
+        # 计算中点：Sum(v1 * is_shared) / Sum(is_shared)
+        # 正常情况下 sum(is_shared) 应该是 2
+        denom = is_shared_v1.sum(dim=1).clamp(min=1.0)  # [E, 1]
+        midpoints = (v1 * is_shared_v1).sum(dim=1) / denom  # [E, 2]
+
+        return midpoints.unsqueeze(1)  # [E, 1, 2] 适配 grid_sample
+
+    def _generate_gt_target(self, midpoints, gt_depth_map, tri_id_map, t1_ids, t2_ids):
+        """
+        基于 GT 深度图生成二值标签
+        Returns:
+            targets: [E] 0 or 1
+            valid_mask: [E] 标记哪些边的 GT 数据是有效的
+        """
+        E = midpoints.shape[0]
+        H, W = gt_depth_map.shape[-2:]
+        device = midpoints.device
+
+        # 1. 生成 3x3 采样网格
+        dx = torch.linspace(-1, 1, 3, device=device) * (2.0 / W)
+        dy = torch.linspace(-1, 1, 3, device=device) * (2.0 / H)
+        grid_y, grid_x = torch.meshgrid(dy, dx, indexing='ij')
+        offsets = torch.stack((grid_x, grid_y), dim=-1).view(1, 9, 2)
+
+        # [E, 9, 2]
+        sample_grid = midpoints + offsets
+
+        # 2. 采样 GT Depth 和 ID Map
+        # 技巧：reshape 为 [1, E*9, 1, 2] 进行一次性采样
+        flat_grid = sample_grid.view(1, E * 9, 1, 2).unsqueeze(2)  # [1, E*9, 1, 2] fix dim
+        # grid_sample 需要 grid 是 4D (N, H, W, 2)
+        flat_grid = sample_grid.view(1, E * 9, 1, 2)
+
+        # 采样深度 (Bilinear)
+        # 注意：GT Depth 通常包含 0 (无效值)，采样后需要处理
+        sampled_depth = F.grid_sample(gt_depth_map, flat_grid, mode='bilinear', align_corners=True,
+                                      padding_mode='zeros')
+
+        # 采样 ID (Nearest)
+        sampled_id = F.grid_sample(tri_id_map, flat_grid, mode='nearest', align_corners=True, padding_mode='border')
+
+        patches_depth = sampled_depth.view(E, 9)
+        patches_id = sampled_id.view(E, 9)
+
+        # 3. 分离区域 T1 和 T2
+        # 判断 patch 中的像素属于哪个三角形
+        mask_t1 = (torch.abs(patches_id - t1_ids.unsqueeze(1)) < 0.1).float()
+        mask_t2 = (torch.abs(patches_id - t2_ids.unsqueeze(1)) < 0.1).float()
+
+        # 4. 过滤无效 GT (GT=0 的位置不参与计算)
+        valid_gt = (patches_depth > 1e-4).float()
+        mask_t1 = mask_t1 * valid_gt
+        mask_t2 = mask_t2 * valid_gt
+
+        # 5. 计算均值
+        sum_t1 = mask_t1.sum(dim=1)
+        sum_t2 = mask_t2.sum(dim=1)
+
+        # 有效性判断：只有当 T1 和 T2 区域都有至少一个有效 GT 像素时，这条边才有效
+        # 否则无法判断深度差，应忽略此边
+        edge_valid_mask = (sum_t1 > 0) & (sum_t2 > 0)
+
+        mean_d1 = (patches_depth * mask_t1).sum(dim=1) / sum_t1.clamp(min=1.0)
+        mean_d2 = (patches_depth * mask_t2).sum(dim=1) / sum_t2.clamp(min=1.0)
+
+        # 6. 生成标签
+        diff = torch.abs(mean_d1 - mean_d2)
+
+        # 核心逻辑：如果深度差大于阈值，Label=1 (断裂)，否则 0
+        targets = (diff > self.depth_threshold).float()
+
+        return targets, edge_valid_mask
 
     # ----------------- 主接口 -----------------
-    def forward(self, pred_alphas_list, gt_depth_map, tri_infos, feat_map=None):
+    def forward(self, pred_alphas_list, gt_depth_map, tri_infos, tri_id_map):
         """
         Args:
             - pred_alphas_list: list len=B, each tensor [E_b] (float 0..1)
@@ -62,249 +156,107 @@ class EdgeConsistencyLoss(nn.Module):
                     'edges_pixels': 每个边的像素（归一化）集合，后续需要引入作为一个特征传入mlp中
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
                 }
-            - feat_map: optional tensor [B,C,H,W]，若给定将用于特征一致性项
+            - tri_id_map: [B, H, W] (Dense ID Map)
         Returns:
             final_loss (tensor scalar), info dict 包含分项损失
         """
         device = gt_depth_map.device
-        B = gt_depth_map.shape[0]
-        _, _, H, W = gt_depth_map.shape
+        B = len(pred_alphas_list)
 
-        # ------------------ 1. 从 tri_infos 提取预处理好的 batch 列表 ------------------
-        # 你说数据放在 tri_infos[0] 中，所以直接读取
-        info_batch = tri_infos[0] if isinstance(tri_infos, (list, tuple)) else tri_infos
-        batch_num_tri = info_batch['batch_num_tri']  # list length B
-        centers_list = info_batch['centers_list']  # list len B
-        vertices_list = info_batch['vertices_list']  # list len B
-        edges_list = info_batch['edges_list']  # list len B
-        boundary_local_idxs_per_batch = info_batch.get('boundary_local_idxs_per_batch',
-                                                       [[] for _ in range(B)])  # list len B
+        total_bce_loss = 0.0
+        total_valid_edges = 0
+        total_sparsity_loss = 0.0
 
-        # ------------------ 2. 统一 centers/vertices 到 tensor 并 pad 到 N_max ------------------
-        # 假定 centers_list[b] 与 vertices_list[b] 已归一化到 [-1,1] 且为 numpy 或 torch tensor
-        N_list = [int(x) for x in batch_num_tri]
-        N_max = int(max(N_list)) if len(N_list) > 0 else 0
-        if N_max == 0:
-            zero = torch.tensor(0.0, device=device)
-            return zero, {'bce': 0.0, 'smooth': 0.0, 'feat_cons': 0.0, 'sparsity': 0.0}
+        # 诊断统计
+        diag_stats = {'pos_ratio': 0.0, 'valid_ratio': 0.0}
 
-        centers_padded = []
-        vertices_padded = []
+        output_alphas_list = []
+
         for b in range(B):
-            n_tri = batch_num_tri[b]
-            c = centers_list[b]  # [n_tri,2] 或 shape (0,2)
-            v = vertices_list[b]  # [n_tri,3,2] 或 (0,3,2)
-
-            if n_tri < N_max:
-                # 进行一个填充，填充到三角形数量最多大小的张量
-                # ym-issue 可能要进行一个修改效率有点低了
-                # pad with zeros (zeros 对 grid_sample 等价于图像左上角；
-                # 但是这些 padding 三角不会被 edges用到所以可以放心填充
-                pad_c = torch.zeros((N_max - n_tri, 2), dtype=torch.float32)
-                c = torch.cat([c, pad_c], dim=0)
-                pad_v = torch.zeros((N_max - n_tri, 3, 2), dtype=torch.float32)
-                v = torch.cat([v, pad_v], dim=0)
-
-            # reshape to required shape for sampling: centers -> [N_max, 1, 2]; vertices -> [N_max, 3, 2]
-            centers_padded.append(c.unsqueeze(1))  # [N_max,1,2]
-            vertices_padded.append(v)  # [N_max,3,2]
-
-        batch_centers = torch.stack(centers_padded, dim=0).to(device=device).float()  # [B, N_max, 1, 2]
-        batch_vertices = torch.stack(vertices_padded, dim=0).to(device=device).float()  # [B, N_max, 3, 2]
-
-        # ------------------ 3. 使用相同的采样策略采样 GT 三角深度（保证一致性） ------------------
-        # 依赖 sample_tri_attributes(map_tensor, centers, vertices) 函数 (与 EdgeHead 共用)
-        gt_tri_depths = _sample_map(gt_depth_map,batch_centers, batch_vertices)  # [B, N_max, 1]
-
-        # 若提供 feat_map，则同样采样三角特征
-        if feat_map is not None:
-            tri_feats = _sample_map(feat_map,batch_centers, batch_vertices)  # [B, N_max, C_feat]
-        else:
-            tri_feats = None
-
-        # ------------------ 4. 将一个batch数据链接在一起方便计算，构建 all_edges_indices (global) & pred_alphas_flat ------------------
-        all_edges_global = []
-        batch_edge_counts = []
-        # 将不同组的三角id进行一个累加类似于 第一组trinum有500 第二组trinum的标记从500开始计算
-        # 这样保证了不会访问到之前pad填充的zero的特征和深度
-        for b in range(B):
-            edges_b = edges_list[b]  # LongTensor [E_b, 2] or shape (0,2)
-            if edges_b.numel() == 0:
-                batch_edge_counts.append(0)
+            # 获取当前数据
+            pred_alphas = pred_alphas_list[b]  # [E]
+            if pred_alphas.numel() == 0:
                 continue
-            edges_b = edges_b.to(device=device).long()
-            # 注意：edges_b 中的索引是 local 0..(n_tri-1)
-            global_offset = b * N_max
-            global_edges = edges_b + global_offset  # broadcasting
-            all_edges_global.append(global_edges)
-            batch_edge_counts.append(global_edges.shape[0])
 
-        # 如果没有任何边，返回空列表（每个样本对应空 tensor）
-        if len(all_edges_global) == 0:
-            zero = torch.tensor(0.0, device=device)
-            return zero, {'bce': 0.0, 'smooth': 0.0, 'feat_cons': 0.0, 'sparsity': 0.0}
+            # 移动数据到 GPU
+            current_edges = tri_infos[0]['edges_list'][b].to(device).long()
+            current_vertices = tri_infos[0]['vertices_list'][b].to(device)
 
-        # 拼接为 [Total_E, 2]，将所有批次的线段拼在一起
-        all_edges_indices = torch.cat(all_edges_global, dim=0).long().to(device=device)
+            # 准备单张图的 Map
+            curr_gt_map = gt_depth_map[b].unsqueeze(0)  # [1, 1, H, W]
+            curr_id_map = tri_id_map[b].unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
 
-        # 对齐并拼接 pred_alphas_list（按 batch_edge_counts 顺序）
-        pred_parts = []
-        for b in range(B):
-            cnt = batch_edge_counts[b]
-            if cnt == 0:
-                continue
-            p = pred_alphas_list[b]
-            if p is None or (isinstance(p, torch.Tensor) and p.numel() == 0):
-                pred_parts.append(torch.zeros((cnt,), device=device))
-            else:
-                pred_parts.append(p.to(device=device).view(-1))
-        if len(pred_parts) == 0:
-            zero = torch.tensor(0.0, device=device)
-            return zero, {'bce': 0.0, 'smooth': 0.0, 'feat_cons': 0.0, 'sparsity': 0.0}
+            # --- Step A: 复用定位逻辑 (计算中点) ---
+            idx1 = current_edges[:, 0]
+            idx2 = current_edges[:, 1]
+            v1 = current_vertices[idx1]
+            v2 = current_vertices[idx2]
 
-        pred_alphas_flat = torch.cat(pred_parts, dim=0).unsqueeze(dim=1)  # [Total_E,1]
+            midpoints = self._compute_edge_midpoints(v1, v2)  # [E, 1, 2]
 
+            # --- Step B & C: 基于 GT 生成真值标签 ---
+            # 传入 idx1, idx2 作为 t1_ids, t2_ids
+            # targets: [E], valid_mask: [E]
+            gt_targets, valid_mask = self._generate_gt_target(
+                midpoints, curr_gt_map, curr_id_map, idx1, idx2
+            )
 
-        if pred_alphas_flat.shape[0] != all_edges_indices.shape[0]:
-            raise RuntimeError(
-                f"[EdgeConsistencyLoss] pred_alphas_flat length ({pred_alphas_flat.shape[0]}) != target_score ({all_edges_indices.shape[0]})")
+            # 这里的 idx1 == idx2 表示这条边只有一个邻接面 (边界)
+            is_boundary = (idx1 == idx2)  # [E] bool
 
+            if is_boundary.any():
+                # 1. 强制将边界边的 Target 设为 1 (断裂)
+                # 注意：gt_targets 不需要梯度，所以直接修改是安全的
+                gt_targets[is_boundary] = 1.0
 
-        # ------------------ 5. 从 gt_tri_depths / tri_feats 中 gather 两侧值 ------------------
-        # 将三角面特征进行一个展平
-        flat_gt = gt_tri_depths.view(B * N_max, 1)  # [B*N_max, 1]
-        # 分别取边的相邻两个三角面的编号
-        idx1 = all_edges_indices[:, 0]
-        idx2 = all_edges_indices[:, 1]
-        # 取得三角面的深度
-        d1 = flat_gt[idx1] # [Total_E]
-        d2 = flat_gt[idx2]
-        depth_diff = torch.abs(d1 - d2)  # [Total_E]
+                # 2. 强制认为边界边是“有效”的 (即使 GT 采样失败)
+                # 因为边界本身就是一种极强的几何先验，不需要 GT 深度也能确定是断裂
+                valid_mask = valid_mask | is_boundary
 
-        # depth consistency -> 归一化到 [0,1],ym-issue 有点问题全都是1 要么就是0
-        depth_diff_norm = torch.clamp(depth_diff / (self.depth_threshold + 1e-6), 0.0, 1.0)  # [Total_E,1]
+            output_alphas_list.append(gt_targets)
+            # --- Step D: 计算 BCE Loss ---
+            # 只在 GT 有效的边上计算 Loss
+            if valid_mask.sum() > 0:
+                valid_pred = pred_alphas[valid_mask]
+                valid_target = gt_targets[valid_mask]
 
-        # 特征一致性（若有）: L2 距离 -> 归一化到 [0,1]
-        if tri_feats is not None:
-            flat_feats = tri_feats.view(B * N_max, -1)  # [B*N_max, C]
-            f1 = flat_feats[idx1]  # [Total_E, C]
-            f2 = flat_feats[idx2]
-            feat_dist = torch.norm(f1 - f2, p=2, dim=1)  # [Total_E]
-            feat_dist_norm = torch.clamp(feat_dist / (self.feat_scale + 1e-6), 0.0, 1.0)
+                # BCE Loss
+                loss_bce = F.binary_cross_entropy(valid_pred, valid_target, reduction='sum')
+
+                total_bce_loss += loss_bce
+                total_valid_edges += valid_mask.sum().item()
+
+                # 统计正样本比例 (断裂边的比例)
+                diag_stats['pos_ratio'] += valid_target.sum().item()
+
+            diag_stats['valid_ratio'] += valid_mask.sum().item()
+
+            # --- Sparsity Loss (针对所有预测，无论 GT 是否有效) ---
+            # 鼓励预测值整体偏向 0
+            if self.sparsity_weight > 0:
+                total_sparsity_loss += pred_alphas.mean()
+
+        # 归一化 Loss
+        if total_valid_edges > 0:
+            final_bce = total_bce_loss / total_valid_edges
+            diag_stats['pos_ratio'] /= total_valid_edges
         else:
-            feat_dist_norm = None
+            final_bce = torch.tensor(0.0, device=device)
 
-        # 合并成 soft target (depth + feat)，若没有 feat 则只用 depth
-        if feat_dist_norm is not None:
-            target_score = (depth_diff_norm * (1.0) + feat_dist_norm * (self.feat_weight)) / (1.0 + self.feat_weight)
-        else:
-            target_score = depth_diff_norm  # [Total_E] in [0,1]
+        # Sparsity 平均
+        final_sparsity = (total_sparsity_loss / B) * self.sparsity_weight
 
-        # ------------------ 6. 强制 boundary edges 的 target = 1.0 ------------------
-        # 目的是解决边对应一个面的情况，默认断裂，值为1，让其进行学习
-        # 计算每个 batch 的 global start index（按 batch_edge_counts）
-        global_starts = []
-        acc = 0
-        for cnt in batch_edge_counts:
-            global_starts.append(acc)
-            acc += cnt
-
-        # 计算这些断裂边在edge_total的位置
-        global_boundary_positions = []
-        for b_idx, local_idxs in enumerate(boundary_local_idxs_per_batch):
-            if not local_idxs:
-                continue
-            start = global_starts[b_idx]
-            for li in local_idxs:
-                global_boundary_positions.append(start + int(li))
-
-        # 将对应断裂边位置赋值为1
-        if len(global_boundary_positions) > 0:
-            gb = torch.tensor(global_boundary_positions, dtype=torch.long, device=device)
-            target_score[gb] = 1.0
-
-        # ------------------ 7. BCE 损失（pred_alphas_flat vs target_score） ------------------
-        pred = pred_alphas_flat
-        ts = target_score
-
-        # 报数值统计 ym-need-delete
-        print("DEBUG pred_alphas_flat: min={}, max={}, nan={}, inf={}".format(
-            float(torch.min(pred).detach().cpu()), float(torch.max(pred).detach().cpu()),
-            int(torch.isnan(pred).any()), int(torch.isinf(pred).any())
-        ))
-        print("DEBUG target_score: min={}, max={}, nan={}, inf={}".format(
-            float(torch.min(ts).detach().cpu()), float(torch.max(ts).detach().cpu()),
-            int(torch.isnan(ts).any()), int(torch.isinf(ts).any())
-        ))
-
-        # 如有异常，抛出更友好的错误
-        if torch.isnan(pred).any() or torch.isinf(pred).any():
-            raise RuntimeError("pred_alphas_flat contains NaN or Inf. Check EdgeHead outputs / any in-place ops.")
-        if torch.isnan(ts).any() or torch.isinf(ts).any():
-            raise RuntimeError("target_score contains NaN or Inf. Check gt sampling / math.")
-        # 检查超出区间
-        if pred.min() < -1e-6 or pred.max() > 1.0 + 1e-6:
-            print("WARN: pred outside [0,1], min/max:", float(pred.min()), float(pred.max()))
-
-        loss_bce_sum = F.binary_cross_entropy(pred_alphas_flat, target_score.detach(), reduction='sum')
-        loss_bce = loss_bce_sum / (pred_alphas_flat.numel() + 1e-8)
-
-        # ------------------ 8. Smoothness 损失（基于三角-边关联） ------------------
-        # 构建 tri -> incident edge indices 映射（使用 edges_list）
-        smooth_loss=0.0
-        if(self.smooth_weight>0.0):
-            tri_to_edges = dict()  # key: global_tri_index (b*N_max + tri_local), value: list of global edge indices
-            # global edge index enumeration: 0..Total_E-1 in the same order as all_edges_indices
-            total_e = all_edges_indices.shape[0]
-            for g_idx in range(total_e):
-                t1 = int(all_edges_indices[g_idx, 0].item())
-                t2 = int(all_edges_indices[g_idx, 1].item())
-                # 对于边被记录成 (t,t)（boundary），仍然添加到该三角对应的 incident list
-                if t1 not in tri_to_edges:
-                    tri_to_edges[t1] = []
-                if t2 not in tri_to_edges:
-                    tri_to_edges[t2] = []
-                tri_to_edges[t1].append(g_idx)
-                if t2 != t1:
-                    tri_to_edges[t2].append(g_idx)
-
-            smooth_loss = torch.tensor(0.0, device=device)
-            smooth_count = 0
-            for tri_idx, edge_idxs in tri_to_edges.items():
-                # 若一个三角 incident 边少于2 则跳过
-                if len(edge_idxs) < 2:
-                    continue
-                # pairwise 差平方和（可优化，但此处直接计算）
-                for i in range(len(edge_idxs)):
-                    for j in range(i + 1, len(edge_idxs)):
-                        e1 = edge_idxs[i];
-                        e2 = edge_idxs[j]
-                        diff = pred_alphas_flat[e1] - pred_alphas_flat[e2]
-                        smooth_loss = smooth_loss + diff * diff
-                        smooth_count += 1
-            if smooth_count > 0:
-                smooth_loss = smooth_loss / float(smooth_count)
-            else:
-                smooth_loss = torch.tensor(0.0, device=device)
-
-
-        # ------------------ 9. Sparsity（可选） ------------------
-        sparsity_loss = 0
-        if self.sparsity_weight > 0.0:
-            sparsity_loss=torch.mean(pred_alphas_flat)
-
-        # ------------------ 10. 总损失合成 ----------------        -
-        final_loss = loss_bce + self.smooth_weight * smooth_loss + self.sparsity_weight * sparsity_loss
+        total_loss = final_bce + final_sparsity
 
         info = {
-            'bce': loss_bce.item() if isinstance(loss_bce, torch.Tensor) else float(loss_bce),
-            'smooth': smooth_loss.item() if isinstance(smooth_loss, torch.Tensor) else float(smooth_loss),
-            'feat_cons': float(torch.mean(target_score).item()) if target_score.numel() > 0 else 0.0,
-            'sparsity': float(sparsity_loss.item()) if isinstance(sparsity_loss, torch.Tensor) else float(
-                sparsity_loss),
-            'total': float(final_loss.item()) if isinstance(final_loss, torch.Tensor) else float(final_loss)
+            'bce': final_bce.item(),
+            'sparsity': final_sparsity.item() if isinstance(final_sparsity, torch.Tensor) else 0.0,
+            'total': total_loss.item(),
+            'pos_ratio': diag_stats['pos_ratio'],  # 诊断：当前的 GT 阈值下，有多少比例的边被判定为断裂
+            'valid_edges': total_valid_edges  # 诊断：有多少边成功采样到了 GT
         }
-        return final_loss, info
+
+        return total_loss, info,output_alphas_list
 
 
 

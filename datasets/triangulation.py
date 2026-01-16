@@ -280,11 +280,12 @@ def get_cdt_datas(cdt_file_path: str,H:int,W:int) -> Cdt_data:
                 errors.append(f"线数量不匹配，预期{num_lines}条，实际{len(lines)}条")
             if len(triangles) != num_triangles:
                 errors.append(f"三角形数量不匹配，预期{num_triangles}个，实际{len(triangles)}个")
-            # 量化处理将亚像素级像素转化为图像像素 ym-issue-11.29 因为后面是双线性插值提取不需要化为整数
-            # vertices_int = quantize_vertices(vertices_float, (W, H), method='round')
+
 
     except Exception as e:
         errors.append(f"读取文件时发生错误：{str(e)}\n{traceback.format_exc()}")
+        print("读取文件时发生错误：{}".format(cdt_file_path))
+
 
     cdt_data=(Cdt_data(vertices_float,lines, triangles))
     return cdt_data

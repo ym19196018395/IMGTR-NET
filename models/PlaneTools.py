@@ -142,7 +142,7 @@ class DensePlaneFitter:
         # 1. 生成 Stage 1 的像素坐标网格 (u, v)
         y_range = torch.arange(0, self.H, dtype=torch.float32, device=device)
         x_range = torch.arange(0, self.W, dtype=torch.float32, device=device)
-        self.grid_y, self.grid_x = torch.meshgrid(y_range, x_range)  # [H, W]
+        self.grid_y, self.grid_x = torch.meshgrid(y_range, x_range,indexing='ij')  # [H, W]
 
         # 2. 生成用于 grid_sample 的归一化坐标 (针对 Stage 2)
         # 归一化到 [-1, 1]
@@ -150,7 +150,8 @@ class DensePlaneFitter:
         self.norm_v = (self.grid_y / (self.H - 1)) * 2.0 - 1.0
         self.sampling_grid = torch.stack((self.norm_u, self.norm_v), dim=-1)  # [H, W, 2]
 
-    def forward(self, depth_stage2, tri_id_map, intrinsics_s1, max_num_triangles):
+
+    def By_SVD_Plane(self, depth_stage2, tri_id_map, intrinsics_s1, max_num_triangles):
         """
         Args:
             depth_stage2: [B, 1, H_s2, W_s2] (Stage 2 深度图)
@@ -162,7 +163,7 @@ class DensePlaneFitter:
             plane_params: [B, N_tri, 4] (nx, ny, nz, d)
         """
         B = depth_stage2.shape[0]
-
+        device = depth_stage2.device
         # ==========================================
         # Step 1: 投影与采样 (Project & Sample)
         # ==========================================
@@ -182,11 +183,9 @@ class DensePlaneFitter:
             align_corners=True
         )  # [B, 1, H_s1, W_s1]
 
-        # --- 🛡️ 诊断 3: 检查深度值是否有效 ---
+        # 检查是否全部无效
         if sampled_depth.max() < 1e-4:
-            print(f"❌ [Fatal Error] Sampled Depth 几乎全为 0 (Max={sampled_depth.max().item():.6f})！")
-            print("   -> 请检查 Stage 2 的输出深度是否正常，或者 grid_sample 的坐标是否正确。")
-            return self._get_fallback_planes(B, max_num_triangles, depth_stage2.device)
+            return self._get_fallback_planes(B, max_num_triangles, device)
 
         # ==========================================
         # Step 2: 反投影生成点云 (Back-Projection)，将深度图(2.5D) 变成 点云(3D)
@@ -227,13 +226,8 @@ class DensePlaneFitter:
         # 过滤无效像素 (tri_id == -1 或 深度要求＞0)
         valid_mask = (tri_ids_flat >= 0) & (points_flat[:, 2] > 1e-4)
 
-        # --- 🛡️ 诊断 4: 检查有效像素数量 ---
         if valid_mask.sum() == 0:
-            print("❌ [Fatal Error] valid_mask 全是 False！没有一个像素同时满足 ID>=0 和 Depth>0。")
-            # 打印一下两边的状态
-            print(f"   -> Valid IDs count: {(tri_ids_flat >= 0).sum().item()}")
-            print(f"   -> Valid Depth count: {(points_flat[:, 2] > 1e-4).sum().item()}")
-            return self._get_fallback_planes(B, max_num_triangles, depth_stage2.device)
+            return self._get_fallback_planes(B, max_num_triangles, device)
 
         # 保留有效点云和有效每个三角形包含像素的编号 是基于像素图
         valid_points = points_flat[valid_mask]
@@ -247,9 +241,8 @@ class DensePlaneFitter:
 
         # 确保 indices 不越界 (这是 scatter 崩溃的常见原因)
         if valid_ids.max() >= total_bins:
-            print(f"❌ [Error] global_tri_ids 越界！Max ID={valid_ids.max()}, Total Bins={total_bins}")
-            print("   -> 请检查传入的 max_num_triangles 是否小于实际存在的三角形 ID。")
-            return self._get_fallback_planes(B, max_num_triangles, depth_stage2.device)
+            print(f"❌ [Error] global_tri_ids Out of Bounds!")
+            return self._get_fallback_planes(B, max_num_triangles, device)
 
         # --- 3.1 统计一阶矩 (Sum P) 和 计数 (Count) ---
         # scatter_add_的作用：对于 valid_ids 中的每个id，把ones中对应位置的值加到counts[id]上。
@@ -300,17 +293,26 @@ class DensePlaneFitter:
         center_correction = torch.bmm(sum_P.unsqueeze(2), sum_P.unsqueeze(1)) / safe_counts.view(-1, 1, 1)
         covariance = sum_PPt - center_correction
 
+        # === 修复 2: 防止协方差矩阵出现 NaN (例如 Inf-Inf 导致) ===
+        # 即使前面 clamp 了深度，数值计算仍可能产生极其微小的负数(应该为0)或 NaN
+        covariance = torch.nan_to_num(covariance, nan=0.0)
+
         # --- 3.4 特征值分解求解法向量 ---
         # 求解 Cov * n = lambda * n
         # eigh 适用于实对称矩阵，速度快且稳定
         try:
-            # torch.symeig (旧版) 或 torch.linalg.eigh (新版)
-            # 假设你用的是 1.7+，用 symeig
-            vals, vecs = torch.symeig(covariance, eigenvectors=True)
+            vals, vecs = torch.linalg.eigh(covariance)
 
             # 取最小特征值对应的特征向量
             normals = vecs[:, :, 0].float()  # [Total, 3]
             centroids = centroids.float()
+
+            # # === 🛠️ 修复 3: 检查 SVD 输出是否含有 NaN ===
+            # # try-except 抓不到 NaN 结果，必须手动查
+            # if torch.isnan(normals).any():
+            #     # print("⚠️ Warning: NaNs detected in normals after SVD. Fixing...")
+            #     nan_mask = torch.isnan(normals).any(dim=1)
+            #     normals[nan_mask] = torch.tensor([0.0, 0.0, 1.0], device=device)  # 默认朝前
 
         except RuntimeError as e:
             print(f"⚠️ SVD Failed: {e}")
@@ -319,21 +321,32 @@ class DensePlaneFitter:
             centroids = centroids.float()
 
         # ==========================================================
-        # 统一法向量方向 (Orient Normals)
+        # 强制法向量指向相机 (Orient Normals)
         # ==========================================================
-        # 你的兜底策略是 (0, 0, 1)，说明你希望法向量指向 +Z 方向（通常是相机前方）
-        # 我们检查每个法向量的 Z 分量。如果 n_z < 0，说明它指向了 -Z，翻转它！
 
-        # 1. 获取 Z 分量
-        nz = normals[:, 2:3]  # [Total, 1]
+        # 方法：计算法向量与“相机-质心”视线的点积
+        # 在相机坐标系下，相机原点是 (0,0,0)，所以视线向量就是 centroids 本身
+        # 我们希望 normal 指向相机，即 normal 与 centroids 的夹角 > 90度 (点积 < 0)
+        # 或者 normal 指向外部 (背离相机)，即 normal 与 centroids 的夹角 < 90度 (点积 > 0)
 
-        # 2. 计算翻转系数：如果 nz < 0 则为 -1，否则为 1
-        # 这里的 1e-6 是防止 0 的情况
-        flip_mask = torch.sign(nz + 1e-6)
+        # 通常 MVS 定义法向量指向物体外部（即指向相机）。
+        # 所以我们需要 dot(n, v) < 0。如果 dot > 0，就翻转 n。
 
-        # 3. 翻转法向量
-        # 如果原来是 [0, 0, -1] -> 乘 -1 -> [0, 0, 1] (正确)
-        # 如果原来是 [0, 0, 1]  -> 乘 1  -> [0, 0, 1] (保持)
+        # 1. 计算点积 (Batch Dot Product)
+        # raw_normals: [N, 3], centroids: [N, 3]
+        dot_product = torch.sum(normals * centroids, dim=1, keepdim=True)  # [N, 1]
+
+        dot_product = -dot_product
+
+        # 2. 判断方向并翻转
+        # 如果点积 > 0 (同向)，说明法向量指向了屏幕里面（背离相机），需要翻转
+        # sign: 正数变 -1 (翻转)，负数变 1 (保持)
+        flip_mask = -torch.sign(dot_product)
+
+        # 处理 0 的情况 (极少见，垂直于视线)
+        flip_mask[flip_mask == 0] = 1.0
+
+        # 3. 应用翻转
         normals = normals * flip_mask
 
         # ==========================================================
@@ -356,10 +369,170 @@ class DensePlaneFitter:
             normals[invalid_tris] = torch.tensor([0.0, 0.0, 1.0], device=self.device)
             d_vals[invalid_tris, 0] = -fallback_z
 
+
+        # === 🛠️ 修复 4: 最终输出前的 NaN 检查 ===
+        # 确保万无一失，防止任何 NaN 导致可视化全黑
+        # if torch.isnan(normals).any() or torch.isnan(d_vals).any():
+        #     print("⚠️ Final check: NaNs found in plane params. Cleaning.")
+        #     normals = torch.nan_to_num(normals, nan=0.0)
+        #     d_vals = torch.nan_to_num(d_vals, nan=-10.0)
+        #     # 确保 normals 模长不为0
+        #     norm_len = torch.norm(normals, dim=1, keepdim=True)
+        #     zero_len = norm_len < 1e-6
+        #     normals[zero_len.squeeze()] = torch.tensor([0.0, 0.0, 1.0], device=device)
+
         # 组合结果
         plane_params = torch.cat([normals, d_vals], dim=1)
 
         return plane_params.view(B, max_num_triangles, 4)
+
+    def get_gt_planes_by_3points(self, depth_gt, tri_id_map, intrinsics, max_num_triangles):
+        """
+        快速利用 GT 深度图，通过三点法解析求解平面参数。
+        策略：在每个三角形内取 [First, Middle, Last] 三个像素点计算法向量。
+
+        Args:
+            depth_gt: [B, 1, H, W] (Stage 1 分辨率的真值深度图)
+            tri_id_map: [B, H, W] (三角形 ID 图)
+            intrinsics: [B, 3, 3]
+            max_num_triangles: int
+
+        Returns:
+            plane_params: [B, N_tri, 4] (nx, ny, nz, d)
+        """
+        B, _, H, W = depth_gt.shape
+        device = depth_gt.device
+        total_bins = B * max_num_triangles
+
+        # ==========================================
+        # 1. 数据准备 (Flatten & ID Offset)
+        # ==========================================
+        # 展平数据
+        depth_flat = depth_gt.view(-1)  # [B*H*W]
+        tri_ids_flat = tri_id_map.view(-1)  # [B*H*W]
+
+        # 生成 Batch 偏移的全局三角形 ID
+        batch_ids = torch.arange(B, device=device).unsqueeze(1).expand(-1, H * W).reshape(-1)
+        global_tri_ids = batch_ids * max_num_triangles + tri_ids_flat
+
+        # 筛选有效像素: ID有效 且 GT深度有效
+        valid_mask = (tri_ids_flat >= 0) & (depth_flat > 1e-4)
+
+        valid_depth = depth_flat[valid_mask]
+        valid_global_ids = global_tri_ids[valid_mask]
+
+        # 我们还需要像素的 u, v 坐标来反投影
+        u_flat = self.grid_x.reshape(1, -1).expand(B, -1).reshape(-1)
+        v_flat = self.grid_y.reshape(1, -1).expand(B, -1).reshape(-1)
+
+        valid_u = u_flat[valid_mask]
+        valid_v = v_flat[valid_mask]
+        valid_batch_idx = batch_ids[valid_mask]  # 记录每个像素属于哪个batch，用于查内参
+
+        # ==========================================
+        # 2. 并行分组与采样 (Sorting & Indexing)
+        # ==========================================
+        # 对 ID 进行排序，这样同一个三角形的像素就会聚在一起
+        sorted_ids, sort_idx = torch.sort(valid_global_ids)
+
+        # 找到每个三角形 ID 的唯一值和出现次数 (Counts)
+        unique_ids, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+
+        # 过滤掉点数少于 3 个的三角形 (无法构成平面)
+        valid_tri_mask = counts >= 3
+
+        final_tri_ids = unique_ids[valid_tri_mask]  # [K] 有效的三角形ID
+        final_counts = counts[valid_tri_mask]  # [K] 每个三角形的点数
+
+        # --- 核心：找到每个三角形的 Start Index ---
+        # unique_consecutive 不直接返回 start index，我们需要算 cumsum
+        # 这里的 cumsum 是针对排序后的数组的
+        ends = torch.cumsum(counts, dim=0)
+        starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), ends[:-1]])
+
+        # 应用 mask，只保留有效三角形的 start 和 count
+        tri_starts = starts[valid_tri_mask]
+
+        # --- 核心：采样三个点 (首、中、尾) ---
+        # 这种采样方式能最大程度保证三点在空间上拉开距离，避免共线
+        idx_a_local = tri_starts
+        idx_b_local = tri_starts + (final_counts // 2)
+        idx_c_local = tri_starts + final_counts - 1
+
+        # 映射回原始数据的索引 (通过 sort_idx)
+        # 这里的 idx_a 是 valid_points 数组中的索引
+        idx_a = sort_idx[idx_a_local]
+        idx_b = sort_idx[idx_b_local]
+        idx_c = sort_idx[idx_c_local]
+
+        # ==========================================
+        # 3. 反投影为 3D 点 (Back-Projection)
+        # ==========================================
+        def get_3d_points(indices):
+            z = valid_depth[indices]
+            u = valid_u[indices]
+            v = valid_v[indices]
+            b_idx = valid_batch_idx[indices]
+
+            # 获取对应的内参
+            fx = intrinsics[b_idx, 0, 0]
+            fy = intrinsics[b_idx, 1, 1]
+            cx = intrinsics[b_idx, 0, 2]
+            cy = intrinsics[b_idx, 1, 2]
+
+            x = (u - cx) * z / fx
+            y = (v - cy) * z / fy
+            return torch.stack([x, y, z], dim=1)  # [K, 3]
+
+        Pa = get_3d_points(idx_a)
+        Pb = get_3d_points(idx_b)
+        Pc = get_3d_points(idx_c)
+
+        # ==========================================
+        # 4. 向量叉乘求法向量 (Vector Math)
+        # ==========================================
+        # 向量 AB 和 AC
+        V1 = Pb - Pa
+        V2 = Pc - Pa
+
+        # 叉乘: N = V1 x V2
+        normals = torch.cross(V1, V2, dim=1)
+
+        # 归一化
+        norm_len = torch.norm(normals, dim=1, keepdim=True)
+        # 防止除零 (虽然很难发生，因为我们选了首尾点)
+        normals = normals / (norm_len + 1e-8)
+
+        # --- 强制法向量指向相机 (Z > 0 修正) ---
+        # 视线向量约为 Pa (从原点到点)
+        # 我们希望 dot(n, view) < 0 => 法向量迎着视线
+        # 或者简单地：MVS 中通常定义法向量指向 Z 负 (迎着相机) 或 Z 正 (远离相机)
+        # 这里为了和你之前的代码一致，我们用 "点积检测"
+        dot_prod = torch.sum(normals * Pa, dim=1, keepdim=True)
+        dot_prod=-dot_prod
+        # 如果同向 (dot>0)，说明指向屏幕内，需要翻转指向屏幕外(相机)
+        flip = -torch.sign(dot_prod)
+        flip[flip == 0] = 1.0
+        normals = normals * flip
+
+        # ==========================================
+        # 5. 计算 d 并 填充结果
+        # ==========================================
+        # d = - n * p
+        d_vals = -torch.sum(normals * Pa, dim=1, keepdim=True)
+
+        # --- 填回 [B * Max_Tri, 4] 的大张量 ---
+        # 初始化默认平面 (0, 0, 1, -10)
+        all_planes = torch.zeros(total_bins, 4, device=device)
+        all_planes[:, 2] = 1.0
+        all_planes[:, 3] = -10.0  # 默认深度
+
+        # 将计算好的值填入对应的 Global ID 位置
+        # final_tri_ids 记录了我们计算的是哪些三角形
+        all_planes[final_tri_ids, :3] = normals
+        all_planes[final_tri_ids, 3:] = d_vals
+
+        return all_planes.view(B, max_num_triangles, 4)
 
     def _get_fallback_planes(self, B, max_tri, device):
         """辅助函数：全挂了的时候返回默认平面"""
@@ -378,9 +551,9 @@ class PlaneVisualizer:
         y_range = torch.arange(0, height, dtype=torch.float32, device=device)
         x_range = torch.arange(0, width, dtype=torch.float32, device=device)
         # indexing='ij' 确保行优先
-        self.grid_y, self.grid_x = torch.meshgrid(y_range, x_range)
+        self.grid_y, self.grid_x = torch.meshgrid(y_range, x_range,indexing='ij')
 
-    def render_from_planes(self, plane_params, tri_id_map, intrinsics):
+    def render_from_planes(self, plane_params, tri_id_map, intrinsics,depth_range):
         """
         利用平面参数渲染深度图和法向量图。
         并确保法向量图的颜色风格与 compute_normal_map_torch 一致
@@ -453,12 +626,6 @@ class PlaneVisualizer:
         # 3. 生成深度图 (Ray-Plane Intersection)
         # ==========================================
 
-        # === 🛡️ 修复 2: 确保使用的是内参 K，而不是投影矩阵 P ===
-        # Proj = K [R|t] -> 4x4
-        # Intrinsics = K -> 3x3
-        if intrinsics.shape[-1] == 4:
-            raise ValueError("错误：你传入了 4x4 的投影矩阵 (ref_proj)，这里需要 3x3 的内参矩阵 (intrinsics)！")
-
         fx = intrinsics[:, 0, 0].view(B, 1, 1)
         fy = intrinsics[:, 1, 1].view(B, 1, 1)
         cx = intrinsics[:, 0, 2].view(B, 1, 1)
@@ -482,7 +649,31 @@ class PlaneVisualizer:
         # 我们都知道物体肯定在相机前面，所以直接要由距离的模长。
         depth_map = depth_map.abs()
 
-        depth_map[invalid_mask] = 0
+        # ==========================================
+        # 4. 数值截断 (Clamp) - 解决 900/160 问题
+        # ==========================================
+        if depth_range is not None:
+            min_d, max_d = depth_range
+
+            # 如果 min_d 是 Tensor (例如 [B])，强制转为 [B, 1, 1] 以匹配 [B, H, W]
+            if isinstance(min_d, torch.Tensor):
+                if min_d.ndim == 1:
+                    min_d = min_d.view(-1, 1, 1)
+                min_d = min_d.to(depth_map.device)  # 确保设备一致
+
+            if isinstance(max_d, torch.Tensor):
+                if max_d.ndim == 1:
+                    max_d = max_d.view(-1, 1, 1)
+                max_d = max_d.to(depth_map.device)
+
+            # 现在无论是 float 还是 Tensor[B,1,1]，clamp 都能处理
+            depth_map = torch.clamp(depth_map, min=min_d, max=max_d)
+        else:
+            # 即使没有给定范围，也要限制一下无穷大
+            depth_map = torch.clamp(depth_map, max=600.0)
+
+        # ym-needmodify，暂时进行一个修改本来是0.0
+        depth_map[invalid_mask] = depth_map.min()
 
         depth_map = depth_map.unsqueeze(1)
 

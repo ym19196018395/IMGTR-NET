@@ -3,7 +3,7 @@ import os
 
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -374,7 +374,7 @@ def test_sample(sample, detailed_summary=True,global_step=0):
 
     loss = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
     scalar_outputs = {"loss": loss}
-    image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'], 
+    image_outputs = {"depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
                     "depth_gt_stage_0": depth_gt['stage_0'] * mask['stage_0'],
                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
                     "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],

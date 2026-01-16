@@ -924,6 +924,9 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
         edges_py = info.get('edges', [])  # list of dicts with 'tri_ids'
 
         n_tri = len(centroids_py)
+        if(n_tri==0):
+            print("qweqeqeq")
+
         batch_num_tri.append(n_tri)
 
         # 将 centroids 转为 numpy array (n_tri, 2)，若为空则用 zeros
@@ -1039,7 +1042,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                     'batch_num_tri': int,三角形的数量
                     'centroids': [B,n_tri,2] 每个三角形的质点
                     'vertices': [B,n_tri,3,2] 每个三角形的顶点
-                    'edges_list' :进行了一个归一化处理边像素点集合,以及其邻接面，去除掉了单邻接面的线段
+                    'edges_list' :进行了一个归一化处理边像素点集合,以及其邻接面
                     'tri_id_map': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效) <--- 新增
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
                 }
@@ -1256,32 +1259,24 @@ def _sample_map(map_tensor, centers, vertices):
     tri_feats = sampled.mean(dim=3).permute(0, 2, 1).contiguous()
     return tri_feats  # [B, N, C_map]
 
+
 def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, device='cpu', overlay_alpha=0.7,
                                  line_thickness=2):
     """
-    基于真实边像素(edges_pixels)生成断裂预测热力图。
-
-    Args:
-        ref_imgs: [B, 3, H, W] 输入图像 Tensor (标准化过的或0-1)
-        edge_alphas_list: list len=B, 元素为 Tensor [E], 预测的断裂概率
-        edges_pixels_list: list len=B, 元素为 list len=E (每条边的像素集合).
-                           结构: batch_list[ edge_list[ pixel_list[(x,y),...] ] ]
-                           注意：假设 pixel 坐标是 (x, y) 格式，适配 OpenCV。
-        device: 输出 Tensor 的设备
-        overlay_alpha: 叠加透明度
-        line_thickness: 线条粗细 (建议设为2，看的更清楚)
-
-    Returns:
-        dict: {"ref_img_edge_alpha": tensor [B, 3, H, W] uint8}
+    基于真实边像素(edges_pixels)生成断裂预测热力图。(修复版)
     """
 
     batch_size = ref_imgs.shape[0]
 
+    # 获取列表实际长度，用于防止越界
+    len_alphas = len(edge_alphas_list)
+    len_pixels = len(edges_pixels_list)
+
     # 结果容器
     output_tensor_list = []
 
-    # 1. 预计算色盘 (0~255) -> BGR
-    # 使用 JET Colormap: 0(蓝) -> 0.5(青/黄) -> 1(红)
+    # 1. 预计算色盘 (0~255) -> BGR (OpenCV format)
+    # JET: 0(Blue) -> 128(Green) -> 255(Red)
     colormap_lut = np.zeros((256, 1, 3), dtype=np.uint8)
     for i in range(256):
         colormap_lut[i, 0] = np.array([i, i, i])
@@ -1291,7 +1286,7 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
         # --- A. 准备底图 ---
         img_tensor = ref_imgs[b].detach().cpu()
 
-        # 反归一化处理 (简单 MinMax 归一化到 0-255，确保可视化正常)
+        # 反归一化处理
         if img_tensor.min() < 0:
             img_tensor = img_tensor - img_tensor.min()
             img_tensor = img_tensor / (img_tensor.max() + 1e-6)
@@ -1299,7 +1294,7 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
         # [C, H, W] -> [H, W, C] -> uint8 numpy
         img_np = (img_tensor.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
 
-        # 格式统转 BGR (OpenCV 默认)
+        # 格式统转 BGR
         if img_np.shape[2] == 1:
             img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
         else:
@@ -1307,76 +1302,95 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
 
         H, W, _ = img_np.shape
 
-        # --- B. 准备画板 ---
-        # 创建纯黑层用于画线
+        # --- B. 安全检查与数据获取 ---
+        # 如果当前 batch 索引超出了列表长度，说明数据不对齐，直接返回原图
+        if b >= len_alphas or b >= len_pixels:
+            # 转回 Tensor 并添加到输出
+            final_tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(torch.float32) / 255.0
+            output_tensor_list.append(final_tensor)
+            print("当前 batch 索引超出了列表长度，说明数据不对齐")
+            continue  # 跳过绘制
+
+        # 获取当前数据
+        curr_alphas_tensor = edge_alphas_list[b]
+        curr_pixels_list = edges_pixels_list[b]
+
+        # 检查 alpha 是否为空或 None
+        if curr_alphas_tensor is None or curr_alphas_tensor.numel() == 0:
+            # 如果没有预测值，直接返回原图
+            final_tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(torch.float32) / 255.0
+            output_tensor_list.append(final_tensor)
+            print("alpha 为空")
+            continue
+
+        # 转 numpy
+        curr_alphas = curr_alphas_tensor.detach().cpu().numpy()
+
+        # 再次检查长度对齐 (防止 alphas 和 pixels 数量不一致)
+        num_pixels_groups = len(curr_pixels_list)
+        num_probs = len(curr_alphas)
+        safe_len = min(num_pixels_groups, num_probs)
+
+        # --- C. 准备画板 ---
         overlay_layer = np.zeros_like(img_np)
 
-        # 获取当前 Batch 数据
-        # edges_pixels: List[List[Tuple(x,y)]]
-        curr_pixels_list = edges_pixels_list[b]
-        # alphas: Tensor [E]
-        curr_alphas = edge_alphas_list[b].detach().cpu().numpy()
-
-        num_edges = len(curr_pixels_list)
-        # 安全检查：如果边数量和预测数量不一致，取最小值防止越界
-        safe_len = min(num_edges, len(curr_alphas))
-
-        # --- C. 遍历画线 ---
+        # --- D. 遍历画线 ---
         for i in range(safe_len):
             prob = curr_alphas[i]
-            pixels = curr_pixels_list[i]  # [(x1,y1), (x2,y2), ...]
+            pixels = curr_pixels_list[i]  # [(x1,y1), ...]
 
-            # 过滤：概率太小的边(完全连通)可以选择不画，或者画得很淡
-            # 这里设置 > 0.05 才画，保持画面干净
-            if prob < 0.05 or len(pixels) == 0:
+            # 如果像素点列表为空，跳过
+            if not pixels:
+                print("像素点列表为空，跳过")
                 continue
 
-            # 颜色映射: 0.0 -> Blue, 1.0 -> Red
-            color_idx = int(np.clip(prob * 255, 0, 255))
+            # 颜色映射: 0.0(Blue) -> 1.0(Red)
+            # 确保 prob 在 0-1 之间
+            prob = np.clip(prob, 0.0, 1.0)
+            color_idx = int(prob * 255)
             color = colormap_lut[color_idx].tolist()  # (B, G, R)
 
-            # 1. 转为 numpy float 数组
-            pts_norm = np.array(pixels, dtype=np.float32) # shape [N, 2]
+            # 1. 转为 numpy float
+            pts_norm = np.array(pixels, dtype=np.float32)
 
-            # 2. 根据归一化类型转换
-            # 情况 A: 如果坐标范围是 [-1, 1] (PyTorch grid_sample 标准)
-            # x_real = (x_norm + 1) / 2 * (W - 1)
+            # 2. 坐标反归一化 [-1, 1] -> [0, W/H]
+            # 你的 edges_pixels 如果已经是绝对坐标，请注释掉这两行
             pts_x = (pts_norm[:, 0] + 1) * (W - 1) / 2.0
             pts_y = (pts_norm[:, 1] + 1) * (H - 1) / 2.0
 
-            # 3. 组合并取整
+            # 3. 组合
             pts_real = np.stack([pts_x, pts_y], axis=1).astype(np.int32)
 
-            # 4. Reshape 为 cv2.polylines 需要的 (N, 1, 2)
+            # 4. Reshape
             pts_to_draw = pts_real.reshape((-1, 1, 2))
 
             # 绘制
-            cv2.polylines(overlay_layer, [pts_to_draw], isClosed=False, color=color, thickness=line_thickness,
-                          lineType=cv2.LINE_AA)
+            cv2.polylines(overlay_layer, [pts_to_draw], isClosed=False, color=color,
+                          thickness=line_thickness, lineType=cv2.LINE_AA)
 
-        # --- D. 图像融合 ---
-        # 只有画了线的地方才有 mask
+        # --- E. 图像融合 ---
         mask = np.any(overlay_layer > 0, axis=-1)
-
-        # 融合: Original * (1-alpha) + Overlay * alpha
         final_img = img_np.copy()
 
-        # 使用 addWeighted 会让整体变暗，我们只混合 Mask 区域
+        # 只混合有线条的区域，保持背景亮度
         weighted_overlay = cv2.addWeighted(img_np, 1.0 - overlay_alpha, overlay_layer, overlay_alpha, 0)
-
         final_img[mask] = weighted_overlay[mask]
 
-        # --- E. 转回 Tensor ---
-        # HWC -> CHW
-        final_tensor = torch.from_numpy(final_img).permute(2, 0, 1).to(torch.float32)
+        # OpenCV 操作完是 BGR，但 TensorBoard 需要 RGB
+        final_img = cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB)
+
+        # --- F. 转回 Tensor ---
+        # 归一化到 0-1 范围 (通常 image_outputs 期望 float 0-1)
+        final_tensor = torch.from_numpy(final_img).permute(2, 0, 1).to(torch.float32) / 255.0
         output_tensor_list.append(final_tensor)
 
-    # 堆叠 Batch
+    # 堆叠
     if len(output_tensor_list) > 0:
         output_stack = torch.stack(output_tensor_list).to(device)
     else:
-        # 如果 batch 为空或出错，返回全黑
-        output_stack = torch.zeros_like(ref_imgs).to(torch.uint8).to(device)
+        output_stack = torch.zeros_like(ref_imgs).to(device)
+
+    # 你的原代码返回的是 uint8 注释，但 tensor 转换时通常 float 更通用，这里我输出了 float [0,1]
 
     return {"ref_img_edge_alpha": output_stack}
 
@@ -1446,7 +1460,8 @@ def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
 
     # 5. 构造法向量 (-dz/dx, -dz/dy, 1)
     # 注意：这里 Z 轴设为 1，如果你想要更强的凹凸感，可以把 dzdx, dzdy 乘以一个系数 (sensitivity)
-    normal_x = -dzdx
+    # todo:法向量颜色问题，进行一个更改
+    normal_x = dzdx
     normal_y = -dzdy
     normal_z = torch.ones_like(normal_x)
 
@@ -1480,3 +1495,39 @@ def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
 
     return normal_map
 
+
+def normalize_depth_for_display(depth, valid_mask=None):
+    """
+    专门用于显示的深度图归一化函数。
+    将有效范围 [min, max] 线性映射到 [0, 1]，背景保持 0。
+    """
+    # 1. 复制一份，不影响原始数据
+    vis_depth = depth.clone()
+
+    # 2. 确定有效区域
+    if valid_mask is None:
+        valid_mask = vis_depth > 1e-4  # 假设大于0也是有效
+
+    # 3. 只在有效区域计算 Min 和 Max
+    if valid_mask.sum() > 0:
+        d_min = vis_depth[valid_mask].min()
+        d_max = vis_depth[valid_mask].max()
+
+        # 防止 max == min 导致除零
+        diff = d_max - d_min
+        if diff < 1e-6:
+            diff = 1.0
+
+        # 4. 核心：只拉伸有效区域
+        # (val - min) / (max - min) -> 范围变回 0~1
+        vis_depth[valid_mask] = (vis_depth[valid_mask] - d_min) / diff
+
+        # 5. 可选：反转颜色 (通常近处亮，远处暗，或者反过来，看你习惯)
+        # 现在的逻辑是：近处(min) -> 0(黑), 远处(max) -> 1(白)
+        # 如果你想反过来，可以取消下面这行的注释：
+        # vis_depth[valid_mask] = 1.0 - vis_depth[valid_mask]
+
+    # 6. 确保背景是纯黑
+    vis_depth[~valid_mask] = 0.0
+
+    return vis_depth
