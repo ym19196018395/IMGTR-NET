@@ -1070,12 +1070,14 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         # 2. 转换 triangles 格式 并 填充 Map
         current_triangles_data = []
 
+
         # 遍历当前样本的所有三角形
         for tri_idx, tri in enumerate(triangles_batch[b]):
             # 解析数据
             v_ids = tri[0].cpu().numpy()
             l_ids = tri[1].cpu().numpy()
             pts = tri[2]  # tensor (M, 2) (x, y) on device
+
 
             # === 🔥 核心新增逻辑：生成 tri_id_map ===
             if pts.shape[0] > 0:
@@ -1095,6 +1097,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                 'line_ids': l_ids
                 # 'valid_points': pts.cpu().numpy() 不需要这个了
             })
+
 
         # 执行下采样 (关键: mode='nearest')
         if current_tri_id_map.dim() == 2:
@@ -1460,8 +1463,7 @@ def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
 
     # 5. 构造法向量 (-dz/dx, -dz/dy, 1)
     # 注意：这里 Z 轴设为 1，如果你想要更强的凹凸感，可以把 dzdx, dzdy 乘以一个系数 (sensitivity)
-    # todo:法向量颜色问题，进行一个更改
-    normal_x = dzdx
+    normal_x = -dzdx
     normal_y = -dzdy
     normal_z = torch.ones_like(normal_x)
 
@@ -1479,6 +1481,10 @@ def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
     # RGB 对应关系: R:X(左右), G:Y(上下), B:Z(指向相机)
     normal_map = (normals + 1.0) / 2.0
 
+    # normals_vis = normals.clone()
+    # normals_vis[:, 2, :, :] = -normals_vis[:, 2, :, :]  # 翻转 Z 用于显示
+    # normal_map = (normals_vis + 1.0) / 2.0
+
     # 8. 应用 Mask (如果有)
     if mask is not None:
         if mask.dim() == 3:
@@ -1495,6 +1501,153 @@ def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
 
     return normal_map
 
+def compute_normal_map_perspective(depth_tensor, intrinsics, mask=None, smooth=True):
+    """
+    [高精度版] 基于透视投影 (Perspective Projection) 计算法向量。
+
+    原理：
+    1. 将深度图反投影为 3D 点云 (Vertex Map)。
+    2. 使用链式法则计算 3D 空间中相对于像素 u, v 的切向量 Tu, Tv。
+    3. 法向量 n = normalize(Tu x Tv)。
+    此方法比直接 Sobel 深度图更精准，因为它考虑了 FOV 和视线角度。
+
+    Args:
+        depth_tensor: [B, 1, H, W] 深度图
+        intrinsics:   [B, 3, 3] 相机内参
+        mask:         [B, 1, H, W] 有效区域
+        smooth:       bool, 是否预平滑深度图 (推荐 True, 否则微分噪声大)
+
+    Returns:
+        normal_map:   [B, 3, H, W], 数值范围 [-1, 1], 指向相机方向 (Z < 0)
+    """
+    B, C, H, W = depth_tensor.shape
+    device = depth_tensor.device
+
+    # 1. 预处理：高斯平滑 (减少微分对噪声的放大)
+    if smooth:
+        # 3x3 高斯核
+        gaussian_kernel = torch.tensor([[1., 2., 1.],
+                                        [2., 4., 2.],
+                                        [1., 2., 1.]], device=device) / 16.0
+        gaussian_kernel = gaussian_kernel.view(1, 1, 3, 3)
+        depth_tensor = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
+        depth_tensor = F.conv2d(depth_tensor, gaussian_kernel)
+
+    # 2. 准备网格坐标 (u, v)
+    y_range = torch.arange(0, H, dtype=torch.float32, device=device)
+    x_range = torch.arange(0, W, dtype=torch.float32, device=device)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')  # [H, W]
+
+    # 扩展到 Batch: [B, H, W]
+    u = grid_x.unsqueeze(0).expand(B, -1, -1)
+    v = grid_y.unsqueeze(0).expand(B, -1, -1)
+
+    # 3. 解析内参
+    # intrinsics: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+    fx = intrinsics[:, 0, 0].view(B, 1, 1)
+    fy = intrinsics[:, 1, 1].view(B, 1, 1)
+    cx = intrinsics[:, 0, 2].view(B, 1, 1)
+    cy = intrinsics[:, 1, 2].view(B, 1, 1)
+
+    # 4. 计算深度图的梯度 (dz/du, dz/dv)
+    # 使用 Sobel 算子计算像素坐标系下的梯度
+    sobel_x = torch.tensor([[-1., 0., 1.],
+                            [-2., 0., 2.],
+                            [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1., -2., -1.],
+                            [0., 0., 0.],
+                            [1., 2., 1.]], device=device).view(1, 1, 3, 3)
+
+    depth_pad = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
+    dz_du = F.conv2d(depth_pad, sobel_x)  # 深度在 u 方向的变化率
+    dz_dv = F.conv2d(depth_pad, sobel_y)  # 深度在 v 方向的变化率
+
+    # 将 B,1,H,W 压缩为 B,H,W 方便后续计算
+    Z = depth_tensor.squeeze(1)
+    dz_du = dz_du.squeeze(1)
+    dz_dv = dz_dv.squeeze(1)
+
+    # =================================================================
+    # 5. 核心逻辑：透视投影下的切向量计算 (Chain Rule)
+    # =================================================================
+    # 3D点 P = [X, Y, Z]
+    # X = (u - cx) * Z / fx
+    # Y = (v - cy) * Z / fy
+
+    # 我们需要求 P 对 u 和 v 的偏导数，作为切平面上的两个向量 Tu, Tv
+
+    # --- 计算 Tu = dP/du ---
+    # dX/du = (Z + (u-cx)*dz_du) / fx
+    # dY/du = ((v-cy)*dz_du) / fy
+    # dZ/du = dz_du
+    dX_du = (Z + (u - cx) * dz_du) / fx
+    dY_du = ((v - cy) * dz_du) / fy
+    dZ_du = dz_du
+    Tu = torch.stack([dX_du, dY_du, dZ_du], dim=1)  # [B, 3, H, W]
+
+    # --- 计算 Tv = dP/dv ---
+    # dX/dv = ((u-cx)*dz_dv) / fx
+    # dY/dv = (Z + (v-cy)*dz_dv) / fy
+    # dZ/dv = dz_dv
+    dX_dv = ((u - cx) * dz_dv) / fx
+    dY_dv = (Z + (v - cy) * dz_dv) / fy
+    dZ_dv = dz_dv
+    Tv = torch.stack([dX_dv, dY_dv, dZ_dv], dim=1)  # [B, 3, H, W]
+
+    # 6. 计算法向量：叉积 (Cross Product)
+    # n = Tu x Tv
+    # 注意顺序：u 是向右，v 是向下。根据右手定则，Right x Down = Forward (Z > 0)
+    # 我们希望法向量指向相机 (Z < 0)，所以我们用 Tv x Tu 或者最后取反
+    # 这里直接计算 cross(Tu, Tv) 然后强制 Z 为负
+    normals = torch.cross(Tu, Tv, dim=1)
+
+    # 7. 归一化
+    norm = torch.norm(normals, dim=1, keepdim=True)
+    normals = normals / (norm + 1e-8)
+
+    # normals = (normals + 1.0) / 2.0
+
+    normals_vis = normals.clone()
+    normals_vis[:, 2, :, :] = -normals_vis[:, 2, :, :]  # 翻转 Z 用于显示
+    normals = (normals_vis + 1.0) / 2.0
+
+    # 8. 强制指向相机 (Z < 0)
+    # 检查 Z 分量的符号。如果 Z > 0，说明指向了屏幕里面，需要翻转。
+    # 大部分情况下 Tu x Tv 得到的 Z 应该已经是正的(背离相机)，所以这里统一翻转比较稳妥
+    # 或者使用 dot product 检测法
+
+    # 简单粗暴且正确的方法：因为我们知道表面是看着相机的，所以 n_z 必须小于 0
+    # 获取 n_z 的符号
+    # sign_z = torch.sign(normals[:, 2:3, :, :])
+    # # 如果是正数 (1.0)，我们要变成负数，所以乘以 -1
+    # # 如果是负数 (-1.0)，我们要保持，所以乘以 1
+    # # 也就是乘以 -sign_z (除了0的情况)
+    # flip_mask = -sign_z
+    # flip_mask[flip_mask == 0] = -1.0  # 处理 z=0 的边界情况，默认翻转
+    #
+    # normals = normals * flip_mask
+
+    # 9. 应用 Mask
+    if mask is not None:
+        if mask.dim() == 3: mask = mask.unsqueeze(1)
+        if mask.shape[1] == 3: mask = mask[:, :1, :, :]
+        if mask.shape[-2:] != normals.shape[-2:]:
+            mask = F.interpolate(mask.float(), size=normals.shape[-2:], mode='nearest')
+        normals = normals * mask
+
+    return normals
+
+# --- 辅助函数：可视化转换 ---
+def visualize_normal_map(normal_tensor):
+    """
+    将 [-1, 1] 的物理法向量转换为 [0, 1] 的 RGB 图片用于显示。
+    为了符合人类直觉（蓝色为正面），我们会翻转 Z 轴用于显示。
+    """
+    vis_normals = normal_tensor.clone()
+    # 物理上 Z<0 是正面，但可视化习惯用 RGB=(0.5, 0.5, 1.0) 代表正面(Z>0)
+    # 所以显示时翻转 Z
+    vis_normals[:, 2, :, :] = -vis_normals[:, 2, :, :]
+    return (vis_normals + 1.0) / 2.0
 
 def normalize_depth_for_display(depth, valid_mask=None):
     """

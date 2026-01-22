@@ -1,10 +1,10 @@
 import argparse
 import os
 
-from models.PlaneTools import *
+from models.PlanePatchMatch import *
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -120,6 +120,7 @@ model.to(device)
 model_loss = patchmatchnet_loss
 optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd)
 
+
 # load 模型 parameters
 start_epoch = 0
 if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.loadckpt):
@@ -161,10 +162,9 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (1 * args.summary_freq) == 0
+            do_summary_image = global_step % (5 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
-            loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary,
-                                                               global_step=global_step)
+            loss, scalar_outputs, image_outputs = train_sample(sample, do_summary_image=do_summary_image)
             loss_depth = scalar_outputs['loss_depth']
             loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
@@ -194,7 +194,7 @@ def train():
             do_summary = global_step % args.summary_freq == 0
             # do_summary_test = global_step % (10*args.summary_freq) == 0
             do_summary_image = global_step % (50 * args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
+            loss, scalar_outputs, image_outputs = test_sample(sample, do_summary_image=do_summary_image)
             loss_depth = scalar_outputs['loss_depth']
             loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
@@ -229,7 +229,7 @@ def test():
     print("final", avg_test_scalars)
 
 
-def train_sample(sample, detailed_summary=False, global_step=0):
+def train_sample(sample, do_summary_image=False):
     model.train()
     optimizer.zero_grad()
 
@@ -259,6 +259,7 @@ def train_sample(sample, detailed_summary=False, global_step=0):
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
+    torch.autograd.set_detect_anomaly(True)  # 启用梯度异常检测
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
@@ -287,91 +288,114 @@ def train_sample(sample, detailed_summary=False, global_step=0):
     loss_alpha_sup=loss_alpha_sup*weight_alpha
     loss = loss_depth+loss_alpha_sup
 
+
     # 边断裂损失
     loss.backward()
 
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
-    # ================ 生成断裂图 ===============================================
-    image_outputs_pre = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
-        edge_alphas_list=outputs["edge_alphas"],
-        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
-        device=device,
-        overlay_alpha=0.6,  # 线条显示的透明度
-        line_thickness=1  # 线条粗细
-    )
-
-    ref_img_edge_alpha_pre = image_outputs_pre["ref_img_edge_alpha"]
-
-    image_outputs_gt = generate_edge_alpha_overlays(
-        ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
-        edge_alphas_list=edge_alphas_gt,
-        edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
-        device=device,
-        overlay_alpha=0.6,  # 线条显示的透明度
-        line_thickness=1  # 线条粗细
-    )
-
-    ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
-
-    # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
-    # 获取 Stage 1 的 GT 深度和 Mask
-    gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
-    gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
-
-    # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
-    pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
-
-    # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
-    normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
-
-    # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
-    normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
-
-    # vis_depth = normalize_depth_for_display(depth_pred_phys, valid_mask=None)
-    # 2. 生成用于 TensorBoard 展示的数据 ym-need-delete 1.13
-    # 注意：这里我们手动归一化了，所以 save_images 里对 depth 的 normalize=True 其实就
-    # 变成了在 0~1 之间归一化，不会破坏我们做好的拉伸。
-    # vis_depth_gt_plane = normalize_depth_for_display(depth_gt_plane_stage_1)  # 传入 valid mask
-    #
-    # vis_depth_pre_plane = normalize_depth_for_display(outputs["output_plane"]['depth_pred'])  # 传入 valid mask
-
-    # ===== tensorboard显示图片和曲线 ======================================
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth,
                       "loss_alpha_sup": loss_alpha_sup}
 
-    image_outputs = { # 暂时注释一些图片，输出的图片太多了
-                     # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
-                     "depth_gt_stage_1": depth_gt['stage_1'] * mask['stage_1'],
-                     "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
-                     # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
-                     # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-                     "ref_img": sample["imgs"]['stage_1'][:, 0],
-                     # 新增：基于像素点的法向量图 
-                     "normal_gt_stage_1": normal_gt_s1,
-                     "normal_pred_stage_1": normal_pred_s1,
-                     # 新增：基于平面的深度图和法向量图
-                     "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
-                     "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'],
-                     # 新增：基于平面的深度图和法向量图,真值
-                     "depth_gt_plane_stage_1": outputs["output_plane"]['depth_gt'],
-                     "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'],
-                     # 新增：边预测头预测值和真值
-                     "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
-                     "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
-                     }
+    image_outputs = []
+    if do_summary_image:
+        # ================ 生成断裂图 ===============================================
+        image_outputs_pre = generate_edge_alpha_overlays(
+            ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+            edge_alphas_list=outputs["edge_alphas"],
+            edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+            device=device,
+            overlay_alpha=0.6,  # 线条显示的透明度
+            line_thickness=1  # 线条粗细
+        )
 
-    # if detailed_summary:
-    #     image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
-    #     image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
-    #                                                    mask['stage_1']
-    #     image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
-    #                                                    mask['stage_2']
-    #     image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
-    #                                                    mask['stage_3']
+        ref_img_edge_alpha_pre = image_outputs_pre["ref_img_edge_alpha"]
+
+        image_outputs_gt = generate_edge_alpha_overlays(
+            ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+            edge_alphas_list=edge_alphas_gt,
+            edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+            device=device,
+            overlay_alpha=0.6,  # 线条显示的透明度
+            line_thickness=1  # 线条粗细
+        )
+
+        ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
+
+        # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
+        # 获取 Stage 1 的 GT 深度和 Mask
+        gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
+        gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
+
+        valid_mask_s1 = (outputs["output_plane"]['tri_id_map']<0)
+
+        # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
+        pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
+
+        # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
+        normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
+
+        # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
+        normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
+
+        intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
+
+        # normal_gt_s1 = compute_normal_map_perspective(
+        #     gt_depth_s1,
+        #     intrinsics_s1[0],
+        #     mask=gt_mask_s1,
+        #     smooth=False
+        # )
+        #
+        # normal_pred_s1 = compute_normal_map_perspective(
+        #     pred_depth_s1,
+        #     intrinsics_s1[0],
+        #     mask=gt_mask_s1,
+        #     smooth=False
+        # )
+
+        # vis_depth = normalize_depth_for_display(depth_pred_phys, valid_mask=None)
+        # 2. 生成用于 TensorBoard 展示的数据 ym-need-delete 1.13
+        # 注意：这里我们手动归一化了，所以 save_images 里对 depth 的 normalize=True 其实就
+        # 变成了在 0~1 之间归一化，不会破坏我们做好的拉伸。
+        # vis_depth_gt_plane = normalize_depth_for_display(depth_gt_plane_stage_1)  # 传入 valid mask
+        #
+        # vis_depth_pre_plane = normalize_depth_for_display(outputs["output_plane"]['depth_pred'])  # 传入 valid mask
+
+        # ===== tensorboard显示图片和曲线 ======================================
+
+        image_outputs = {  # 暂时注释一些图片，输出的图片太多了
+            # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
+            "depth_gt_stage_1": depth_gt['stage_1'] ,
+            "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
+            # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
+            # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
+            "ref_img": sample["imgs"]['stage_1'][:, 0],
+            # 新增：基于像素点的法向量图
+            "normal_gt_stage_1": normal_gt_s1,
+            "normal_pred_stage_1": normal_pred_s1,
+            # 新增：基于平面的深度图和法向量图
+            "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
+            "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'],
+            # 新增：基于平面的深度图和法向量图,真值
+            "depth_gt_plane_stage_1": outputs["output_plane"]['depth_gt'],
+            "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'],
+            # 新增：边预测头预测值和真值
+            "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
+            "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
+        }
+
+        # image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
+        # image_outputs["errormap_patchmatch_stage_1"] = (depth_patchmatch['stage_1'][-1] - depth_gt['stage_1']).abs() * \
+        #                                                mask['stage_1']
+        # image_outputs["errormap_patchmatch_stage_2"] = (depth_patchmatch['stage_2'][-1] - depth_gt['stage_2']).abs() * \
+        #                                                mask['stage_2']
+        # image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
+        #                                                mask['stage_3']
+
+
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
@@ -401,7 +425,7 @@ def train_sample(sample, detailed_summary=False, global_step=0):
 
 
 @make_nograd_func
-def test_sample(sample, detailed_summary=True, global_step=0):
+def test_sample(sample,detailed_summary=False):
     model.eval()
 
     # 将cdt_data进行一个单独处理处理,单独将这些数据放入GPU中

@@ -8,7 +8,7 @@ from .edge_head import EdgeHead
 from .module import *
 import cv2
 import numpy as np
-from .PlaneTools import *
+from .PlanePatchMatch import *
 
 class DepthInitialization(nn.Module):
     def __init__(self, patchmatch_num_sample = 1):
@@ -72,106 +72,6 @@ class DepthInitialization(nn.Module):
                 return depth_sample
 
 
-class PlanePatchMatchModule(nn.Module):
-    def __init__(self, fitter_module, propagation_iters=2):
-        super().__init__()
-        self.fitter = fitter_module  # 你传入的 DensePlaneFitter 实例
-        self.generator = PlaneHypothesisGenerator()
-        self.warper = PlaneHomographyWarper()
-        self.prop_iters = propagation_iters
-
-        # Group Correlation 也就是你说的球平面扭曲代价计算网络
-        # 假设你复用了原 PatchMatchNet 的 group_correlation_core 或者类似逻辑
-
-    def forward(self, stage2_depth, stage1_tri_info, ref_feature, src_features, proj_matrices):
-        """
-        Args:
-            stage2_depth: [B, 1, H/4, W/4]
-            stage1_tri_info: dict (含 tri_id_map, vertices 等)
-            ref_feature: [B, C, H/2, W/2]
-            src_features: list of [B, C, H/2, W/2]
-            proj_matrices: 包含 K, R, t
-        """
-        B, _, H, W = ref_feature.shape
-        tri_id_map = stage1_tri_info['tri_id_map']  # [B, H, W]
-        num_tri = stage1_tri_info['num_tri']
-
-        # 1. 拟合平面 (Keep your code!)
-        # fitted_planes: [B, N_tri, 4]
-        fitted_planes = self.fitter(stage2_depth, tri_id_map, ...)
-
-        # 计算三角形平均深度用于生成 Hypothesis 1
-        # (简单起见这里假设你已经有或者能从 fitted_planes 算出来 d)
-        avg_depths = -fitted_planes[..., 3:]  # 近似 d = -z
-
-        # 2. 生成假设池
-        # hypotheses: [B, N_tri, K, 4]
-        hypotheses = self.generator(fitted_planes, avg_depths)
-
-        # 将假设从三角形映射到像素 (Broadcasting)
-        # 这一步是为了方便并行 Warping 和 Cost 计算
-        # pixel_hypotheses: [B, H, W, K, 4]
-        pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map)
-
-        current_hypotheses = pixel_hypotheses
-
-        # 3. PatchMatch 迭代 (传播 -> 评估 -> 选择)
-        for i in range(self.prop_iters):
-            # --- A. 传播 (Spatial Propagation) ---
-            # 这里融合你的 Edge Break 思想
-            # 如果 tri_id 不同，且 Edge Predictor 说断裂，则不传播
-            propagated_hypotheses = self.spatial_propagation(current_hypotheses, tri_id_map)
-
-            # --- B. 评估 (Warping & Cost) ---
-            # 形状变换 [B*H*W, K, 4] -> 方便批量 Warp
-            all_costs = []
-            for src_idx, src_feat in enumerate(src_features):
-                # 计算 H 并 warp
-                # 注意：这里需要为 K 个假设分别计算 H，计算量较大
-                # 优化：只对当前最优的和采样到的邻居计算
-
-                # 假设我们只评估当前的 current_hypotheses (简化逻辑)
-                # [B, H, W, K, 3, 3]
-                H_mats = self.warper.get_homography(current_hypotheses, ...)
-
-                # Warp 并计算相似度 (Group Correlation)
-                cost = self.compute_cost(ref_feature, src_feat, H_mats)
-                all_costs.append(cost)
-
-            total_cost = torch.stack(all_costs).mean(0)
-
-            # --- C. 选择 (Selection) ---
-            # 选出 Cost 最小的平面参数更新 current_hypotheses
-            best_idx = torch.argmin(total_cost, dim=-1)  # [B, H, W]
-            current_hypotheses = torch.gather(current_hypotheses, 3,
-                                              best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 4))
-
-        # 4. 最终输出
-        # 将像素级平面转回深度图输出
-        final_depth = self.planes_to_depth(current_hypotheses)
-        return final_depth
-
-    def map_tri_to_pixel(self, tri_params, tri_id_map):
-        """
-        利用 tri_id_map 将 [B, N, K, 4] 映射为 [B, H, W, K, 4]
-        使用 F.embedding 或者 gather
-        """
-        B, N, K, C = tri_params.shape
-        flat_params = tri_params.view(B * N, K * C)  # Flatten for embedding constraint
-        # 需要处理 Batch 偏移，类似 Fitter 里的逻辑
-        # ... (Implementation detail)
-        # return mapped_params
-        return
-
-    def spatial_propagation(self, hypotheses, tri_id_map):
-        """
-        Checkerboard 传播
-        在此处加入你的 Edge Break 判断逻辑
-        """
-        # ...
-        # return prop_hypotheses
-        return hypotheses
-
 class Propagation(nn.Module):
     def __init__(self, neighbors = 16):
         super(Propagation, self).__init__()
@@ -217,7 +117,15 @@ class Propagation(nn.Module):
 
 
 class Evaluation(nn.Module):
+    """Evaluation module for adaptive evaluation step in Learning-based Patchmatch
+    Used to compute the matching costs for all the hypotheses and choose best solutions.
+    """
     def __init__(self,  G=8, stage=3, evaluate_neighbors=9, iterations=2):
+        """Initialize method`
+
+        Args:
+            G: 输入的特征平均被分为G个组
+        """
         super(Evaluation, self).__init__()
 
         self.iterations = iterations
@@ -268,7 +176,7 @@ class Evaluation(nn.Module):
         ref_feature = ref_feature.view(batch, self.G, feature_channel//self.G, height, width)
 
         similarity_sum = 0
-        # 对于没有视图权重的时候，计算视图权重，权重只计算一次
+        # 对于没有视图权重的时候，计算视图权重，权重只计算一次,只在第三阶段学习
         if self.stage == 3 and view_weights == None:
             view_weights = []
             # 对于每一个源图进行一个可微分投影计算代价
@@ -282,6 +190,7 @@ class Evaluation(nn.Module):
                 similarity = (warped_feature * ref_feature.unsqueeze(3)).mean(2)
 
                 # 3.pixel-wise view weight:根据相似体，学习每个源视图的可靠性,只学习一次 [B,1,H,W]
+                # 对于参考图每一个像素点去计算在源视图该像素点可靠性，如果可靠性高，那其特征相似度参考值就大
                 view_weight = self.pixel_wise_net(similarity)
                 view_weights.append(view_weight)
 
@@ -307,10 +216,10 @@ class Evaluation(nn.Module):
             score = self.similarity_net(similarity, grid, weight)
             del similarity, grid, weight
 
-            # apply softmax to get probability
+            # softmax 得到每种假设的概率，概率合为1，根据概率做了一个加权平均
             softmax = nn.LogSoftmax(dim=1)
             score = softmax(score)
-            score = torch.exp(score)
+            score = torch.exp(score) # 得到了每个深度假设的“概率” P_i
 
             # depth regression: expectation
             depth_sample = torch.sum(depth_sample * score, dim = 1)
@@ -425,6 +334,7 @@ class PatchMatch(nn.Module):
         # adaptive spatial cost aggregation (adaptive evaluation)
         self.eval_conv = nn.Conv2d(self.propa_num_feature, 2 * self.evaluate_neighbors, kernel_size=3, stride=1,
                                     padding=self.dilation, dilation=self.dilation, bias=True)
+
         nn.init.constant_(self.eval_conv.weight, 0.)
         nn.init.constant_(self.eval_conv.bias, 0.)
         # ym—issue 这个特征权重网络最后和自适应聚合如何进行一个构建的
@@ -589,11 +499,13 @@ class PatchMatch(nn.Module):
         if self.propagate_neighbors > 0:
             # last iteration on stage 1 does not have propagation (photometric consistency filtering)
             if not (self.stage == 1 and self.patchmatch_iteration == 1):
+                # 通过学习来寻找最佳传播领居，学习的是偏移量
                 propa_offset = self.propa_conv(ref_feature)
                 propa_offset = propa_offset.view(batch, 2 * self.propagate_neighbors, height*width)
                 propa_grid = self.get_propagation_grid(batch,height,width,propa_offset,device,img)
 
         # the learned additional 2D offsets for adaptive spatial cost aggregation (adaptive evaluation)
+        # 通过学习来寻找最佳评估邻居，学习的是偏移量
         eval_offset = self.eval_conv(ref_feature)
         eval_offset = eval_offset.view(batch, 2 * self.evaluate_neighbors, height*width)
         # 评估网格
@@ -611,7 +523,8 @@ class PatchMatch(nn.Module):
                                     self.patchmatch_interval_scale, device)
             # 第一次迭代是没有自适应传播的
 
-            # weights for adaptive spatial cost aggregation in adaptive evaluation，深度和特征权重聚合目的是后面自适应代价聚合
+            # 如果邻居的深度和我很像，那它就是可靠的；如果它深度和我不像（比如处于物体边缘的背景），我就不参考它的 Cost。
+            # 深度目的是后面算代价的时候去参考有价值的点，用加权的方式
             weight = depth_weight(depth_sample.detach(), depth_min, depth_max, eval_grid.detach(), self.patchmatch_interval_scale,
                                     self.evaluate_neighbors)
             weight = weight * feature_weight.unsqueeze(1)
@@ -767,10 +680,12 @@ class FeatureWeightNet(nn.Module):
 # adaptive spatial cost aggregation
 # weight based on depth difference of sampling points and center pixel
 def depth_weight(depth_sample, depth_min, depth_max, grid, patchmatch_interval_scale, evaluate_neighbors):
-    # grid: position of sampling points in adaptive spatial cost aggregation
+    # grid: 自适应评估网格的采样位置 [B, neighbors*H, W, 2]
+    # depth_sample: 当前像素的深度假设 [B, Ndepth, H, W]
+
     neighbors = evaluate_neighbors
     batch,num_depth,height,width = depth_sample.size()
-    # normalization
+    # 1. 归一化深度 (Normalization)
     x = 1.0 / depth_sample
     del depth_sample
     inverse_depth_min = 1.0 / depth_min
@@ -778,6 +693,8 @@ def depth_weight(depth_sample, depth_min, depth_max, grid, patchmatch_interval_s
     x = (x-inverse_depth_max.view(batch,1,1,1))/(inverse_depth_min.view(batch,1,1,1)
                     -inverse_depth_max.view(batch,1,1,1))
 
+    # 2. 网格采样 (Grid Sample) - "看看邻居的深度是多少"
+    # grid 是学习出来的偏移位置。这里去采样邻居的归一化逆深度。
     x1 = F.grid_sample(x,
                     grid,
                     mode='bilinear',
@@ -785,16 +702,20 @@ def depth_weight(depth_sample, depth_min, depth_max, grid, patchmatch_interval_s
     del grid
     x1 = x1.view(batch, num_depth, neighbors, height, width)
 
+    # 3. 计算差异 (Difference Calculation)
+    # x.unsqueeze(2) 是中心像素的深度
+    # x1 是采样到的邻居深度
+    # 计算绝对差值，并除以 scale (缩放因子)
     # [B,Ndepth,N_neighbors,H,W]
     x1 = torch.abs(x1 - x.unsqueeze(2)) / patchmatch_interval_scale
     del x
-    x1 = torch.clamp(x1, min=0, max=4)
+    x1 = torch.clamp(x1, min=0, max=4) # 将数据缩放到0-4的区间
     # sigmoid output approximate to 1 when x=4
     x1 = (-x1 + 2) * 2
     output = nn.Sigmoid()
     x1 = output(x1)
 
-    return x1.detach()
+    return x1.detach()# 注意：说明不需要对这个权重本身产生的路径回传梯度去修正深度图，它只作为权重使用。
 
 # estimate pixel-wise view weight
 class PixelwiseNet(nn.Module):
