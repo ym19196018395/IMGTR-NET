@@ -194,7 +194,7 @@ def train():
             do_summary = global_step % args.summary_freq == 0
             # do_summary_test = global_step % (10*args.summary_freq) == 0
             do_summary_image = global_step % (50 * args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, do_summary_image=do_summary_image)
+            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image)
             loss_depth = scalar_outputs['loss_depth']
             loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
@@ -259,7 +259,10 @@ def train_sample(sample, do_summary_image=False):
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
-    torch.autograd.set_detect_anomaly(True)  # 启用梯度异常检测
+
+    # 启用梯度异常检测
+    # torch.autograd.set_detect_anomaly(True)
+
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
@@ -326,13 +329,13 @@ def train_sample(sample, do_summary_image=False):
 
         # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
         # 获取 Stage 1 的 GT 深度和 Mask
-        gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
-        gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
+        gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B,1, H, W]
+        gt_mask_s1 = mask['stage_1']  # 假设形状 [B, 1,H, W]
 
-        valid_mask_s1 = (outputs["output_plane"]['tri_id_map']<0)
+        valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
 
         # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
-        pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
+        pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B,H, W]
 
         # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
         normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
@@ -341,6 +344,7 @@ def train_sample(sample, do_summary_image=False):
         normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
 
         intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
+
 
         # normal_gt_s1 = compute_normal_map_perspective(
         #     gt_depth_s1,
@@ -367,9 +371,9 @@ def train_sample(sample, do_summary_image=False):
         # ===== tensorboard显示图片和曲线 ======================================
 
         image_outputs = {  # 暂时注释一些图片，输出的图片太多了
-            # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
+            "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
             "depth_gt_stage_1": depth_gt['stage_1'] ,
-            "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
+            "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] ,
             # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
             # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
             "ref_img": sample["imgs"]['stage_1'][:, 0],
@@ -378,10 +382,10 @@ def train_sample(sample, do_summary_image=False):
             "normal_pred_stage_1": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图
             "normal_pred_plane_stage_1": outputs["output_plane"]['normal_pred'],
-            "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'],
+            "depth_pred_plane_stage_1": outputs["output_plane"]['depth_pred'] ,
             # 新增：基于平面的深度图和法向量图,真值
             "depth_gt_plane_stage_1": outputs["output_plane"]['depth_gt'],
-            "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'],
+            "normal_gt_plane_stage_1": outputs["output_plane"]['normal_gt'] ,
             # 新增：边预测头预测值和真值
             "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
             "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
@@ -508,6 +512,7 @@ def test_sample(sample,detailed_summary=False):
     gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B, H, W]
     gt_mask_s1 = mask['stage_1']  # 假设形状 [B, H, W]
 
+
     # 获取 Stage 1 的 预测 深度 (PatchMatch 最后一轮迭代结果)
     pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B, H, W]
 
@@ -522,7 +527,7 @@ def test_sample(sample,detailed_summary=False):
                       "loss_alpha_sup": loss_alpha_sup}
 
     image_outputs = {  # 暂时注释一些图片，输出的图片太多了
-        # "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
+        "depth_refined_stage_0": depth_est['stage_0'] * mask['stage_0'],
         "depth_gt_stage_1": depth_gt['stage_1'] * mask['stage_1'],
         "depth_patchmatch_stage_1": depth_patchmatch['stage_1'][-1] * mask['stage_1'],
         # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],

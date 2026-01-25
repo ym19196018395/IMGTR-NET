@@ -158,6 +158,8 @@ class PatchmatchNet(nn.Module):
         self.num_hypotheses = 3
         self.tau = 1.0
 
+        self.plane_patchmatch_agent = PlanePatchMatchModule(num_hypotheses=3, G=8)
+
 
     def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1):
         
@@ -205,7 +207,7 @@ class PatchmatchNet(nn.Module):
         refined_depth = {}
 
 
-        tri_infos=[]
+
         edge_alphas,edge_mats=[],[]
         output_plane={
            'depth_pred':[],# 平面预测深度图
@@ -238,7 +240,7 @@ class PatchmatchNet(nn.Module):
                 #===================对stage1 进行planepatchmatch===========================
 
                 # 根据stage2粗深度图来拟合stage1的法向量和深度图
-
+                tri_infos = []
                 depth_stage2 = depth_patchmatch['stage_2'][-1]
 
                 # 获得stage1的长和宽
@@ -246,21 +248,28 @@ class PatchmatchNet(nn.Module):
                 device = depth.get_device()
                 # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
                 # 传入原分辨率的图片，里面会进行一个归一化操作 传入的是原分辨率的
+                # todo: 会产生0像素的三角形，这个地方以后可能更改一下逻辑
                 tri_infos = batch_convert_to_tri_infos_new(vertexs, lines, triangles, height * 2, width * 2, device)
 
-                # 假设 tri_infos 结构为: [{'batch_num_tri': [0, 2254, ...], ...}]
-                # 从 list 中取出第一个 dict
-                info_batch = tri_infos[0] if isinstance(tri_infos, list) else tri_infos
-                batch_num_tri = info_batch['batch_num_tri']
+                intrinsics_s1 = torch.unbind(intrinsics_mats['stage_1'].float(), 1)
 
                 # 根据stage的深度信息拟合平面
-                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=4, perturbation_range=0.05,depth_max=depth_max)
+                num_hypotheses=4
+                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,depth_max=depth_max)
+
+
+                depth_samples, score, view_weights,normal_samples = self.plane_patchmatch_agent.forward(
+                                                                    self.dense_plane_fitter,
+                                                                    depth_stage2, tri_infos,
+                                                                    ref_feature[f'stage_{l}'], src_features_l,
+                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights)
+
                 # 批次里面最大三角形数量
                 max_tri_num = max(item['batch_num_tri'] for item in tri_infos)
                 max_tri_num = max(max_tri_num)
 
                 # 获得stage1参考图的内参矩阵
-                intrinsics_s1 = torch.unbind(intrinsics_mats['stage_1'].float(), 1)
+
                 ref_proj = intrinsics_s1[0]
 
                 # 转化为tensor形式(B,H,W)
@@ -271,28 +280,17 @@ class PatchmatchNet(nn.Module):
 
                 output_plane['tri_id_map'] = tri_id_map_tensor
 
-                # depth_patchmatch['stage_2'][-1]: [B, 1, H/4, W/4]
-                # tri_id_map: [B, H/2, W/2]
-                # num_tri: int
-                # 1. 拟合平面 + 生成假设
-                # plane_hypothesis_svd 现在的形状是 [B, N_tri, K, 4]
-                # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
 
-                plane_hypothesis_svd = self.dense_plane_fitter.get_plane_hypotheses(
-                    depth_stage2=depth_stage2,
-                    tri_id_map=tri_id_map_tensor,
-                    intrinsics_s1=ref_proj,
-                    max_num_triangles=max_tri_num
-                )
-
-                # [B, N_tri, K, 4] -> [B, N_tri, 3] (取第0个假设,最佳平面的前3通道)
-                best_guess_planes = plane_hypothesis_svd[:, :, 0, :]  # [B, N_tri, 4]
+                # 刚拟合平面的初始状态，没进行传播
+                before_guess_planes = normal_samples[0]  # [B, N_tri, 4]
 
                 # 取法向量
-                tri_normals = best_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
+                tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
 
-                # # 已经归一化
-                # tri_normals = F.normalize(tri_normals, p=2, dim=-1)
+                # 更新完之后的法向量图
+                output_plane['depth_pred']=depth # 目前放stage2 产生的深度图放大后
+                output_plane['normal_pred']=normal_samples[1]
+
 
                 # 操作是在1 / 2分辨率下面进行,少了一个edge—mat
                 # ym-need-modify 暂时不给其放梯度，
@@ -304,43 +302,38 @@ class PatchmatchNet(nn.Module):
 
                 # 进行planePatchMatch
 
-
                 visualizer = PlaneVisualizer(height, width, device)
-                output_plane['depth_pred'], output_plane['normal_pred'] = visualizer.render_from_planes(
-                    best_guess_planes,
+                output_plane['depth_gt'], output_plane['normal_gt'] = visualizer.render_from_planes(
+                    before_guess_planes.detach(),
                     tri_id_map_tensor,
-                    ref_proj,
+                    ref_proj.detach(),
                     depth_range=(depth_min, depth_max))
 
                 # 生成gt-stage-1的三角平面深度图和法向量图
-                plane_hypothesis_svd_gt = self.dense_plane_fitter.By_SVD_Plane(
-                    depth_stage2=depth_stage_1,
-                    tri_id_map=tri_id_map_tensor,
-                    intrinsics_s1=ref_proj,
-                    max_num_triangles=max_tri_num
-                )
+                # plane_hypothesis_svd_gt = self.dense_plane_fitter.By_SVD_Plane(
+                #     depth_stage2=depth_stage_1,
+                #     tri_id_map=tri_id_map_tensor,
+                #     intrinsics_s1=ref_proj,
+                #     max_num_triangles=max_tri_num
+                # )
+                #
+                # depth_gt_plane_stage_1, normal_gt_plane_stage_1 = visualizer.render_from_planes(
+                #     plane_hypothesis_svd_gt, tri_id_map_tensor, ref_proj
+                #     , depth_range=(depth_min, depth_max))
+                #
+                # output_plane['depth_gt'] = depth_gt_plane_stage_1
+                # output_plane['normal_gt'] = normal_gt_plane_stage_1
 
-                depth_gt_plane_stage_1, normal_gt_plane_stage_1 = visualizer.render_from_planes(
-                    plane_hypothesis_svd_gt, tri_id_map_tensor, ref_proj
-                    , depth_range=(depth_min, depth_max))
-
-                output_plane['depth_gt'] = depth_gt_plane_stage_1
-                output_plane['normal_gt'] = normal_gt_plane_stage_1
-
+                depth = depth_samples
 
             
             del src_features_l, ref_proj, src_projs, projs_l
 
-            if l > 1:
-                # 存放各个阶段的深度图，并将最新得到的深度图进行分出来进行一个上采样来适应下一个阶段
-                depth_patchmatch[f'stage_{l}'] = depth
-                # 这里数据分为两份，一份用来上采样，一份用来返回
-                depth = depth[-1].detach()
-            else:# 测试专用
-                depth_samples=[]
-                depth_samples.append(depth)
-                depth_samples.append(depth)
-                depth_patchmatch[f'stage_{l}'] = depth_samples
+            # 存放各个阶段的深度图，并将最新得到的深度图进行分出来进行一个上采样来适应下一个阶段
+            depth_patchmatch[f'stage_{l}'] = depth
+            # 这里数据分为两份，一份用来上采样，一份用来返回
+            depth = depth[-1].detach()
+
 
             if l > 1:
                 # upsampling the depth map and pixel-wise view weight for next stage
@@ -349,8 +342,6 @@ class PatchmatchNet(nn.Module):
                 # 视图权重进行上采样，以便于后续阶段用
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
-            
-
 
         # step 3. Refinement  
         depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)

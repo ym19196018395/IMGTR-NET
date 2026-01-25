@@ -34,10 +34,10 @@ class EdgeConsistencyLoss(nn.Module):
       loss (scalar tensor), diagnostics (dict)
     """
 
-    def __init__(self, depth_threshold=0.1, sparsity_weight=0.0):
+    def __init__(self, depth_threshold=0.2, sparsity_weight=0.0):
         """
                 Args:
-                    depth_threshold (float): 判定断裂的深度阈值 (单位是m，超过0.1m就算断裂)。
+                    depth_threshold (float): 判定断裂的深度阈值 (单位是m，超过0.2m就算断裂)。
                                              如果 GT 深度差大于此值，认为该边是断裂的 (Label=1)。
                     sparsity_weight (float): 稀疏正则权重 (可选)。
                 """

@@ -585,14 +585,6 @@ class PatchMatch(nn.Module):
             depth_sample = depth_sample.unsqueeze(1)
             depth_samples.append(depth_sample)
 
-        # todo：暂时只在h/2，w/2分辨率处理，这个三角数据是否可以在一开始之前就进行处理
-        # if(self.stage==1):
-        #     # 处理一下三角数据，用来传入边预测头
-        #     # 这里要首先映射到原来大小，然后再经过一个下采样
-        #     tri_infos = batch_convert_to_tri_infos(vertexs, lines, triangles, height*2, width*2, device)
-        #     edge_alphas,edge_mats=self.edge_head(ref_feature,img=None,depth_map=depth_sample[-1],tri_infos=tri_infos)
-        #     return depth_samples, score, view_weights,edge_alphas,edge_mats
-
         return depth_samples, score, view_weights
 
 

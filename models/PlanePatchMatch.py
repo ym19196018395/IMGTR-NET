@@ -73,39 +73,40 @@ class PlaneHomographyWarper(nn.Module):
 
     def get_homography(self, plane_params, K_ref, K_src, R_rel, t_rel):
         """
-        为每个像素/三角形计算单应性矩阵 H
-        Args:
-            plane_params: [B, 4, H, W] (像素级平面参数) 或 [B, N, 4]
-            K_ref, K_src: [B, 3, 3]
-            R_rel, t_rel: [B, 3, 3], [B, 3] (Ref to Src 的相对位姿)
-        Returns:
-            H: [B, H, W, 3, 3] (每个像素一个 H)
+        计算 Homography 矩阵
+        配合 compute_costs 的 trick:
+        - K_src 传入 Identity
+        - R_rel 传入 rot @ K_ref
+        - t_rel 传入 trans
+        这样计算结果 H = rot - trans * n^T * inv(K_ref) / d，完全符合预期
         """
         B, C, H_img, W_img = plane_params.shape
-        device = plane_params.device
+        # device = plane_params.device # 未使用，可注释
 
         # 解析 n, d
         n = plane_params[:, :3, :, :]  # [B, 3, H, W]
         d = plane_params[:, 3:, :, :]  # [B, 1, H, W]
 
-        # 1. 计算中间项 K_src * (R - t*n^T / d) * K_ref_inv
-        # 为了高效，我们将 H, W 拉平处理
+        # 1. 展平处理 [B, Pix, ...]
         n_flat = n.permute(0, 2, 3, 1).reshape(B, -1, 3, 1)  # [B, Pix, 3, 1]
         d_flat = d.permute(0, 2, 3, 1).reshape(B, -1, 1, 1)  # [B, Pix, 1, 1]
 
-        # 准备 R, t
+        # 2. 准备 R, t
+        # 注意：这里的 R, t 已经在 compute_costs 里被扩展为 [B*K, 3, 3]
         R = R_rel.view(B, 1, 3, 3)
         t = t_rel.view(B, 1, 3, 1)
 
-        # 核心公式: M = R - (t @ n.T) / d
-        # t @ n.T -> [B, 1, 3, 1] @ [B, Pix, 1, 3] -> [B, Pix, 3, 3]
+        # 3. 核心公式: M = R - (t @ n.T) / d
+        # d + 1e-7 防止除零
+        # 这中间已经乘出来了一个源视图的内参矩阵，所以内参矩阵设置为了单位阵，以防乘两次
         tn_T = torch.matmul(t, n_flat.transpose(-2, -1))
         M = R - (tn_T / (d_flat + 1e-7))  # [B, Pix, 3, 3]
 
-        # 前后乘内参
+        # 4. 前后乘内参
         K_src_expand = K_src.view(B, 1, 3, 3)
         K_ref_inv = torch.inverse(K_ref).view(B, 1, 3, 3)
 
+        # H = K_src * M * K_ref^-1
         H_mat = torch.matmul(K_src_expand, torch.matmul(M, K_ref_inv))  # [B, Pix, 3, 3]
 
         return H_mat.view(B, H_img, W_img, 3, 3)
@@ -113,62 +114,159 @@ class PlaneHomographyWarper(nn.Module):
     def warp_feature(self, src_feature, H_mat):
         """
         利用 H 矩阵对 Src 特征进行 grid_sample
-        Args:
-            src_feature: [B, C, H, W]
-            H_mat: [B, H, W, 3, 3]
+        优化点：增加了对相机背面点 (w < 0) 的处理
         """
         B, C, H, W = src_feature.shape
         device = src_feature.device
 
-        # 生成 Ref 图像的归一化坐标 grid
+        # 1. 生成 Ref 图像的网格 (u, v, 1)
         y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
         coords = torch.stack([x, y, torch.ones_like(x)], dim=-1).float()  # [H, W, 3]
-        coords = coords.view(1, H, W, 3, 1).expand(B, -1, -1, -1, -1)  # [B, H, W, 3, 1]
 
-        # 应用 H 变换: p_src = H @ p_ref
+        # [B, H, W, 3, 1]
+        coords = coords.view(1, H, W, 3, 1).expand(B, -1, -1, -1, -1)
+
+        # 2. 应用 H 变换: p_src = H @ p_ref
         # H_mat: [B, H, W, 3, 3]
-        projected_coords = torch.matmul(H_mat, coords).squeeze(-1)  # [B, H, W, 3]
+        projected_coords = torch.matmul(H_mat, coords).squeeze(-1)  # [B, H, W, 3] (u', v', w')
 
-        # 归一化齐次坐标 (u, v, w) -> (u/w, v/w)
-        w = projected_coords[..., 2:3]
-        uv = projected_coords[..., :2] / (w + 1e-7)
+        # 3. 透视除法与归一化
+        u_prime = projected_coords[..., 0]
+        v_prime = projected_coords[..., 1]
+        w_prime = projected_coords[..., 2]
 
-        # 归一化到 [-1, 1]
-        uv_norm = torch.zeros_like(uv)
-        uv_norm[..., 0] = 2 * uv[..., 0] / (W - 1) - 1
-        uv_norm[..., 1] = 2 * uv[..., 1] / (H - 1) - 1
+        # === 🛡️ 安全修正：处理相机背面的点 ===
+        # 如果 w < 0，说明点在相机背面。如果不处理，除法后坐标可能是合法的(图像翻转)，导致采样错误特征。
+        # 我们给它一个极小的正数 eps，或者将其坐标设为极大值(采样出界为0)
+        valid_mask = w_prime > 1e-6
 
-        # 采样
-        warped_feat = F.grid_sample(src_feature, uv_norm, align_corners=True, padding_mode='zeros')
+        # 这种写法既防止了除零，又把背面点(w<=0)除成了一个极大值/极小值，从而 grid_sample 采样到 0 (padding)
+        w_prime = torch.where(valid_mask, w_prime, torch.ones_like(w_prime) * 1e-12)
+
+        # 正常的透视除法
+        u_norm = u_prime / w_prime
+        v_norm = v_prime / w_prime
+
+        # 如果是无效点(背面)，手动将其设为出界值 (例如 2.0，范围是 -1~1)
+        # 这样 grid_sample 会填充 0
+        u_norm = torch.where(valid_mask, u_norm, torch.tensor(10.0, device=device))
+        v_norm = torch.where(valid_mask, v_norm, torch.tensor(10.0, device=device))
+
+        # 4. 归一化到 [-1, 1] 用于 grid_sample
+        # 公式: 2 * x / (W-1) - 1
+        uv_grid = torch.stack([
+            2.0 * u_norm / (W - 1) - 1.0,
+            2.0 * v_norm / (H - 1) - 1.0
+        ], dim=-1)  # [B, H, W, 2]
+
+        # 5. 采样
+        warped_feat = F.grid_sample(src_feature, uv_grid, align_corners=True, padding_mode='zeros')
 
         return warped_feat
 
 
-class PlanePatchMatchModule(nn.Module):
-    def __init__(self, fitter_module, num_hypotheses=3, G=8):
+import torch
+import torch.nn as nn
+
+
+class SimilarityNet(nn.Module):
+    def __init__(self, G):
+        """
+        Similarity Net: 将分组相关性 (Group-wise Correlation) 映射为匹配分数 (Score)
+
+        Args:
+            G: int, 分组数量 (Group number)，输入通道数
+        """
+        super(SimilarityNet, self).__init__()
+
+        # Layer 1: G -> 16
+        # 使用 1x1 卷积进行通道融合
+        self.conv0 = nn.Conv2d(G, 16, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn0 = nn.BatchNorm2d(16)
+        self.relu0 = nn.ReLU(inplace=True)
+
+        # Layer 2: 16 -> 8
+        self.conv1 = nn.Conv2d(16, 8, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(8)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        # Layer 3: 8 -> 1 (Output Score)
+        # 输出 Logits，数值越大代表越相似
+        self.similarity = nn.Conv2d(8, 1, kernel_size=1, stride=1, padding=0, bias=False)
+
+        # 🔥 关键：手动初始化权重
+        # 确保初始状态下：输入越大 -> 输出越大 (Positive Correlation)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # 1. 将卷积核权重设为小的正数 (例如 0.01)
+                # 这样保证了 input * weight > 0，且保留了梯度传导能力
+                nn.init.constant_(m.weight, 0.01)
+
+                # 2. 将 Bias 设为 0
+                # 防止初始 Bias 为负数导致整体分数偏移
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+            elif isinstance(m, nn.BatchNorm2d):
+                # BN 层初始化为恒等映射
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
         """
         Args:
-            fitter_module: 实例化好的 DensePlaneFitter 对象
+            x: [B*K, G, H, W] - 分组相似度 (Group Correlation)
+               通常数值范围在 -1 到 1 之间 (取决于特征归一化情况)
+
+        Returns:
+            score: [B*K, 1, H, W] - 匹配分数 (Logits)
+                   数值越大表示置信度越高
+        """
+        # x: [B*K, G, H, W]
+        out = self.conv0(x)
+        out = self.bn0(out)
+        out = self.relu0(out)
+
+        out = self.conv1(out)
+        out = self.bn1(out)
+        out = self.relu1(out)
+
+        # score: [B*K, 1, H, W]
+        score = self.similarity(out)
+
+        return score
+
+class PlanePatchMatchModule(nn.Module):
+    def __init__(self,  num_hypotheses=3, G=8):
+        """
+        Args:
             num_hypotheses: K (假设数量)
             G: Group Correlation 的组数 (默认8)
         """
         super().__init__()
-        self.fitter = fitter_module
+
         self.num_hypotheses = num_hypotheses
+
+        self.G=G
 
         # 核心组件
         self.warper = PlaneHomographyWarper()
 
-        # 复用 PatchMatchNet 的 Evaluation 模块 (用于计算特征相似度)
-        # 假设 Evaluation 类可用，若未导入需从 patchmatch.py 导入
-        # self.evaluation = Evaluation(G=G, stage=1)
-        # 暂时用一个占位符或你需要确保 Evaluation 类在上下文中可用
-        self.evaluation = None
+        # 不需要 propa_conv, eval_conv, feature_weight_net
+        # 不需要 depth_initialization (因为我们用 fitter 初始化)
 
-    def forward(self, depth_stage2, tri_infos, ref_feature, src_features,
+        # 相似度计算网络 (类似于原版，但不需要 grid)
+        # 这是一个简单的 1x1 Conv，把 G 组相关性映射为 1 个 Cost
+        self.similarity_net = SimilarityNet(G=G)
+
+    def forward(self,fitter_module, depth_stage2, tri_infos, ref_feature, src_features,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights=None):
         """
         Args:
+            fitter_module: 实例化好的 DensePlaneFitter 对象
             depth_stage2: [B, 1, H/4, W/4] (Stage 2 深度)
             tri_infos: List[Dict], 包含 'tri_id_map' 和 'batch_num_tri'
             ref_feature: [B, C, H, W] (Stage 1 参考特征)
@@ -186,47 +284,43 @@ class PlanePatchMatchModule(nn.Module):
         """
         B, C, H, W = ref_feature.shape
         device = ref_feature.device
-
+        self.fitter = fitter_module
         # ==========================================
         # 1. 数据准备 (Data Preparation)
         # ==========================================
+
         # 处理 tri_id_map: List[[1, H, W]] -> [B, H, W]
-        # 对应源代码中的 stack 逻辑
-        if isinstance(tri_infos[0]['tri_id_map'], list):
-            # 兼容处理
-            processed_list = [t.squeeze(0) for t in tri_infos[0]['tri_id_map']]
-            tri_id_map = torch.stack(processed_list, dim=0).to(device)
-        else:
-            tri_id_map = tri_infos[0]['tri_id_map'].to(device)  # 假设已经是 Tensor
+        # 步骤1：去掉每个Tensor中长度为1的维度（把[1, H, W]转成[H, W]）
+        processed_list = [tensor.squeeze(0) for tensor in tri_infos[0]['tri_id_map']]
+        # 步骤2：在第0维（batch维）堆叠，得到[B, H, W]
+        tri_id_map = torch.stack(processed_list, dim=0)
 
         # 获取 batch 内最大的三角形数量
-        # 注意：tri_infos 结构可能比较复杂，这里按你提供的逻辑获取
-        # 假设 tri_infos[0] 包含了所有 batch 的信息
-        if 'batch_num_tri' in tri_infos[0]:
-            batch_num_tri_list = tri_infos[0]['batch_num_tri']
-            # 如果是 tensor 转 list
-            if isinstance(batch_num_tri_list, torch.Tensor):
-                batch_num_tri_list = batch_num_tri_list.tolist()
-            max_num_tri = max(batch_num_tri_list)
-        else:
-            # 备用逻辑
-            max_num_tri = 2000  # 默认值或报错
+        max_tri_num = max(item['batch_num_tri'] for item in tri_infos)
+        max_tri_num = max(max_tri_num)
+
+        ref_intrinsics = intrinsics_s1[0]
 
         # ==========================================
         # 2. 拟合与生成 (Fitting & Generation)
         # ==========================================
         # 使用优化后的 get_plane_hypotheses 直接得到 [B, N, K, 4]
-        # 它内部包含了 By_SVD_Plane (Hypo 0) 和 Hypothesis Expansion (Hypo 1~K)
+        # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
         hypotheses = self.fitter.get_plane_hypotheses(
             depth_stage2=depth_stage2,
             tri_id_map=tri_id_map,
-            intrinsics_s1=ref_proj,
-            max_num_triangles=max_num_tri
+            intrinsics_s1=ref_intrinsics,
+            max_num_triangles=max_tri_num
         )  # Output: [B, N_tri, K, 4]
+
+        # [B, N_tri, K, 4] -> [B, N_tri, 3] (取第0个假设,最佳平面的前3通道)
+        # 进行一个可视化看看效果
+        before_best_guess_planes = hypotheses[:, :, 0, :]  # [B, N_tri, 4]
 
         # ==========================================
         # 3. 广播 (Broadcasting: Triangle -> Pixel)
         # ==========================================
+
         # 将三角形级的假设映射到像素级
         # pixel_hypotheses: [B, H, W, K, 4]
         pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map, H, W)
@@ -243,25 +337,34 @@ class PlanePatchMatchModule(nn.Module):
         # ==========================================
         # 计算所有假设的代价
         # costs: [B, H, W, K]
-        costs = self.compute_costs(
+        pixel_costs = self.compute_costs(
             ref_feature, src_features,
             ref_proj, src_projs,
             current_hypotheses,
-            view_weights
+            view_weights,
+            ref_intrinsic=ref_intrinsics
         )
 
         # ==========================================
-        # 6. 评估与选择 (Evaluation & Selection)
+        # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
         # ==========================================
-        # 简化版: Hard Argmin (直接取 Cost 最小的平面)
-        # best_idx: [B, H, W]
-        best_idx = torch.argmin(costs, dim=3)
 
-        # Gather 最佳平面参数
-        # [B, H, W, K, 4] -> [B, H, W, 4]
-        # 需要构造 gather 索引
-        gather_idx = best_idx.unsqueeze(3).unsqueeze(4).expand(-1, -1, -1, 1, 4)
-        best_planes = torch.gather(current_hypotheses, 3, gather_idx).squeeze(3)  # [B, H, W, 4]
+        # 1. 聚合 Cost: [B, H, W, K] -> [B, N_tri, K]
+        tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
+
+        # 2. 三角形级选择 (Triangle-wise Argmin)
+        # best_tri_idx: [B, N_tri] (每个三角形选择了第几个假设 0~K-1)
+        best_tri_idx = torch.argmin(tri_costs, dim=2)
+
+        # 3. 提取最佳平面参数
+        # hypotheses: [B, N_tri, K, 4]
+        # 我们需要根据 best_tri_idx 从 K 个假设中 Gather 出最好的那个
+
+        # 构造 Gather Index: [B, N_tri, 1, 4]
+        gather_idx = best_tri_idx.view(B, max_tri_num, 1, 1).expand(-1, -1, 1, 4)
+
+        # best_planes: [B, N_tri, 4] (更新后的三角形平面)
+        best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
 
         # ==========================================
         # 7. 渲染与输出 (Rendering)
@@ -269,46 +372,33 @@ class PlanePatchMatchModule(nn.Module):
         # 动态实例化 Visualizer 以适应当前 H, W
         visualizer = PlaneVisualizer(H, W, device)
 
-        # 渲染深度图 (这里直接用像素级平面参数渲染，不需要再传 tri_id_map 了，或者复用接口)
-        # 注意：render_from_planes 原本接收 [B, N, 4]，但我们现在有 [B, H, W, 4]
-        # 为了复用 visualizer，我们可以写一个专门针对 pixel-wise plane 的渲染函数，
-        # 或者在这里直接用公式算：depth = -d / (n * K^-1 * uv)
-        # 为了简单，假设 visualizer 有个 render_pixel_wise 或者我们手动算一下：
+        # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)
+        invalid_mask = (tri_id_map < 0)
 
-        # 手动快速渲染 (参考 Visualizer 逻辑)
-        # n: [B, H, W, 3], d: [B, H, W, 1]
-        n_map = best_planes[..., :3]
-        d_map = best_planes[..., 3:]
+        # 调用新函数直接渲染 ✅
+        # depth_sample, normal_vis = visualizer.render_from_pixel_wise_planes(
+        #     best_planes,
+        #     ref_intrinsics,  # 这里假设 ref_proj 就是 intrinsics (如果是 [B,4,4] 需取 [:3,:3])
+        #     (depth_min, depth_max),
+        #     invalid_mask=invalid_mask
+        # )
 
-        # 构建坐标网格
-        y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-        # [B, H, W]
-        fx = ref_proj[:, 0, 0].view(B, 1, 1)
-        fy = ref_proj[:, 1, 1].view(B, 1, 1)
-        cx = ref_proj[:, 0, 2].view(B, 1, 1)
-        cy = ref_proj[:, 1, 2].view(B, 1, 1)
+        # ym-modify 目前的逻辑是假设一个三角的像素处于同一个平面
+        depth_sample, normal_vis = visualizer.render_from_planes(
+            best_planes,
+            tri_id_map,
+            ref_intrinsics,
+            depth_range=(depth_min, depth_max))
 
-        u_bar = (x.unsqueeze(0) - cx) / fx
-        v_bar = (y.unsqueeze(0) - cy) / fy
+        # 组装输出 (PatchMatchNet 通常需要 List 格式)
+        depth_samples = [depth_sample,depth_sample]  # List[[B, 2, H, W]]
 
-        dot_product = (n_map[..., 0] * u_bar) + (n_map[..., 1] * v_bar) + (n_map[..., 2] * 1.0)
-        dot_product = dot_product.clamp(min=1e-6)  # 防止除零（注意符号）
-
-        # 正常情况下 dot_product 应该是负的(指向相机)，这里取绝对值简化
-        depth_sample = (-d_map.squeeze(-1) / dot_product).abs()
-
-        # Clamp
-        if isinstance(depth_max, torch.Tensor):
-            depth_max = depth_max.to(device).view(B, 1, 1)
-        depth_sample = torch.clamp(depth_sample, min=depth_min, max=depth_max)
-
-        # 组装输出
-        depth_samples = [depth_sample.unsqueeze(1)]  # List[[B, 1, H, W]]
+        normal_samples= [before_best_guess_planes,normal_vis]
 
         # Score (Confidence) = -min_cost
-        score = -torch.min(costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
+        score = -torch.min(pixel_costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
 
-        return depth_samples, score, view_weights
+        return depth_samples, score, view_weights,normal_samples
 
     # ==========================================
     # 辅助函数 (Placeholders)
@@ -323,17 +413,280 @@ class PlanePatchMatchModule(nn.Module):
         Returns:
             pixel_hypotheses: [B, H, W, K, 4]
         """
-        # 待实现
-        pass
+        B, N_tri, K, C = hypotheses.shape
+        device = hypotheses.device
 
-    def compute_costs(self, ref_feature, src_features, ref_proj, src_projs, current_hypotheses, view_weights):
+        # 1. 安全处理无效 ID (-1)
+        # 将 -1 (无效区域) 临时映射到 0，防止索引越界报错
+        # 之后可以用 mask 再次处理，或者直接让它取第 0 个三角形的平面（通常无伤大雅，因为无效区域后续不参与计算）
+        invalid_mask = (tri_id_map < 0)
+        safe_id_map = tri_id_map.clone()
+        safe_id_map[invalid_mask] = 0
+
+        # 确保是 Long 类型
+        safe_id_map = safe_id_map.long()
+
+        # 2. 计算全局索引 (Global Indices)
+        # 因为 hypotheses 是 [B, N, ...]，直接索引需要区分 batch
+        # 我们构造一个偏移量: batch_idx * N_tri
+        batch_offset = torch.arange(B, device=device) * N_tri
+        batch_offset = batch_offset.view(B, 1, 1)  # [B, 1, 1] 用于广播
+
+        # global_ids: 每个像素在 flattened hypotheses 中的绝对索引
+        # shape: [B, H, W] -> view -> [B*H*W]
+        global_ids = (safe_id_map + batch_offset).view(-1)
+
+        # 3. 展平假设池以供索引
+        # [B, N_tri, K, 4] -> [B * N_tri, K, 4]
+        flat_hypotheses = hypotheses.view(-1, K, C)
+
+        # 4. 查表 (Gather / Advanced Indexing)
+        # [B*H*W, K, 4]
+        pixel_hypotheses_flat = flat_hypotheses[global_ids]
+
+        # 5. 恢复形状
+        # [B, H, W, K, 4]
+        pixel_hypotheses = pixel_hypotheses_flat.view(B, H, W, K, C)
+
+        # (可选) 6. 处理无效区域
+        # 如果你希望无效区域的平面参数是全0或者特定值，可以在这里处理
+        # 例如: 将无效像素的假设全部置为 0
+        # if invalid_mask.any():
+        #     mask_expand = invalid_mask.unsqueeze(-1).unsqueeze(-1).expand_as(pixel_hypotheses)
+        #     pixel_hypotheses[mask_expand] = 0.0
+
+        return pixel_hypotheses
+
+    def compute_costs(self, ref_feature, src_features, ref_proj, src_projs, current_hypotheses, view_weights,
+                      ref_intrinsic):
         """
-        计算代价体积
+        计算代价体积 (Cost Volume)
+        Args:
+            ref_feature: [B, C, H, W]
+            src_features: List of [B, C, H, W]
+            ref_proj: [B, 4, 4] (Ref 投影矩阵 P)
+            src_projs: List of [B, 4, 4] (Src 投影矩阵 P)
+            current_hypotheses: [B, H, W, K, 4] (像素级平面假设)
+            view_weights: [B, Nview-1, H, W] (可选)
+            ref_intrinsic: [B, 3, 3] (参考图内参 K, 必须提供以计算 Homography)
         Returns:
             costs: [B, H, W, K]
         """
-        # 待实现
-        pass
+        B, H, W, K, _ = current_hypotheses.shape
+        C = ref_feature.shape[1]
+        device = ref_feature.device
+
+        # 1. 预处理平面参数
+        # [B, H, W, K, 4] -> [B, K, 4, H, W] -> [B*K, 4, H, W]
+        # 这样我们可以利用 Batch 并行计算所有假设的 Homography
+        plane_params = current_hypotheses.permute(0, 3, 4, 1, 2).reshape(B * K, 4, H, W)
+
+        # 2. 准备 Ref 特征 (Group 分组)
+        # [B, C, H, W] -> [B, 1, G, C/G, H, W] -> Repeat K -> [B*K, G, C/G, H, W]
+        ref_feat_grouped = ref_feature.view(B, self.G, C // self.G, H, W)
+        ref_feat_expanded = ref_feat_grouped.unsqueeze(1).repeat(1, K, 1, 1, 1, 1).view(B * K, self.G, C // self.G, H,
+                                                                                        W)
+
+        # 3. 准备内参 K
+        # 我们利用 get_homography 的数学特性：
+        # H = K_src * (R - t * n^T / d) * K_ref_inv
+        # 这里我们传入 K_src=Identity, K_ref=Real_K, R_rel=rot*K, t_rel=trans
+        # 结果 H = I * (rot*K - trans * n^T / d) * K_inv = rot - trans * n^T * K_inv / d
+        # 这正是我们需要的 Homography (因为 rot/trans 已经是投影空间的相对变换了)
+
+        K_ref_expand = ref_intrinsic.unsqueeze(1).repeat(1, K, 1, 1).view(B * K, 3, 3)
+        # 单位矩阵
+        K_src_identity = torch.eye(3, device=device).view(1, 3, 3).expand(B * K, -1, -1)
+
+        total_cost = 0
+
+        # 遍历所有源视图
+        for i, (src_feat, src_proj) in enumerate(zip(src_features, src_projs)):
+            # --- A. 计算相对变换 (Projective Space) ---
+            # M = P_src * P_ref^-1
+            # rot (3x3) 对应 K' R K^-1
+            # trans (3x1) 对应 K' t
+            with torch.no_grad():
+                proj_rel = torch.matmul(src_proj, torch.inverse(ref_proj))
+                rot = proj_rel[:, :3, :3]  # [B, 3, 3]
+                trans = proj_rel[:, :3, 3:4]  # [B, 3, 1]
+
+                # 扩展到 [B*K, ...]
+                rot_expand = rot.unsqueeze(1).repeat(1, K, 1, 1).view(B * K, 3, 3)
+                trans_expand = trans.unsqueeze(1).repeat(1, K, 1, 1).view(B * K, 3, 1)
+
+                # 构造传递给 warper 的 R_rel
+                # Trick: 传入 rot @ K_ref，配合 get_homography 内部的 * K_ref_inv，正好抵消得到 rot
+                R_rel_input = torch.matmul(rot_expand, K_ref_expand)
+
+            # --- B. 计算 Homography ---
+            # H: [B*K, H, W, 3, 3]
+            H_mats = self.warper.get_homography(
+                plane_params=plane_params,
+                K_ref=K_ref_expand,
+                K_src=K_src_identity,  # 这里设为 Identity
+                R_rel=R_rel_input,
+                t_rel=trans_expand
+            )
+
+            # --- C. 特征扭曲 (Warping) --- ✅
+            # src_feat: [B, C, H, W] -> [B*K, C, H, W]
+            src_feat_expand = src_feat.unsqueeze(1).repeat(1, K, 1, 1, 1).view(B * K, C, H, W)
+            warped_src = self.warper.warp_feature(src_feat_expand, H_mats)
+
+            del src_feat_expand, H_mats # 释放显存
+
+            # --- D. 分组相关性 (Group Correlation) ---
+            # [B*K, G, C/G, H, W]
+            warped_src_grouped = warped_src.view(B * K, self.G, C // self.G, H, W)
+            # Similarity: [B*K, G, H, W]
+            similarity = (warped_src_grouped * ref_feat_expanded).mean(dim=2)
+
+            del warped_src, warped_src_grouped  # 释放显存
+
+            # ================== debug专用 ==================================
+            # if i == 0:
+            #     # similarity: [B*K, G, H, W] -> Mean over G -> [B*K, 1, H, W]
+            #     raw_sim = similarity.mean(dim=1).view(B, K, H, W)
+            #
+            #     raw_svd = raw_sim[:, 0, ...].mean().item()
+            #     raw_fp = raw_sim[:, 1, ...].mean().item()
+            #     raw_rnd = raw_sim[:, 2, ...].mean().item()
+            #     print(f"✅ [Check Input] Raw SVD: {raw_svd:.4f} | FP: {raw_fp:.4f} | Rnd: {raw_rnd:.4f}")
+            # similarity 是 [B*K, G, H, W]，我们在 G 维度取平均
+            # score_i = similarity.mean(dim=1, keepdim=True)  # [B*K, 1, H, W]
+
+
+            # --- E. 计算代价 (Cost Regression) --- ❌
+            # similarity_net: [B*K, G, H, W] -> [B*K, 1, H, W]
+            # cost 越小越好，correlation 越大越好，所以取负
+            score_i = self.similarity_net(similarity)
+            cost_i = -score_i  # [B*K, 1, H, W]
+
+            # ============debug专用========================
+            if i == 0:  # 只看第一个源视图
+                # Reshape 回 [B, K, 1, H, W]
+                temp_score = score_i.view(B, K, 1, H, W)
+                score_0 = temp_score[:, 0, ...].mean().item()
+                score_1 = temp_score[:, 1, ...].mean().item()
+                score_2 = temp_score[:, 2, ...].mean().item()
+                score_3 = temp_score[:, 3, ...].mean().item()
+                print(f"\n[Debug] Raw Similarity Mean | Hypo 0 (SVD): {score_0:.4f} | Hypo 1 (FP): {score_1:.4f}"
+                      f"Hypo 2 (SVD): {score_2:.4f} | Hypo 3 (FP): {score_3:.4f}")
+
+            # ========== 特征扭曲debug =====================================
+            # if i == 0 :  # 你需要自己加个计数器或者只跑一个 batch
+            #     import torchvision.utils as vutils
+            #     # Reshape 为 [B, K, C, H, W]
+            #     debug_warp = warped_src.view(B, K, C, H, W)
+            #
+            #     # 取 Hypo 0 (SVD) 和 Hypo 1 (FP)
+            #     # 归一化到 0-1 以便显示
+            #     img_0 = debug_warp[0, 0, :3].detach().cpu()  # 取前3个通道当RGB
+            #     img_1 = debug_warp[0, 2, :3].detach().cpu()
+            #
+            #     # 归一化
+            #     img_0 = (img_0 - img_0.min()) / (img_0.max() - img_0.min())
+            #     img_1 = (img_1 - img_1.min()) / (img_1.max() - img_1.min())
+            #
+            #     vutils.save_image(img_0, "debug_warp_svd.png")
+            #     vutils.save_image(img_1, "debug_warp_fp.png")
+            #     print("📸 已保存 debug_warp_svd.png 和 debug_warp_fp.png")
+
+            # --- F. 应用视图权重 (View Weights) ---
+            if view_weights is not None:
+                # view_weights: [B, Nview-1, H, W] -> 取第 i 个 -> [B, 1, H, W]
+                # 扩展到 K
+                vw = view_weights[:, i:i + 1, :, :].unsqueeze(1).repeat(1, K, 1, 1, 1).view(B * K, 1, H, W)
+                cost_i = cost_i * vw
+
+            total_cost = total_cost + cost_i
+
+        # 还原形状 [B*K, 1, H, W] -> [B, K, H, W] -> [B, H, W, K]
+        total_cost = total_cost.view(B, K, H, W).permute(0, 2, 3, 1)
+
+        return total_cost
+
+    def aggregate_costs_per_triangle(self, pixel_costs, tri_id_map, max_num_tri):
+        """
+        将像素级的代价聚合为三角形级的代价 (Triangle-wise Aggregation)
+        Args:
+            pixel_costs: [B, H, W, K] (每个像素对 K 个假设的代价)
+            tri_id_map: [B, H, W] (每个像素属于哪个三角形，-1 表示无效)
+            max_num_tri: int (最大三角形数量)
+        Returns:
+            tri_costs: [B, N_tri, K] (每个三角形对 K 个假设的平均代价)
+        """
+        B, H, W, K = pixel_costs.shape
+        device = pixel_costs.device
+
+        # 1. 展平数据
+        # pixel_costs 来自 permute，内存不连续，必须用 reshape
+        flat_costs = pixel_costs.reshape(B, -1, K) # [B, Pixels, K]
+        flat_ids = tri_id_map.reshape(B, -1)  # [B, Pixels]
+
+        # 2. 生成有效 Mask
+        valid_mask = (flat_ids >= 0)
+
+        # 3. 准备 Scatter 用的全局索引 (Offset Trick)
+        # 将 Batch 维度折叠进三角形 ID：Global_ID = Batch_ID * Max_Tri + Local_Tri_ID
+        batch_offset = (torch.arange(B, device=device) * max_num_tri).view(B, 1)
+
+        # 为了计算索引安全，先把无效的 -1 变成 0 (反正后面会被 mask 过滤掉)
+        safe_ids = flat_ids.clone()
+        safe_ids[~valid_mask] = 0
+
+        # 计算全局唯一索引 [B, Pixels] -> [Total_Pixels]
+        global_ids = (safe_ids + batch_offset).view(-1)
+
+        # 4. 提取有效数据 (Filtering)
+        # 只保留 mask 为 True 的像素数据，减少计算量
+        flat_mask = valid_mask.reshape(-1)
+
+        valid_global_ids = global_ids[flat_mask]  # [Valid_Pixels]
+        flat_costs_all = flat_costs.reshape(-1, K)
+        valid_costs = flat_costs_all[flat_mask]  # [Valid_Pixels, K]
+
+        # 5. 聚合 (Scatter Add)
+        total_bins = B * max_num_tri
+
+        # 准备输出容器 (扁平化)
+        flat_tri_sum = torch.zeros(total_bins, K, device=device)
+        flat_tri_counts = torch.zeros(total_bins, 1, device=device)
+
+        # 扩展索引以匹配 K 维度: [N] -> [N, K]
+        idx_expand = valid_global_ids.unsqueeze(1).expand(-1, K)
+
+        # 累加 Cost
+        flat_tri_sum.scatter_add_(0, idx_expand, valid_costs)
+
+        # 累加计数 (Count)
+        # 只需要对一列进行计数
+        flat_tri_counts.scatter_add_(0, valid_global_ids.unsqueeze(1),
+                                     torch.ones_like(valid_global_ids.unsqueeze(1), dtype=torch.float32))
+
+        # 6. 求平均与异常处理 (关键补全!)
+
+        # 找出有效的三角形 (Count > 0)
+        has_pixels = (flat_tri_counts > 0)  # [Total_Bins, 1]
+
+        # 计算平均 Cost
+        # 加上 1e-6 防止除零，但对于 count=0 的情况，结果依然接近 0
+        flat_tri_mean = flat_tri_sum / (flat_tri_counts + 1e-6)
+
+        # 🔥 补全逻辑：将没有像素覆盖的三角形 Cost 设为最大值
+        # 这样 Argmin 就绝对不会选中它们
+        # 使用 100.0 或者更大的数，取决于你的 Cost 范围 (通常 Cost < 1.0)
+        max_cost_value = 1
+
+        # 如果 has_pixels 为 False，则赋值为 max_cost_value
+        # 这一步非常关键，否则空三角形 Cost=0 会导致错误的“完美匹配”
+        flat_tri_mean = torch.where(has_pixels, flat_tri_mean, torch.tensor(max_cost_value, device=device))
+
+        # 7. 恢复形状
+        tri_costs = flat_tri_mean.view(B, max_num_tri, K)
+
+        return tri_costs
 
 class DensePlaneFitter(nn.Module)   :
     def __init__(self, height_s1, width_s1, device, num_hypotheses=3, perturbation_range=0.05, depth_max=None):
@@ -1012,7 +1365,7 @@ class DensePlaneFitter(nn.Module)   :
 
         normal_fp = torch.zeros((B, max_num_triangles, 1, 3), device=device)
         normal_fp[..., 2] = -1.0
-        d_fp = -mean_depth  # d = -z
+        d_fp = mean_depth  # d = -z
 
         hypo_fp = torch.cat([normal_fp, d_fp], dim=-1)  # [B, N, 1, 4]
         hypo_list.append(hypo_fp)
@@ -1466,10 +1819,7 @@ class PlaneVisualizer:
         # 这一步是为了让颜色跟你之前的函数保持一致
         # (x+1)/2: -1->0, 0->0.5, 1->1
 
-        # # 方案 A: 物理正确可视化
-        # normal_vis = (normal_vis + 1.0) / 2.0
-
-        # 方案 B: 视觉友好可视化 (偏蓝) -> 用于 Tensorboard 展示
+        # 视觉友好可视化 (偏蓝) -> 用于 Tensorboard 展示
         # 我们临时翻转 Z 轴用于显示，虽然物理上它是负的
         normal_vis[:, 2, :, :] = -normal_vis[:, 2, :, :]  # 翻转 Z 用于显示
         # 专门针对于目前这个 svd 拟合 ym-modify
@@ -1529,11 +1879,121 @@ class PlaneVisualizer:
             # 即使没有给定范围，也要限制一下无穷大
             depth_map = torch.clamp(depth_map, max=600.0)
 
-        # ym-needmodify，暂时进行一个修改本来是0.0
-        depth_map[invalid_mask] = depth_map.max()
+        # ym-needmodify
+        fill_value = depth_map.mean()
+
+        if invalid_mask is not None:
+            # ✅ 使用 torch.where (非原地操作)
+            # 逻辑：如果 mask 为 True，取 fill_value；否则保持 depth_map 原值
+            # 这会创建一个全新的 tensor，不会破坏原来的 depth_map，梯度可以正常回传
+            depth_map = torch.where(invalid_mask, fill_value, depth_map)
 
         depth_map = depth_map.unsqueeze(1)
 
         return depth_map, normal_vis
 
+    def render_from_pixel_wise_planes(self, pixel_planes, intrinsics, depth_range, invalid_mask=None):
+        """
+        [新版渲染函数] 从像素级平面参数 [B, H, W, 4] 直接渲染深度图和法向量图。
+        替代原有的 Sparse-to-Dense 过程，直接处理 Dense 输入，且保持可视化风格一致。
+
+        Args:
+            pixel_planes: [B, H, W, 4] (nx, ny, nz, d)
+            intrinsics:   [B, 3, 3] 相机内参
+            depth_range:  (min_d, max_d), 支持 float 或 Tensor([B])
+            invalid_mask: [B, H, W] (可选，指定无效区域，如 tri_id_map < 0 的区域)
+
+        Returns:
+            depth_map:  [B, 1, H, W]
+            normal_vis: [B, 3, H, W] (颜色化法向量, 0~1)
+        """
+        B, H, W, _ = pixel_planes.shape
+        device = pixel_planes.device
+
+        # 分离 n 和 d
+        n_map = pixel_planes[..., :3]  # [B, H, W, 3]
+        d_map = pixel_planes[..., 3]  # [B, H, W]
+
+        # ==========================================
+        # 1. 生成法向量图 (保持与 compute_normal_map_torch 一致的风格)
+        # ==========================================
+        # [B, H, W, 3] -> [B, 3, H, W]
+        normal_vis = n_map.permute(0, 3, 1, 2).clone()
+
+        # === 视觉友好可视化处理 (完全复用你的逻辑) ===
+        # 翻转 Z (物理上指向相机为负，显示改为正，偏蓝)
+        normal_vis[:, 2, :, :] = -normal_vis[:, 2, :, :]
+        # 翻转 Y (针对 SVD 拟合的特殊修改 ym-modify)
+        normal_vis[:, 1, :, :] = -normal_vis[:, 1, :, :]
+
+        # 映射到 [0, 1]
+        normal_vis = (normal_vis + 1.0) / 2.0
+
+        # 处理 Mask (背景置黑)
+        if invalid_mask is not None:
+            mask_expand = invalid_mask.unsqueeze(1).expand(-1, 3, -1, -1)
+            normal_vis[mask_expand] = 0.0
+
+        # ==========================================
+        # 2. 生成深度图 (Ray-Plane Intersection)
+        # ==========================================
+        fx = intrinsics[:, 0, 0].view(B, 1, 1)
+        fy = intrinsics[:, 1, 1].view(B, 1, 1)
+        cx = intrinsics[:, 0, 2].view(B, 1, 1)
+        cy = intrinsics[:, 1, 2].view(B, 1, 1)
+
+        # 动态构建网格 (确保尺寸匹配)
+        if not hasattr(self, 'grid_x') or self.grid_x.shape != (H, W):
+            y_range = torch.arange(0, H, dtype=torch.float32, device=device)
+            x_range = torch.arange(0, W, dtype=torch.float32, device=device)
+            self.grid_y, self.grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+
+        u_grid = self.grid_x.unsqueeze(0).expand(B, -1, -1)
+        v_grid = self.grid_y.unsqueeze(0).expand(B, -1, -1)
+
+        u_bar = (u_grid - cx) / fx
+        v_bar = (v_grid - cy) / fy
+
+        # dot = n_x * u_bar + n_y * v_bar + n_z * 1
+        dot_product = (n_map[..., 0] * u_bar) + \
+                      (n_map[..., 1] * v_bar) + \
+                      (n_map[..., 2] * 1.0)
+
+        # 防止除零
+        dot_product[torch.abs(dot_product) < 1e-6] = 1e-6
+
+        # depth = -d / dot
+        depth_map = -d_map / dot_product
+        depth_map = depth_map.abs()  # 确保正深度
+
+        # ==========================================
+        # 3. 数值截断 (Clamp)
+        # ==========================================
+        if depth_range is not None:
+            min_d, max_d = depth_range
+
+            # 兼容 Tensor 类型 [B] -> [B, 1, 1]
+            if isinstance(min_d, torch.Tensor):
+                if min_d.ndim == 1: min_d = min_d.view(-1, 1, 1)
+                min_d = min_d.to(device)
+
+            if isinstance(max_d, torch.Tensor):
+                if max_d.ndim == 1: max_d = max_d.view(-1, 1, 1)
+                max_d = max_d.to(device)
+
+            depth_map = torch.clamp(depth_map, min=min_d, max=max_d)
+        else:
+            depth_map = torch.clamp(depth_map, max=600.0)
+
+        fill_value = depth_map.max().detach()
+
+        if invalid_mask is not None:
+            # ✅ 使用 torch.where (非原地操作)
+            # 逻辑：如果 mask 为 True，取 fill_value；否则保持 depth_map 原值
+            # 这会创建一个全新的 tensor，不会破坏原来的 depth_map，梯度可以正常回传
+            depth_map = torch.where(invalid_mask, fill_value, depth_map)
+
+        depth_map = depth_map.unsqueeze(1)  # [B, 1, H, W]
+
+        return depth_map, normal_vis
 
