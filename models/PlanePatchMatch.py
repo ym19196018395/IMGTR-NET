@@ -164,9 +164,122 @@ class PlaneHomographyWarper(nn.Module):
 
         return warped_feat
 
+class LearnedTrianglePropagator(nn.Module):
+    def __init__(self, plane_dim=4, hidden_dim=64):
+        """
+        深度可微三角传播模块
+        包含: Soft Gating, Attention Aggregation, MLP Refinement
+        """
+        super().__init__()
 
-import torch
-import torch.nn as nn
+        # 1. 特征提取器: 从平面参数提取特征
+        # 输入: Plane(4) + Cost(1) = 5
+        self.encoder = nn.Linear(5, hidden_dim)
+
+        # 2. 门控网络 (Gating Network): 决定传播多少信息
+        # 输入: Edge_Prob(1) + Neighbor_Feature(C) + Self_Feature(C)
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),  # 输出一个标量权重
+            nn.Sigmoid()
+        )
+
+        # 3. 平面修正网络 (Refinement MLP) - 这是增加"深度学习含量"的关键
+        # 类似于 RAFT 的 Update Block
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)  # 可选，增加时序记忆
+        self.plane_head = nn.Linear(hidden_dim, 4)  # 输出平面残差 delta_plane
+
+    def forward(self, current_planes, current_costs, neighbor_indices, edge_probs,
+                ref_feature=None):
+        """
+        Args:
+            current_planes: [B, N, 4]
+            current_costs: [B, N, 1] (注意维度)
+            neighbor_indices: [B, N, 3]
+            edge_probs: [B, N, 3] (来自 EdgeHead, 0~1, 越大表示越阻断)
+        """
+        B, N, _ = current_planes.shape
+        device = current_planes.device
+
+        # ==========================================
+        # 1. 准备数据: Self & Neighbors
+        # ==========================================
+        # 构造输入特征: [Plane, Cost]
+        plane_feat = torch.cat([current_planes, current_costs], dim=-1)  # [B, N, 5]
+
+        # 编码特征: [B, N, H]
+        hidden = self.encoder(plane_feat)
+
+        # 获取邻居的特征
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
+        # [B, N, 3, H]
+        neighbor_hidden = hidden[batch_idx, neighbor_indices]
+        # [B, N, 3, 4]
+        neighbor_planes = current_planes[batch_idx, neighbor_indices]
+
+        # ==========================================
+        # 2. 软门控 (Soft Gating) - 替代硬截断
+        # ==========================================
+        # 我们希望: EdgeProb 越小 (连通), Weight 越大
+
+        # 构造门控输入: [Self_Hidden, Neighbor_Hidden, Edge_Prob]
+        # Self 扩展: [B, N, 1, H] -> [B, N, 3, H]
+        self_hidden_expand = hidden.unsqueeze(2).expand(-1, -1, 3, -1)
+
+        # Concat: [B, N, 3, H*2 + 1]
+        gate_input = torch.cat([self_hidden_expand, neighbor_hidden, edge_probs.unsqueeze(-1)], dim=-1)
+
+        # 计算注意力权重 (Attention Weights)
+        # [B, N, 3, 1]
+        raw_weights = self.gate_net(gate_input)
+
+        # 结合 EdgeProb 的物理约束 (如果 EdgeProb=1, 强制权重为0)
+        # 这是一个 "Hard Constraint via Soft Mechanism"
+        physics_guidance = 1.0 - edge_probs.unsqueeze(-1)  # [B, N, 3, 1]
+        final_weights = raw_weights * physics_guidance
+
+        # 归一化权重 (包括自己)
+        # 假设自己的权重是 1.0 (残差连接的思想)
+        # weights = Softmax([w1, w2, w3, w_self])
+        # 这里为了简化，直接用加权平均
+
+        # ==========================================
+        # 3. 软传播 (Weighted Aggregation)
+        # ==========================================
+        # 聚合邻居平面: Sum(w_i * p_i)
+        # [B, N, 3, 1] * [B, N, 3, 4] -> sum(dim=2) -> [B, N, 4]
+        weighted_neighbor_planes = (final_weights * neighbor_planes).sum(dim=2)
+        sum_weights = final_weights.sum(dim=2) + 1e-6
+
+        # 混合: (Sum_W * Neighbors + 1.0 * Self) / (Sum_W + 1.0)
+        # 这种混合方式保证了数值稳定性
+        aggregated_planes = (weighted_neighbor_planes + current_planes) / (sum_weights + 1.0)
+
+        # ==========================================
+        # 4. MLP Refinement (Deep Learning Part)
+        # ==========================================
+        # 利用聚合后的特征，预测一个残差来微调平面
+        # 这就完全是一个 Deep 的过程了
+
+        # 更新 hidden state (模拟 GRU)
+        # Input: 聚合后的平面特征 (这里简化为再次编码)
+        agg_feat = torch.cat([aggregated_planes, current_costs], dim=-1)
+        agg_hidden = self.encoder(agg_feat)
+
+        # 预测残差 delta: [B, N, 4]
+        delta_plane = self.plane_head(agg_hidden)
+
+        # 更新平面
+        new_planes = aggregated_planes + delta_plane
+
+        # 归一化法向量 (前3维)
+        new_n = F.normalize(new_planes[..., :3], dim=-1)
+        new_d = new_planes[..., 3:]
+
+        final_planes = torch.cat([new_n, new_d], dim=-1)
+
+        return final_planes
 
 
 class SimilarityNet(nn.Module):
