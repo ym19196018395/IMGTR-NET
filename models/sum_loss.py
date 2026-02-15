@@ -252,91 +252,12 @@ class EdgeConsistencyLoss(nn.Module):
             'bce': final_bce.item(),
             'sparsity': final_sparsity.item() if isinstance(final_sparsity, torch.Tensor) else 0.0,
             'total': total_loss.item(),
-            'pos_ratio': diag_stats['pos_ratio'],  # 诊断：当前的 GT 阈值下，有多少比例的边被判定为断裂
+            'pos_ratio': diag_stats['pos_ratio'],# 诊断：当前的 GT 阈值下，有多少比例的边被判定为断裂
             'valid_edges': total_valid_edges  # 诊断：有多少边成功采样到了 GT
         }
 
         return total_loss, info,output_alphas_list
 
-    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs, tri_vertices):
-        """
-        纯粹的连续性损失 (C0 Continuity Loss)
-        只约束公共边的深度一致，不强求法向量一致 (允许有棱角，但不能裂开)
-
-        Args:
-            planes: [B, N, 4] (n, d)
-            neighbor_indices: [B, N, 3] (3个邻居的索引)
-            edge_probs: [B, N, 3] (3个边的边缘概率，来自EdgeHead)
-            tri_vertices: [B, N, 3, 3] (三角形的3个顶点坐标, 顺序通常是 v0, v1, v2)
-                           假设邻居0对应边 v0-v1, 邻居1对应 v1-v2... 需要根据你的Mesh结构确定
-        """
-        B, N, _ = planes.shape
-        device = planes.device
-
-        # 1. 获取邻居平面
-        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
-        neighbor_planes = planes[batch_idx, neighbor_indices]  # [B, N, 3, 4]
-
-        # 2. 计算公共边中点 (Edge Midpoints)
-        # 假设：
-        # neighbor[:,:,0] 对应边 (v0, v1)
-        # neighbor[:,:,1] 对应边 (v1, v2)
-        # neighbor[:,:,2] 对应边 (v2, v0)
-        # 必须确保这里的对应关系与你构建 neighbor_indices 时一致！
-
-        v0 = tri_vertices[:, :, 0, :]
-        v1 = tri_vertices[:, :, 1, :]
-        v2 = tri_vertices[:, :, 2, :]
-
-        # 计算三条边的中点
-        mid_0 = (v0 + v1) / 2.0
-        mid_1 = (v1 + v2) / 2.0
-        mid_2 = (v2 + v0) / 2.0
-
-        # [B, N, 3, 3] (3个中点的坐标)
-        mid_points = torch.stack([mid_0, mid_1, mid_2], dim=2)
-
-        # 3. 计算深度差异 (Discontinuity)
-        # 当前平面在 3 个中点的深度: d = -n*x
-        # planes.unsqueeze(2): [B, N, 1, 4]
-        # n: [B, N, 1, 3]
-        curr_n = planes.unsqueeze(2)[..., :3]
-        # 计算出来的 d_val 应该等于 plane 的 d 参数，但这里我们用 n*x 计算“几何深度”
-        # 实际上直接比较 Plane Equation 的残差更直接： n*x + d = 0
-
-        # 更好的方法：
-        # 如果点 x 在平面 A 上，则 n_A * x + d_A = 0
-        # 连续性意味着：点 x (平面A的边缘) 也应该在平面 B 上，即 n_B * x + d_B ≈ 0
-
-        # 我们用 Neighbor 的平面方程去测 Current 的边中点
-        # 误差 = | n_neigh * mid_curr + d_neigh |
-        # 如果连续，Current 的边中点也应该满足 Neighbor 的平面方程
-
-        n_neigh = neighbor_planes[..., :3]  # [B, N, 3, 3]
-        d_neigh = neighbor_planes[..., 3:]  # [B, N, 3, 1]
-
-        # 计算点积: (n_x * x + n_y * y + n_z * z)
-        # mid_points: [B, N, 3, 3]
-        dot_val = torch.sum(n_neigh * mid_points, dim=-1, keepdim=True)  # [B, N, 3, 1]
-
-        # 代入平面方程: | n*x + d |
-        dist_error = torch.abs(dot_val + d_neigh)  # [B, N, 3, 1]
-
-        # 计算深度不连续性 error: [B, N, 3]
-
-        # 联动核心:
-        # 如果 EdgeProb=1 (边界), weight=0 -> 允许不连续
-        # 如果 EdgeProb=0 (平面), weight=1 -> 强制连续
-        continuity_weight = torch.exp(-edge_probs)
-
-        # Loss
-        loss = (dist_error * continuity_weight).mean()
-
-        # 还可以加一个正则项，防止 EdgeProb 全为 1 (模型为了降低 Loss 把所有地方都当成边界)
-        # 鼓励 Edge 稀疏 (L1 Regularization)
-        sparsity_loss = edge_probs.mean() * 0.1
-
-        return loss + sparsity_loss
 
 def _sanity_check_and_report(device, B, N_max, all_edges_indices, pred_alphas_flat, gt_tri_depths, target_score=None):
     # move small summary to cpu for printing (no heavy copy)
@@ -391,3 +312,6 @@ def _sanity_check_and_report(device, B, N_max, all_edges_indices, pred_alphas_fl
             raise ValueError("target_score 包含 NaN/Inf")
         if ts.min() < -1e-6 or ts.max() > 1.0001:
             print("WARN: target_score 超出 [0,1] 范围:", float(ts.min()), float(ts.max()))
+
+
+

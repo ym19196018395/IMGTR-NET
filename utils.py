@@ -1047,6 +1047,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
                 }
     """
+
     # 结果容器
     batch_num_tri = []
     centers_list = []

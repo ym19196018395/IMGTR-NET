@@ -1,8 +1,8 @@
 import argparse
 import os
 
-from models.PlanePatchMatch import *
 from models.sum_loss import *
+from models.PlanePatchMatch import *
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import torch
@@ -162,7 +162,7 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (5 * args.summary_freq) == 0
+            do_summary_image = global_step % (20 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             loss, scalar_outputs, image_outputs = train_sample(sample, do_summary_image=do_summary_image)
             loss_depth = scalar_outputs['loss_depth']
@@ -187,31 +187,31 @@ def train():
                 'optimizer': optimizer.state_dict()},
                 "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
 
-        avg_test_scalars = DictAverageMeter()
-        for batch_idx, sample in enumerate(TestImgLoader):
-            start_time = time.time()
-            global_step = len(TrainImgLoader) * epoch_idx + batch_idx
-            do_summary = global_step % args.summary_freq == 0
-            # do_summary_test = global_step % (10*args.summary_freq) == 0
-            do_summary_image = global_step % (50 * args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image)
-            loss_depth = scalar_outputs['loss_depth']
-            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
-            if do_summary:
-                save_scalars(logger, 'test', scalar_outputs, global_step)
-            if do_summary_image:
-                save_images(logger, 'test', image_outputs, global_step)
-            avg_test_scalars.update(scalar_outputs)
-            del scalar_outputs, image_outputs
-            print(
-                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
-                    epoch_idx, args.epochs, batch_idx,
-                    len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
-                    time.time() - start_time))
-
-        save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
-        print("avg_test_scalars:", avg_test_scalars.mean())
-        print("当前时间（time模块）：", time.ctime())
+        # avg_test_scalars = DictAverageMeter()
+        # for batch_idx, sample in enumerate(TestImgLoader):
+        #     start_time = time.time()
+        #     global_step = len(TrainImgLoader) * epoch_idx + batch_idx
+        #     do_summary = global_step % args.summary_freq == 0
+        #     # do_summary_test = global_step % (10*args.summary_freq) == 0
+        #     do_summary_image = global_step % (50 * args.summary_freq) == 0
+        #     loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image)
+        #     loss_depth = scalar_outputs['loss_depth']
+        #     loss_alpha_sup=scalar_outputs['loss_alpha_sup']
+        #     if do_summary:
+        #         save_scalars(logger, 'test', scalar_outputs, global_step)
+        #     if do_summary_image:
+        #         save_images(logger, 'test', image_outputs, global_step)
+        #     avg_test_scalars.update(scalar_outputs)
+        #     del scalar_outputs, image_outputs
+        #     print(
+        #         'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
+        #             epoch_idx, args.epochs, batch_idx,
+        #             len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
+        #             time.time() - start_time))
+        #
+        # save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
+        # print("avg_test_scalars:", avg_test_scalars.mean())
+        # print("当前时间（time模块）：", time.ctime())
         gc.collect()
 
 

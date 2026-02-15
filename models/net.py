@@ -206,8 +206,6 @@ class PatchmatchNet(nn.Module):
         depth_patchmatch = {}
         refined_depth = {}
 
-
-
         edge_alphas,edge_mats=[],[]
         output_plane={
            'depth_pred':[],# 平面预测深度图
@@ -246,6 +244,7 @@ class PatchmatchNet(nn.Module):
                 # 获得stage1的长和宽
                 _, _, height, width = depth.size()
                 device = depth.get_device()
+
                 # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
                 # 传入原分辨率的图片，里面会进行一个归一化操作 传入的是原分辨率的
                 # todo: 会产生0像素的三角形，这个地方以后可能更改一下逻辑
@@ -280,7 +279,6 @@ class PatchmatchNet(nn.Module):
 
                 output_plane['tri_id_map'] = tri_id_map_tensor
 
-
                 # 刚拟合平面的初始状态，没进行传播
                 before_guess_planes = normal_samples[0]  # [B, N_tri, 4]
 
@@ -303,6 +301,7 @@ class PatchmatchNet(nn.Module):
                 # 进行planePatchMatch
 
                 visualizer = PlaneVisualizer(height, width, device)
+                # 没有进行传播得到的平面，刚拟合完的初始平面
                 output_plane['depth_gt'], output_plane['normal_gt'] = visualizer.render_from_planes(
                     before_guess_planes.detach(),
                     tri_id_map_tensor,
@@ -356,7 +355,6 @@ class PatchmatchNet(nn.Module):
                         "edge_alphas": edge_alphas,
                         "output_plane":output_plane
                     }
-            
         else:
             num_depth = self.patchmatch_num_sample[0]
             score_sum4 = 4 * F.avg_pool3d(F.pad(score.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
@@ -388,6 +386,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
         depth_gt_l = depth_gt[f'stage_{l}']
         # 代表这个地方深度是有效的
         mask_l = mask[f'stage_{l}'] > 0.5
+
         depth2 = depth_gt_l[mask_l]
 
         depth_patchmatch_l = depth_patchmatch[f'stage_{l}']
