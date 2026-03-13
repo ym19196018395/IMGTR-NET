@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mpmath import eye
 
+from models.edge_head import EdgeHead
+from utils import convert_edge_features_to_tri_format
+
 
 class PlaneHypothesisGenerator(nn.Module):
     def __init__(self, num_hypotheses=5, perturbation_range=0.05):
@@ -192,7 +195,12 @@ class LearnedTrianglePropagator(nn.Module):
         # 3. 平面修正网络 (Refinement MLP) - 这是增加"深度学习含量"的关键
         # 类似于 RAFT 的 Update Block
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)  # 可选，增加时序记忆
+
         self.plane_head = nn.Linear(hidden_dim, 4)  # 输出平面残差 delta_plane
+
+        # 残差网络初始化，防止残差网络一开始的随机值过大，导致整个深度图和法向量全部往一个地方偏
+        nn.init.constant_(self.plane_head.bias, 0.0)
+        nn.init.normal_(self.plane_head.weight, mean=0.0, std=0.001)
 
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs,ref_feature=None):
@@ -202,6 +210,8 @@ class LearnedTrianglePropagator(nn.Module):
             current_costs: [B, N, 1] (注意维度)
             neighbor_indices: [B, N, 3]
             edge_probs: [B, N, 3] (来自 EdgeHead, 0~1, 越大表示越阻断)
+        return:
+            final_planes:最终得到的传播平面 [B, N, 4]
         """
 
         B, N, _ = current_planes.shape
@@ -307,7 +317,7 @@ class LearnedTrianglePropagator(nn.Module):
 
         return final_planes
 
-    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs, tri_vertices_uv, intrinsics):
+    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs,aligned_midpoints_norm, intrinsics,H, W):
         """
         纯粹的连续性损失 (C0 Continuity Loss) - 包含坐标反投影
 
@@ -315,12 +325,18 @@ class LearnedTrianglePropagator(nn.Module):
             planes: [B, N, 4] (n, d) 当前平面参数 (Camera Space)
             neighbor_indices: [B, N, 3] 邻居索引
             edge_probs: [B, N, 3] 边缘概率
-            tri_vertices_uv: [B, N, 3, 2] 三角形顶点的像素坐标 (u, v)
-                             注意：顺序 v0, v1, v2 需对应邻居 0, 1, 2 的边
+            aligned_midpoints_norm: [B, N, 3, 2] 完美对齐的边中点坐标，值域 [-1, 1]
             intrinsics: [B, 3, 3] 相机内参矩阵
         """
-        B, N, _, _ = tri_vertices_uv.shape
+        B, N, _, _ = aligned_midpoints_norm.shape
         device = planes.device
+
+        # ==========================================
+        # 0. 解除归一化: [-1, 1] -> 像素坐标 [0, W-1] / [0, H-1]
+        # ==========================================
+        midpoints_uv = torch.zeros_like(aligned_midpoints_norm)
+        midpoints_uv[..., 0] = (aligned_midpoints_norm[..., 0] + 1.0) / 2.0 * (W - 1)
+        midpoints_uv[..., 1] = (aligned_midpoints_norm[..., 1] + 1.0) / 2.0 * (H - 1)
 
         # ==========================================
         # 1. 将像素坐标 (UV) 反投影回相机坐标 (XYZ)
@@ -328,7 +344,7 @@ class LearnedTrianglePropagator(nn.Module):
 
         # 1.1 构造齐次像素坐标 [B, N, 3, 3] -> (u, v, 1)
         ones = torch.ones(B, N, 3, 1, device=device)
-        uv_homo = torch.cat([tri_vertices_uv, ones], dim=-1)
+        uv_homo = torch.cat([midpoints_uv, ones], dim=-1)
 
         # 1.2 计算归一化射线方向 (Ray Direction)
         # K_inv * uv
@@ -361,27 +377,10 @@ class LearnedTrianglePropagator(nn.Module):
 
         # 1.4 恢复相机坐标 XYZ
         # XYZ = depth * ray
-        tri_vertices_cam = rays * depth  # [B, N, 3, 3] (Camera Space XYZ)
+        mid_points = rays * depth  # [B, N, 3, 3] (Camera Space XYZ)
 
         # ==========================================
-        # 2. 计算公共边中点 (Edge Midpoints)
-        # ==========================================
-
-        # 获取三个顶点
-        v0 = tri_vertices_cam[:, :, 0, :]
-        v1 = tri_vertices_cam[:, :, 1, :]
-        v2 = tri_vertices_cam[:, :, 2, :]
-
-        # 计算三条边的中点 (Camera Space)
-        mid_0 = (v0 + v1) / 2.0
-        mid_1 = (v1 + v2) / 2.0
-        mid_2 = (v2 + v0) / 2.0
-
-        # [B, N, 3, 3] -> 对应 neighbor 0, 1, 2
-        mid_points = torch.stack([mid_0, mid_1, mid_2], dim=2)
-
-        # ==========================================
-        # 3. 计算连续性损失 (Discontinuity Loss)
+        # 2. 计算连续性损失 (Discontinuity Loss)
         # ==========================================
 
         # 获取邻居平面
@@ -404,19 +403,19 @@ class LearnedTrianglePropagator(nn.Module):
         dist_error = dist_error.squeeze(-1)  # [B, N, 3]
 
         # ==========================================
-        # 4. Edge 门控与 Loss 聚合
+        # 3. Edge 门控与 Loss 聚合
         # ==========================================
 
         # 权重: EdgeProb越大(边界)，权重越小
         continuity_weight = torch.exp(-edge_probs)  # [B, N, 3]
 
-        # 主 Loss
+        # 主 Loss，连续性损失 (受 EdgeProb 控制)
         loss = (dist_error * continuity_weight).mean()
 
         # 正则项: 防止 EdgeProb 偷懒全输出 1
-        sparsity_loss = edge_probs.mean() * 0.1
+        sparsity_loss = edge_probs.mean()
 
-        return loss + sparsity_loss
+        return loss,sparsity_loss
 
 class SimilarityNet(nn.Module):
     def __init__(self, G):
@@ -489,11 +488,12 @@ class SimilarityNet(nn.Module):
         return score
 
 class PlanePatchMatchModule(nn.Module):
-    def __init__(self,  num_hypotheses=3, G=8):
+    def __init__(self, num_hypotheses=3, G=8, feat_channels=16,propagator_iter=2):
         """
         Args:
             num_hypotheses: K (假设数量)
             G: Group Correlation 的组数 (默认8)
+            feat_channels: 传入EdgeHead的通道数
         """
         super().__init__()
 
@@ -511,8 +511,18 @@ class PlanePatchMatchModule(nn.Module):
         # 这是一个简单的 1x1 Conv，把 G 组相关性映射为 1 个 Cost
         self.similarity_net = SimilarityNet(G=G)
 
+        # 传播模块
+        self.propagator=LearnedTrianglePropagator()
+
+        # === 🔥 新增：EdgeHead作为内部模块 ===
+        self.edge_head = EdgeHead(feat_channels)
+
+        self.propagator_iter = propagator_iter
+
+
     def forward(self,fitter_module, depth_stage2, tri_infos, ref_feature, src_features,
-                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights=None):
+                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights=None,
+                neighbor_indices_batched=None):
         """
         Args:
             fitter_module: 实例化好的 DensePlaneFitter 对象
@@ -525,6 +535,7 @@ class PlanePatchMatchModule(nn.Module):
             src_projs: List[[B, 4, 4]] (源视图投影矩阵, 用于计算相对位姿)
             depth_min, depth_max: 深度范围
             view_weights: [B, N_view] (可选，视图权重)
+            neighbor_indices_batched: 每个面的邻居索引 [B, N_tri, 3]
 
         Returns:
             depth_samples: List[[B, 1, H, W]] (这里只返回一项)
@@ -534,6 +545,8 @@ class PlanePatchMatchModule(nn.Module):
         B, C, H, W = ref_feature.shape
         device = ref_feature.device
         self.fitter = fitter_module
+        # 动态实例化 Visualizer 以适应当前 H, W
+        visualizer = PlaneVisualizer(H, W, device)
         # ==========================================
         # 1. 数据准备 (Data Preparation)
         # ==========================================
@@ -551,10 +564,11 @@ class PlanePatchMatchModule(nn.Module):
         ref_intrinsics = intrinsics_s1[0]
 
         # ==========================================
-        # 2. 拟合与生成 (Fitting & Generation)
+        # 2. 拟合与生成 (Fitting & Generation)，根据stage2预测深度来拟合生成假设平面
         # ==========================================
         # 使用优化后的 get_plane_hypotheses 直接得到 [B, N, K, 4]
         # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
+        # todo:在这里目前不用前向平行平面，因为我感觉有点破坏整个平面的光滑性
         hypotheses = self.fitter.get_plane_hypotheses(
             depth_stage2=depth_stage2,
             tri_id_map=tri_id_map,
@@ -570,33 +584,26 @@ class PlanePatchMatchModule(nn.Module):
         # 3. 广播 (Broadcasting: Triangle -> Pixel)
         # ==========================================
 
-        # 将三角形级的假设映射到像素级
-        # pixel_hypotheses: [B, H, W, K, 4]
+        # 将三角形级的假设映射到像素级 pixel_hypotheses: [B, H, W, K, 4]
         pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map, H, W)
 
         current_hypotheses = pixel_hypotheses
 
         # ==========================================
-        # 4. 传播 (Propagation) - 暂时跳过
+        # 4. 代价计算 (Cost Computation)
         # ==========================================
-        # pass
-
-        # ==========================================
-        # 5. 代价计算 (Cost Computation)
-        # ==========================================
-        # 计算所有假设的代价
+        # 计算所有假设的代价,计算了每个像素点的代价，但是后面会转化成一个个三角形所以不影响
         # costs: [B, H, W, K]
         pixel_costs = self.compute_costs(
             ref_feature, src_features,
             ref_proj, src_projs,
             current_hypotheses,
-            view_weights,
+            None,
             ref_intrinsic=ref_intrinsics
         )
 
-        # ==========================================
         # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
-        # ==========================================
+        # 不在基于单个像素了，保证一个整体的出现
 
         # 1. 聚合 Cost: [B, H, W, K] -> [B, N_tri, K]
         tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
@@ -618,10 +625,89 @@ class PlanePatchMatchModule(nn.Module):
         # best_planes = before_best_guess_planes
 
         # ==========================================
-        # 7. 渲染与输出 (Rendering)
+        # 5. 通过边预测头得到边的断裂概率
         # ==========================================
-        # 动态实例化 Visualizer 以适应当前 H, W
-        visualizer = PlaneVisualizer(H, W, device)
+
+        # 渲染当前分辨率的第一次最佳深度图供 EdgeHead 使用
+        current_coarse_depth, _ = visualizer.render_from_planes(
+            best_planes.detach(),  # 注意 detach，不传导梯度
+            tri_id_map,
+            ref_intrinsics,
+            depth_range=(depth_min, depth_max)
+        )
+
+        # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
+        edge_alphas = self.edge_head(
+            feat=ref_feature.detach(),  # [B, C, H, W]
+            tri_infos=tri_infos,
+            tri_planes=best_planes.detach(),  # [B, N_max, 4] 包含法向和距离
+            intrinsics=ref_intrinsics  # [B, 3, 3] 相机内参
+        )
+
+        # C. 转换为三角形级别格式 [B, N_max, 3]
+        edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
+            edge_alphas, tri_infos, max_tri_num, device
+        )
+
+        # ==========================================
+        # 6. 传播 (Propagation)
+        # ==========================================
+        current_planes = best_planes
+        # torch.min(dim=2) 会同时返回最小值(values)和对应索引(indices)
+        current_costs = tri_costs.min(dim=2)[0].unsqueeze(-1) # [B, N, 1]
+
+        for iter_idx in range(self.propagator_iter):
+            # 6.1 传播 得到
+            new_planes = self.propagator(
+                current_planes=current_planes,
+                current_costs=current_costs,
+                neighbor_indices=neighbor_indices_batched,
+                edge_probs=edge_probs_tensor # 暂时不让边预测头互相影响，后续肯定会要做到互相影响
+            )
+
+            # 6.2 重新评估新平面的代价 (极其重要！)
+            # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
+            new_planes_k1 = new_planes.unsqueeze(2)
+
+            # 将三角形平面广播到像素级
+            pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
+
+            # 计算像素代价
+            pixel_costs_new = self.compute_costs(
+                ref_feature, src_features, ref_proj, src_projs,
+                pixel_hypo, None, ref_intrinsics,is_debug=False
+            )
+
+            # 重新聚合成三角形级代价 -> [B, N, 1]
+            tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
+            # todo：看看之后是否做一个判断，loss比之前高就不替换，不然则替换. 并且断裂概率是不是要做一个更新
+            # 🔥 极度关键：防止 NaN 和异常大值
+            if torch.isnan(tri_costs_new).any() or torch.isinf(tri_costs_new).any():
+                print(
+                    f"🚨🚨 [WARNING] NaN detected in propagated costs at iter {iter_idx}! Falling back to previous costs.")
+                tri_costs_new = current_costs  # 回滚，自保
+            else:
+                tri_costs_new = torch.clamp(tri_costs_new, -100.0, 100.0)  # 防止数值爆炸
+
+            # 6.3 状态更新，进入下一次迭代
+            # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
+            current_planes = new_planes
+            current_costs = tri_costs_new
+
+        final_planes = current_planes
+
+        # ==========================================
+        # 7. 渲染与输出和计算损失
+        # ==========================================
+
+        continuity_loss, continuity_s_loss = 0,0
+        # continuity_loss,continuity_s_loss = self.propagator.compute_continuity_loss(
+        #     planes=final_planes,
+        #     neighbor_indices=neighbor_indices_batched,
+        #     edge_probs=edge_probs_tensor.detach(),  # 不让其受影响
+        #     aligned_midpoints_norm=aligned_midpoints_norm,
+        #     intrinsics=ref_intrinsics,
+        #     H=H,W=W)
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)
         invalid_mask = (tri_id_map < 0)
@@ -635,21 +721,23 @@ class PlanePatchMatchModule(nn.Module):
         # )
 
         # ym-modify 目前的逻辑是假设一个三角的像素处于同一个平面
-        depth_sample, normal_vis = visualizer.render_from_planes(
-            best_planes,
+        final_depth, final_normal = visualizer.render_from_planes(
+            final_planes,
             tri_id_map,
             ref_intrinsics,
             depth_range=(depth_min, depth_max))
 
         # 组装输出 (PatchMatchNet 通常需要 List 格式)
-        depth_samples = [depth_sample,depth_sample]  # List[[B, 2, H, W]]
+        # todo:一个是刚拟合完毕的，另外一个是经过传播处理的
+        depth_samples = [current_coarse_depth,final_depth]  # List[[B, 2, H, W]]
         # 拟合的初始平面
-        normal_samples= [before_best_guess_planes,normal_vis]
+        normal_samples= [before_best_guess_planes,final_normal]
 
         # Score (Confidence) = -min_cost
         score = -torch.min(pixel_costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
 
-        return depth_samples, score, view_weights,normal_samples
+        return (depth_samples, score, view_weights,normal_samples,edge_alphas,
+                continuity_loss,continuity_s_loss)
 
     # ==========================================
     # 辅助函数 (Placeholders)
@@ -709,7 +797,7 @@ class PlanePatchMatchModule(nn.Module):
         return pixel_hypotheses
 
     def compute_costs(self, ref_feature, src_features, ref_proj, src_projs, current_hypotheses, view_weights,
-                      ref_intrinsic):
+                      ref_intrinsic,is_debug=True):
         """
         计算代价体积 (Cost Volume)
         Args:
@@ -815,7 +903,7 @@ class PlanePatchMatchModule(nn.Module):
             cost_i = -score_i  # [B*K, 1, H, W]
 
             # ============debug专用========================
-            if i == 0:  # 只看第一个源视图
+            if i == 0 and is_debug:  # 只看第一个源视图
                 # Reshape 回 [B, K, 1, H, W]
                 temp_score = score_i.view(B, K, 1, H, W)
                 score_0 = temp_score[:, 0, ...].mean().item()
@@ -1623,7 +1711,6 @@ class DensePlaneFitter(nn.Module)   :
 
         # ==========[Hypothesis 1] 前向平行 (Fronto-Parallel)=====
         # 利用现成的 centroids[:, 2] (平均深度)
-        # n=[0,0,-1], d = mean_depth
 
         mean_depth = centroids[:, 2].view(B, max_num_triangles, 1, 1)
 
@@ -1633,7 +1720,7 @@ class DensePlaneFitter(nn.Module)   :
 
         hypo_fp = torch.cat([normal_fp, d_fp], dim=-1)  # [B, N, 1, 4]
 
-        # todo:这里暂时不用前向平行平面，还是用随机扰动，所以导致self.K - 2 变为 self.K - 1
+        # todo:用了前向平行平面，如果不用需要将这里注释，并且self.K - 2 变为 self.K - 1
         hypo_list.append(hypo_fp)
 
         # ==========[Hypothesis 2+] 随机扰动 (Vectorized Jitter)======

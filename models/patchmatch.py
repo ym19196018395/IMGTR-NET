@@ -181,7 +181,6 @@ class Evaluation(nn.Module):
             view_weights = []
             # 对于每一个源图进行一个可微分投影计算代价
             for src_feature, src_proj in zip(src_features, src_projs):
-                # todo:改天有时间将代价体和视图权重图以及扭曲特征输出出来
                 # 1.可微投影，然后进行一个特征分组
                 warped_feature = differentiable_warping(src_feature, src_proj, ref_proj, depth_sample)
                 warped_feature = warped_feature.view(batch, self.G, feature_channel//self.G, num_depth, height, width)
@@ -319,7 +318,6 @@ class PatchMatch(nn.Module):
         if self.propagate_neighbors > 0:
             # last iteration on stage 1 does not have propagation (photometric consistency filtering)
             if not (self.stage == 1 and self.patchmatch_iteration == 1):
-                # todo：定义了两个卷积网络用来得到自适应传播和聚合的网格grid ym-issue 为啥需要设置dilation呢
                 self.propa_conv = nn.Conv2d(
                                 self.propa_num_feature,
                                 2 * self.propagate_neighbors,
@@ -494,7 +492,7 @@ class PatchMatch(nn.Module):
 
         device = ref_feature.get_device()
         batch, _, height, width = ref_feature.size()
-        # todo：grid 如何学习而来，并且深度和特征权重如何得来，有空细看一遍
+
         # the learned additional 2D offsets for adaptive propagation
         if self.propagate_neighbors > 0:
             # last iteration on stage 1 does not have propagation (photometric consistency filtering)
@@ -615,7 +613,7 @@ class SimilarityNet(nn.Module):
         Returns:
             final cost: in the shape of [B,Ndepth,H,W]
         """
-        # todo: 聚合的领域网格和权重如何学习过来的
+
         batch,G,num_depth,height,width = x1.size()
 
         # 将多通道G压缩为1通道，并移出G维度
@@ -665,7 +663,6 @@ class FeatureWeightNet(nn.Module):
         del ref_feature
         # [B,Neighbor,H,W]
         x = self.similarity(self.conv1(self.conv0(x))).squeeze(1)
-
 
         return self.output(x)
 

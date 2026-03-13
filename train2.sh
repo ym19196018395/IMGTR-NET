@@ -39,7 +39,7 @@ python train_whu.py --dataset dtu_whu --batch_size 5 --epochs 4 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/train.txt --vallist lists/whu/test.txt \
---logdir ./checkpoints/tensorboard_train1 \
-2>&1 | tee txt_logs/1_修改边预测头,没有约束,没前向平面${timestamp}.log \
+--logdir ./checkpoints/tensorboard_train2 \
+2>&1 | tee txt_logs/2_修改边预测头,没有约束,有前向平面${timestamp}.log \
  "$@"
 

@@ -155,6 +155,8 @@ class EdgeConsistencyLoss(nn.Module):
                     'edges_list' :每个边的邻接面，
                     'edges_pixels': 每个边的像素（归一化）集合，后续需要引入作为一个特征传入mlp中
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                    'tri_edge_ids_list':每个三角形的边ID列表
+                    'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
                 }
             - tri_id_map: [B, H, W] (Dense ID Map)
         Returns:
@@ -187,12 +189,12 @@ class EdgeConsistencyLoss(nn.Module):
             curr_id_map = tri_id_map[b].unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
 
             # --- Step A: 复用定位逻辑 (计算中点) ---
-            idx1 = current_edges[:, 0]
-            idx2 = current_edges[:, 1]
-            v1 = current_vertices[idx1]
-            v2 = current_vertices[idx2]
+            # 获取边两侧三角形的索引
+            idx1 = current_edges[:, 0].long()
+            idx2 = current_edges[:, 1].long()
 
-            midpoints = self._compute_edge_midpoints(v1, v2)  # [E, 1, 2]
+            # 获取归一化中点
+            midpoints = tri_infos[0]['edges_midpoints'][b].unsqueeze(1)  # [E_b, 1, 2]
 
             # --- Step B & C: 基于 GT 生成真值标签 ---
             # 传入 idx1, idx2 作为 t1_ids, t2_ids

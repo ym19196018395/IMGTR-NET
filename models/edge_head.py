@@ -8,11 +8,11 @@ from utils import _sample_map, check_tensor
 
 class EdgeHead(nn.Module):
     """
-    EdgeHead —— 升级版边级断裂预测器
+    EdgeHead —— 终极版边级断裂预测器 (Analytical Plane-based)
     升级特性：
-      - 基于几何边中点 (Edge Midpoint) 采样
-      - 局部 3x3 窗口深度差分 (Patch-based Depth Diff)
-      - 引入法向量特征 (Normal Features)
+      - 彻底抛弃 3x3 离散像素采样，免疫狭长三角形的特征崩溃
+      - 基于平面方程 (n, d) 直接求解边中点的解析深度差，无限分辨率
+      - 单点采样 Backbone 图像特征，保留 CNN 原生感受野
     输入:
       - feat: [B, C, Hf, Wf]  （backbone / FPN 特征）
       - img: [B, C_img, H, W] （原图，可为 None）
@@ -23,7 +23,9 @@ class EdgeHead(nn.Module):
                     'centroids': [B,n_tri,2] 每个三角形的质点，已经归一化处理
                     'vertices': [B,n_tri,3,2] 每个三角形的顶点，已进行归一化处理
                     'edges_list' :每个边的邻接面，
-                    boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                    'tri_edge_ids_list':每个三角形的边ID列表
+                    'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
                 }
     输出:
       - per_image_edges_alpha: list len=B，每个 tensor [E]，E = edges 数（按 edges 列表顺序）
@@ -61,113 +63,59 @@ class EdgeHead(nn.Module):
         # 可学习缩放，用来调节 sigmoid 输入尺度（训练稳定）
         self.register_parameter("edge_scale", nn.Parameter(torch.tensor(10.0)))
 
-    def _compute_edge_midpoints(self, v1, v2):
+
+    def _compute_analytical_depth_diff(self, midpoints_norm, planes_t1, planes_t2, intrinsics, H, W):
         """
-        计算两个三角形公共边的中点 (向量化实现)
+        使用平面方程精确计算边中点两侧的深度差 (无限分辨率，无视三角形大小)
         Args:
-            v1: [E, 3, 2] 三角形1的三个顶点坐标 (归一化 [-1, 1])
-            v2: [E, 3, 2] 三角形2的三个顶点坐标
-        Returns:
-            midpoints: [E, 1, 2] 边的中点坐标
-        """
-        # 寻找公共点：计算 v1 和 v2 顶点之间的两两距离
-        # v1: [E, 3, 1, 2], v2: [E, 1, 3, 2]
-        dist = torch.norm(v1.unsqueeze(2) - v2.unsqueeze(1), p=2, dim=-1)  # [E, 3, 3]
-
-        # 判定重合点：距离小于极小值 (考虑浮点误差)
-        mask = dist < 1e-4  # [E, 3, 3] bool
-
-        # 对于标准的三角网格，两个邻接三角形应该恰好有2个公共顶点
-        # 我们需要找到这2个顶点并求平均
-
-        # 方法：利用 mask 提取 v1 中属于公共边的顶点
-        # mask.any(dim=2) -> [E, 3]，表示 v1 的第 i 个点是否在 v2 中出现过
-        is_shared_v1 = mask.any(dim=2).float().unsqueeze(-1)  # [E, 3, 1]
-
-        # 计算中点：Sum(v1 * is_shared) / Sum(is_shared)
-        # 正常情况下 sum(is_shared) 应该是 2
-        denom = is_shared_v1.sum(dim=1).clamp(min=1.0)  # [E, 1]
-        midpoints = (v1 * is_shared_v1).sum(dim=1) / denom  # [E, 2]
-
-        return midpoints.unsqueeze(1)  # [E, 1, 2] 适配 grid_sample
-
-    def _sample_local_patch(self, midpoints, depth_map, tri_id_map, t1_ids, t2_ids):
-        """
-        在边中点周围采样 3x3 Patch，并计算 T1 和 T2 区域的平均深度
-        Args:
-            midpoints: [E, 1, 2] 归一化坐标
-            depth_map: [1, 1, H, W] 当前图的深度
-            tri_id_map: [1, 1, H, W] 当前图的三角形索引 (float)
-            t1_ids: [E] 三角形1的ID
-            t2_ids: [E] 三角形2的ID
+            midpoints_norm: [E, 2] 归一化坐标 [-1, 1]
+            planes_t1: [E, 4] T1 的平面参数 (n, d)
+            planes_t2: [E, 4] T2 的平面参数 (n, d)
+            intrinsics: [3, 3] 当前视角的相机内参
+            H, W: 图像高宽
         Returns:
             depth_diff: [E, 1]
         """
-        E = midpoints.shape[0]
-        H, W = depth_map.shape[-2:]
-        device = midpoints.device
+        E = midpoints_norm.shape[0]
+        device = midpoints_norm.device
 
-        # 1. 生成 3x3 偏移网格 (Kernel)
-        # 偏移量需要转为归一化坐标尺度: 2/W, 2/H
-        dx = torch.linspace(-1, 1, 3, device=device) * (2.0 / W)
-        dy = torch.linspace(-1, 1, 3, device=device) * (2.0 / H)
-        grid_y, grid_x = torch.meshgrid(dy, dx, indexing='ij')
-        offsets = torch.stack((grid_x, grid_y), dim=-1).view(1, 9, 2)  # [1, 9, 2]
+        # 1. 解除归一化: [-1, 1] -> 像素坐标 [0, W-1], [0, H-1]
+        midpoints_uv = torch.zeros_like(midpoints_norm)
+        midpoints_uv[:, 0] = (midpoints_norm[:, 0] + 1.0) / 2.0 * (W - 1)
+        midpoints_uv[:, 1] = (midpoints_norm[:, 1] + 1.0) / 2.0 * (H - 1)
 
-        # 2. 生成采样坐标: Midpoint + Offsets
-        # midpoints: [E, 1, 2] -> [E, 9, 2]
-        sample_grid = midpoints + offsets
-        sample_grid = sample_grid.unsqueeze(1)  # [E, 1, 9, 2] for grid_sample
+        # 2. 构造齐次坐标并反投影为射线方向 (Ray)
+        ones = torch.ones(E, 1, device=device)
+        uv_homo = torch.cat([midpoints_uv, ones], dim=-1)  # [E, 3]
 
-        # 3. 采样深度和 ID
-        # 深度用 bilinear 插值
-        # tri_id_map 必须用 nearest 插值 !!
-        # 注意：grid_sample 输入需要 batch 维度，这里我们将 E 视为 batch 处理
-        # depth_map expand: [1, 1, H, W] -> [E, 1, H, W] (显存消耗大，不可取)
-        # 优化：不expand map，而是 reshape sample_grid
-        # 但 pytorch grid_sample 要求 grid 和 input batch 维度一致
-        # 技巧：我们将 sample_grid 压扁为 [1, E*9, 1, 2]，只对单张图采样，然后再 reshape 回来
+        K_inv = torch.inverse(intrinsics)  # [3, 3]
+        rays = torch.matmul(K_inv, uv_homo.unsqueeze(-1)).squeeze(-1)  # [E, 3]
 
-        flat_grid = sample_grid.view(1, E * 9, 1, 2)
+        # 3. 提取平面参数 n 和 d
+        n1, d1 = planes_t1[:, :3], planes_t1[:, 3:]
+        n2, d2 = planes_t2[:, :3], planes_t2[:, 3:]
 
-        sampled_depth = F.grid_sample(depth_map, flat_grid, mode='bilinear', align_corners=True, padding_mode='border')
-        sampled_id_map = F.grid_sample(tri_id_map, flat_grid, mode='nearest', align_corners=True, padding_mode='border')
+        # 4. 分别用 T1 和 T2 的平面方程计算该射线上的深度 Z
+        # Z = -d / (n * ray)
+        denom1 = torch.sum(n1 * rays, dim=-1, keepdim=True)
+        denom1 = torch.where(torch.abs(denom1) < 1e-6, torch.tensor(1e-6, device=device), denom1)
+        depth1 = -d1 / denom1  # [E, 1]
 
-        # Reshape 回 [E, 9]
-        patches_depth = sampled_depth.view(E, 9)
-        patches_id = sampled_id_map.view(E, 9)
+        denom2 = torch.sum(n2 * rays, dim=-1, keepdim=True)
+        denom2 = torch.where(torch.abs(denom2) < 1e-6, torch.tensor(1e-6, device=device), denom2)
+        depth2 = -d2 / denom2  # [E, 1]
 
-        # 4. 区分 T1 和 T2 区域
-        # t1_ids: [E] -> [E, 1]
-        mask_t1 = (torch.abs(patches_id - t1_ids.unsqueeze(1)) < 0.1).float()
-        mask_t2 = (torch.abs(patches_id - t2_ids.unsqueeze(1)) < 0.1).float()
-
-        # 5. 计算区域平均深度
-        # 防止除零 (有些patch可能只采到了T1或者只采到了T2)
-        sum_t1 = mask_t1.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        sum_t2 = mask_t2.sum(dim=1, keepdim=True).clamp(min=1e-6)
-
-        mean_d1 = (patches_depth * mask_t1).sum(dim=1, keepdim=True) / sum_t1
-        mean_d2 = (patches_depth * mask_t2).sum(dim=1, keepdim=True) / sum_t2
-
-        # 如果某个三角形在Patch里完全没出现(mask sum approx 0)，则深度差可能无效
-        # 这种情况下用中心点深度代替或者深度差置0
-        valid_edge = (mask_t1.sum(dim=1, keepdim=True) > 0.5) & (mask_t2.sum(dim=1, keepdim=True) > 0.5)
-
-        depth_diff = torch.abs(mean_d1 - mean_d2)
-        depth_diff = depth_diff * valid_edge.float()  # 无效边深度差设为0
+        # 5. 获得绝对精确的深度差
+        depth_diff = torch.abs(depth1 - depth2)  # [E, 1]
 
         return depth_diff
 
-
-    def forward(self, feat, pred_depth_map, tri_infos, tri_id_map, tri_normals):
+    def forward(self, feat, tri_infos, tri_planes, intrinsics):
         """
         EdgeHead.forward（兼容原始 tri_infos 格式）
 
         Args:
             - feat: [B, C, H, W]   (torch.Tensor)
-            - pred_depth_map: [B, 1, H, W] (torch.Tensor)
-            - 推荐传入 depth_map.detach() 如果不想让 edgehead 影响 depth predictor
             - tri_infos: list length B, 每项为 dict:
                 {
                     'batch_num_tri': int,三角形的数量
@@ -177,8 +125,8 @@ class EdgeHead(nn.Module):
                     'edges_pixels': 每个边的像素（归一化）集合，后续需要引入作为一个特征传入mlp中
                     'boundary_local_idxs_per_batch': 存储着断裂边，也就是只有一个面的边
                 }
-            - tri_id_map: [B, H, W] (dense index map)
-            - tri_normals: [B, N_max, 3] (每个三角形的法向量)
+            - tri_planes: [B, N_max, 4] (当前拟合出的平面参数, n 和 d)
+            - intrinsics: [B, 3, 3] (相机内参矩阵)
         Returns:
             output_alphas_list: list length B, 每项是 torch.Tensor shape [E_b]，类型 float，位于 feat.device 上
             tri_infos：已经处理完毕的数据
@@ -186,23 +134,14 @@ class EdgeHead(nn.Module):
         device = feat.device
         B, C, H, W = feat.shape
 
-        # 1. 特征投影
         feat_proj = self.proj(feat)  # [B, D, H, W]
-
-        # 2. 准备输出容器
         output_alphas_list = []
 
-        # 3. 逐个 Batch 处理 (因为 edges 数量不一致)
         for b in range(B):
-            # 获取当前样本数据
-            # tri_infos 里的 tensor 默认可能在 CPU，必须转到 GPU 才能和 feat/depth 计算
             current_edges = tri_infos[0]['edges_list'][b].to(device)  # [E, 2]
-            current_vertices = tri_infos[0]['vertices_list'][b].to(device)  # [N_tri, 3, 2]
-            current_normals = tri_normals[b].to(device)  # [N_max, 3]
+            current_planes = tri_planes[b].to(device)  # [N_max, 4]
+            curr_intrinsics = intrinsics[b].to(device) if intrinsics.dim() == 3 else intrinsics.to(device)
 
-            # tri_id_map 需要转为 [1, 1, H, W] float 格式供 grid_sample 使用
-            curr_id_map = tri_id_map[b].unsqueeze(0).unsqueeze(0).float().to(device)
-            curr_depth_map = pred_depth_map[b].unsqueeze(0).to(device)  # [1, 1, H, W]
             curr_feat_map = feat_proj[b].unsqueeze(0)  # [1, D, H, W]
 
             num_edges = current_edges.shape[0]
@@ -210,36 +149,28 @@ class EdgeHead(nn.Module):
                 output_alphas_list.append(torch.zeros(0, device=device))
                 continue
 
-            # --- Step A: 定位边中点 ---
-            # 获取边两侧三角形的索引
+            # --- Step A: 定位边中点和相关面 ---
             idx1 = current_edges[:, 0].long()
             idx2 = current_edges[:, 1].long()
+            midpoints_norm = tri_infos[0]['edges_midpoints'][b]  # [E_b, 2]
 
-            # 获取对应的顶点坐标
-            v1 = current_vertices[idx1]  # [E, 3, 2]
-            v2 = current_vertices[idx2]  # [E, 3, 2]
+            # --- Step B: 解析法计算深度差 (Analytical Depth Diff) ---
+            planes_t1 = current_planes[idx1]  # [E, 4]
+            planes_t2 = current_planes[idx2]  # [E, 4]
 
-            # 计算中点
-            midpoints = self._compute_edge_midpoints(v1, v2)  # [E, 1, 2]
-
-            # --- Step B: 局部深度采样 (Patch Sampling) ---
-            depth_diff = self._sample_local_patch(
-                midpoints, curr_depth_map, curr_id_map, idx1, idx2
-            )  # [E, 1]
-
-            # 深度差截断，防止异常值干扰
+            depth_diff = self._compute_analytical_depth_diff(
+                midpoints_norm, planes_t1, planes_t2, curr_intrinsics, H, W
+            )
             depth_diff = torch.clamp(depth_diff, max=500.0)
 
             # --- Step C: 整合法向量 ---
-            n1 = current_normals[idx1]  # [E, 3]
-            n2 = current_normals[idx2]  # [E, 3]
+            n1 = planes_t1[:, :3]
+            n2 = planes_t2[:, :3]
             normal_feat = torch.cat([n1, n2], dim=1)  # [E, 6]
 
-            # --- Step D: 采样边特征 ---
-            # 直接在中点处采样 Backbone 特征
-            # midpoints: [E, 1, 2] -> grid_sample -> [1, D, E, 1]
-            # 这里为了效率，同样利用 reshape 技巧
-            flat_midpoints = midpoints.unsqueeze(0)  # [1, E, 1, 2]
+            # --- Step D: 单点采样边特征 ---
+            # 直接提取中点这 1 个点的特征，利用 CNN 自带感受野，避免越界污染
+            flat_midpoints = midpoints_norm.unsqueeze(0).unsqueeze(2)  # [1, E, 1, 2]
             edge_feats = F.grid_sample(
                 curr_feat_map, flat_midpoints, align_corners=True
             ).view(feat_proj.shape[1], num_edges).permute(1, 0)  # [E, D]

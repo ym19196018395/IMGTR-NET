@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 import random
 
+from tensorboard.plugins.hparams.metadata import NULL_TENSOR
+
+
 # print arguments
 def print_args(args):
     print("################################  args  ################################")
@@ -336,14 +339,14 @@ def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, sca
     # -------------------------- 1. 获取原始顶点和质心 (不缩放) --------------------------
     # 预先将所有顶点转换为 float32 方便计算
     # vertexs 是 (Nv, 2)
-    # 不进行缩放
+    # 不进行缩放，因为后面统一归一化
     if(scale_ratio==1.0):
         for tri in triangles:
             # 1.1 获取三角形原始顶点
             vertex_ids = tri['vertex_ids']  # (3,)
             tri_vertices_original = vertexs[vertex_ids].astype(np.float32)  # (3, 2) 原始顶点坐标 (x, y)
 
-            # 1.2 计算原始质心
+            # 1.2 计算原始质心 todo：质心之后后续不需要了，需要改成边中点的区域
             centroid_original = np.mean(tri_vertices_original, axis=0)  # (2,)
 
             # 1.3 直接存入，不做 scale_ratio 处理
@@ -424,6 +427,7 @@ def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, sca
         tri_infos['edges'].append({
             'tri_ids': tri_ids,
             'edge_pixels': edge_pixels_scaled,
+            'endpoints': [p1, p2]  # 边的端点
         })
 
     return tri_infos
@@ -1027,7 +1031,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
 
     参数:
         vertexs_batch: list of tensor, 每个元素为单个样本的顶点（已to(device)，形状(Nv, 2)，(x, y)）
-        lines_batch: list of tensor, 每个元素为单个样本的边（已to(device)，形状(Ne, 2)，(v1_id, v2_id)）
+        lines_batch: list of tensor, 每个元素为单个样本的边（已to(device)，形状(Ne, 2)，(v1_id, v2_id)）[Line(p1, p2, face1, face2)]
         triangles_batch: list of list of tuple, 每个元素为单个样本的三角形数据:
                         每个三角形是 (v_ids, l_ids, pts)，其中：
                         - v_ids: tensor (3,) 顶点ID
@@ -1042,9 +1046,12 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                     'batch_num_tri': int,三角形的数量
                     'centroids': [B,n_tri,2] 每个三角形的质点
                     'vertices': [B,n_tri,3,2] 每个三角形的顶点
-                    'edges_list' :进行了一个归一化处理边像素点集合,以及其邻接面
+                    'edges_list' :边两个邻接面，如果只有一个面，则是两个相等的面id
+                    ‘edges_pixels’:进行了一个归一化处理边像素点集合
                     'tri_id_map': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效) <--- 新增
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
+                    'tri_edge_ids_list':每个三角形的边ID列表
+                    'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
                 }
     """
 
@@ -1055,9 +1062,12 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
     edges_list = []
     edges_pixels = []
     boundary_local_idxs_per_batch = []
+    edges_midpoints_list=[] #边中点
 
     # 新增：存储每个样本的 tri_id_map
     tri_id_maps_list = []
+    # ym-add-26.3.7 每个三角形的边ID列表
+    tri_edge_ids_list = []
 
     # 合并后的单次遍历
     for b in range(len(vertexs_batch)):
@@ -1070,7 +1080,8 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
 
         # 2. 转换 triangles 格式 并 填充 Map
         current_triangles_data = []
-
+        # 收集每个三角形的边ID
+        current_tri_edge_ids = []
 
         # 遍历当前样本的所有三角形
         for tri_idx, tri in enumerate(triangles_batch[b]):
@@ -1078,7 +1089,6 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
             v_ids = tri[0].cpu().numpy()
             l_ids = tri[1].cpu().numpy()
             pts = tri[2]  # tensor (M, 2) (x, y) on device
-
 
             # === 🔥 核心新增逻辑：生成 tri_id_map ===
             if pts.shape[0] > 0:
@@ -1092,6 +1102,9 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                 # 注意：PyTorch 的索引顺序是 [H, W] 即 [y, x]
                 current_tri_id_map[ys, xs] = tri_idx
 
+            # === 保存边ID ===
+            current_tri_edge_ids.append(l_ids)  # numpy [3]
+
             # 收集数据给 helper 函数
             current_triangles_data.append({
                 'vertex_ids': v_ids,
@@ -1099,8 +1112,18 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                 # 'valid_points': pts.cpu().numpy() 不需要这个了
             })
 
+        # 转换为Tensor [N_tri, 3]
+        if len(current_tri_edge_ids) > 0:
+            tri_edge_ids_tensor = torch.from_numpy(
+                np.stack(current_tri_edge_ids, axis=0)
+            ).long()
+        else:
+            tri_edge_ids_tensor = torch.zeros((0, 3), dtype=torch.long)
+        # 放入总容器中，B,N_tri,3
+        tri_edge_ids_list.append(tri_edge_ids_tensor)
 
         # 执行下采样 (关键: mode='nearest')
+        # todo: 会产生0像素的三角形，这个地方以后可能更改一下逻辑
         if current_tri_id_map.dim() == 2:
             current_tri_id_map = current_tri_id_map.unsqueeze(0)  # [1, H, W]
         # 转换为 Float 才能进 interpolate，但在 nearest 模式下数值不会变
@@ -1180,12 +1203,13 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         edge_ids = []
         boundary_local_idxs = []
         current_pixels = []
+        current_midpoints = []  # 收集当前batch的边中点
 
         for i, ed in enumerate(edges_py):
             # 获取像素集合
             current_pixels.append(ed.get('edge_pixels', None))
 
-            # 获取 tri_ids
+            # 获取 tri_ids 三角面id
             tid = ed.get('tri_ids', None) if isinstance(ed, dict) else ed
             if tid is None:
                 continue
@@ -1209,11 +1233,34 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
             else:
                 raise RuntimeError(f"Sample {b}, Edge {i}: 一条直线没有相邻三角形")
 
+            # 🔥 提取端点，计算原始像素中点
+            pts = ed.get('endpoints')
+            if pts is not None:
+                p1, p2 = pts
+                current_midpoints.append([(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0])
+            else:
+                current_midpoints.append([0.0, 0.0])
+                raise RuntimeError(f"线段没有端点")
+
+
         if len(edge_ids) == 0:
             edges_list.append(torch.zeros((0, 2), dtype=torch.long))
         else:
             edges_list.append(torch.tensor(edge_ids, dtype=torch.long))
 
+        # 对中点进行统一的 [-1, 1] 归一化
+        if len(current_midpoints) > 0:
+            mid_np = np.array(current_midpoints, dtype=np.float32)  # [E, 2]
+
+            # 归一化公式: (x / W) * 2 - 1
+            mid_np[:, 0] = (mid_np[:, 0] / div_w) * 2.0 - 1.0
+            mid_np[:, 1] = (mid_np[:, 1] / div_h) * 2.0 - 1.0
+
+            midpoints_tensor = torch.from_numpy(mid_np).to(device)
+        else:
+            midpoints_tensor = torch.zeros((0, 2), dtype=torch.float32, device=device)
+
+        edges_midpoints_list.append(midpoints_tensor)
         edges_pixels.append(current_pixels)
         boundary_local_idxs_per_batch.append(boundary_local_idxs)
 
@@ -1226,10 +1273,148 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         'edges_list': edges_list,
         'edges_pixels': edges_pixels,
         'tri_id_map': tri_id_maps_list,
-        'boundary_local_idxs_per_batch': boundary_local_idxs_per_batch
+        'boundary_local_idxs_per_batch': boundary_local_idxs_per_batch,
+        'tri_edge_ids_list': tri_edge_ids_list,
+        'edges_midpoints': edges_midpoints_list # List[B] of [E, 2]
     })
 
     return new_tri_infos
+
+
+def build_neighbor_indices(tri_infos, max_tri_num, device, return_batched=True):
+    """
+    构建邻居索引，支持返回list或batched tensor
+
+    Args:
+        tri_infos: 三角形信息
+        max_tri_num: 最大三角形数量（用于padding）
+        device: 计算设备
+        return_batched: True返回[B, N_max, 3]，False返回list[B]
+
+    Returns:
+        neighbor_indices: [B, N_max, 3] Tensor 或 list[B] of [N, 3]
+    """
+    tri_edge_ids_list = tri_infos[0]['tri_edge_ids_list']
+    edges_list = tri_infos[0]['edges_list']
+
+    B = len(tri_edge_ids_list)
+    neighbor_indices_list = []
+
+    for b in range(B):
+        tri_edge_ids = tri_edge_ids_list[b].to(device)  # [N, 3]
+        edges = edges_list[b].to(device)  # [E, 2]
+
+        N_tri = tri_edge_ids.shape[0]
+
+        if N_tri == 0:
+            print("=================三角形等于0================")
+            return NULL_TENSOR
+
+        # 向量化计算
+        E_max = edges.shape[0]
+        tri_edge_ids = torch.clamp(tri_edge_ids, 0, E_max - 1)  # 安全裁剪
+
+        # 获取“构成每个三角形的3条边”所连接的“两个三角形面的ID”,广播机制
+        connected_faces = edges[tri_edge_ids]  # [N, 3, 2]
+        # 自身三角形id，为了跟后面进行一个比对判断，来得到三角形邻居面
+        self_ids = torch.arange(N_tri, device=device).view(N_tri, 1, 1)
+        # 判断三角形每条边对应的三角面对中，当前三角形是不是自己本身，如果是为True，不是为false
+        mask_is_t1 = (connected_faces[..., 0] == self_ids.squeeze(-1))
+        # torch.where(条件, 为真时取值, 为假时取值)，去取相反的一个面
+        neighbors = torch.where(mask_is_t1, connected_faces[..., 1], connected_faces[..., 0])
+
+        neighbor_indices_list.append(neighbors)
+
+    # === 根据参数决定返回格式 ===
+    if return_batched:
+        # Stack并Pad为 [B, max_tri_num, 3]
+        batched_neighbors = torch.zeros((B, max_tri_num, 3), dtype=torch.long, device=device)
+
+        for b in range(B):
+            N_tri = neighbor_indices_list[b].shape[0]
+            if N_tri > 0:
+                batched_neighbors[b, :N_tri, :] = neighbor_indices_list[b]
+
+        return batched_neighbors
+    else:
+        return neighbor_indices_list
+
+
+def convert_edge_features_to_tri_format(edge_alphas_list, tri_infos, max_tri_num, device):
+    """
+    将边级别的特征 (alphas 和 midpoints) 转换为三角形级别的格式 [B, N_max, 3, ...]
+    Args:
+        edge_alphas_list: list[B], 每个元素是 [E_b] (EdgeHead输出)
+        tri_infos: 包含 tri_edge_ids_list 和 edges_midpoints 的字典
+        max_tri_num: int, 最大三角形数量（用于Padding）
+        device: 计算设备
+
+    Returns:
+        edge_probs: Tensor [B, max_tri_num, 3]
+        aligned_midpoints_norm: Tensor [B, max_tri_num, 3, 2] (归一化到 [-1, 1] 的边中点)
+    """
+    tri_edge_ids_list = tri_infos[0]['tri_edge_ids_list']
+    edges_midpoints_list = tri_infos[0]['edges_midpoints']  # 你之前新增的归一化中点列表
+    batch_num_tri = tri_infos[0]['batch_num_tri']
+    B = len(edge_alphas_list)
+
+    # 1. 初始化返回容器
+    # edge_probs 初始化为 1.0（默认阻断，安全垫底）
+    edge_probs = torch.ones((B, max_tri_num, 3), dtype=torch.float32, device=device)
+
+    # aligned_midpoints_norm 初始化为 0.0 (中心点，实际上无效边不会产生 loss，所以填什么都行)
+    aligned_midpoints_norm = torch.zeros((B, max_tri_num, 3, 2), dtype=torch.float32, device=device)
+
+    total_invalid = 0
+
+    for b in range(B):
+        edge_alphas = edge_alphas_list[b]  # [E_b]
+        edge_midpoints = edges_midpoints_list[b].to(device)  # [E_b, 2]
+        tri_edge_ids = tri_edge_ids_list[b].to(device)  # [N_tri, 3]
+        N_tri = batch_num_tri[b]
+
+        if N_tri == 0:
+            continue
+
+        E_max = edge_alphas.shape[0]
+
+        # === 安全检查 ===
+        invalid_mask = (tri_edge_ids < 0) | (tri_edge_ids >= E_max)
+        num_invalid = invalid_mask.sum().item()
+        if num_invalid > 0:
+            total_invalid += num_invalid
+            # print(f"⚠️ Batch {b}: {num_invalid}/{tri_edge_ids.numel()} edge IDs invalid")
+
+        # === Padding Trick (为 -1 的无效边准备垫片) ===
+        # 1. 垫概率: 末尾追加 1.0 (代表断裂)
+        padded_alphas = torch.cat([edge_alphas, torch.tensor([1.0], dtype=edge_alphas.dtype, device=device)])
+
+        # 2. 垫中点: 末尾追加 [0.0, 0.0]
+        padded_midpoints = torch.cat(
+            [edge_midpoints, torch.tensor([[0.0, 0.0]], dtype=edge_midpoints.dtype, device=device)], dim=0)
+
+        # === 安全映射 ===
+        # 将无效的 id (-1 或 越界) 映射为最后一行的索引 (即垫片的位置)
+        # 注意：这里我们使用 E_max 作为垫片的索引，因为 padded 数组的长度是 E_max + 1
+        safe_edge_ids = torch.where(
+            ~invalid_mask,
+            tri_edge_ids,
+            torch.tensor(E_max, dtype=torch.long, device=device)
+        )
+
+        # === 同步提取 (Gather) ===
+        # 提取概率 -> [N_tri, 3]
+        gathered_probs = padded_alphas[safe_edge_ids]
+        edge_probs[b, :N_tri, :] = gathered_probs
+
+        # 提取中点 -> [N_tri, 3, 2]
+        gathered_midpoints = padded_midpoints[safe_edge_ids]
+        aligned_midpoints_norm[b, :N_tri, :, :] = gathered_midpoints
+
+    if total_invalid > 0:
+        print(f"📊 Total invalid edge IDs mapped to safe padding across all batches: {total_invalid}")
+
+    return edge_probs, aligned_midpoints_norm
 
 # --------------------------------------------
 # 通用采样函数：对三角形的 (质心 + 3个顶点) 进行采样并取平均

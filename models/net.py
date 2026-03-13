@@ -2,7 +2,7 @@ from typing import List, Tuple, Dict
 
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 from .PlanePatchMatch import *
-from utils import batch_convert_to_tri_infos_new
+from utils import batch_convert_to_tri_infos_new,build_neighbor_indices
 from .feature_map import *
 import torch
 import torch.nn as nn
@@ -127,7 +127,6 @@ class PatchmatchNet(nn.Module):
         
         num_features = [8, 16, 32, 64]
 
-
         self.propagate_neighbors = propagate_neighbors
         self.evaluate_neighbors = evaluate_neighbors
         # number of groups for group-wise correlation
@@ -152,13 +151,15 @@ class PatchmatchNet(nn.Module):
         self.upsample_net = Refinement()
 
         # ym—need-modify 后面可能需要加入传播里面
-        self.edge_head = EdgeHead(num_features[1])
+        # self.edge_head = EdgeHead(num_features[1])
 
         # ym-add 1.21 添加PlanePatchMatch
         self.num_hypotheses = 3
         self.tau = 1.0
 
-        self.plane_patchmatch_agent = PlanePatchMatchModule(num_hypotheses=3, G=8)
+        self.plane_patchmatch_agent = PlanePatchMatchModule(num_hypotheses=self.num_hypotheses, G=8,
+                                                            feat_channels=num_features[1],
+                                                            propagator_iter=3)
 
 
     def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1):
@@ -206,13 +207,14 @@ class PatchmatchNet(nn.Module):
         depth_patchmatch = {}
         refined_depth = {}
 
-        edge_alphas,edge_mats=[],[]
+        continuity_loss = [] # 连续性损失
+        continuity_s_loss = [] # 正则化损失，防止边断裂概率都为1
         output_plane={
-           'depth_pred':[],# 平面预测深度图
-            'normal_pred':[], # 平面预测法向量图
+           'depth_stage1_pixels':[],# stage2放大后产生的深度图
+            'normal_pred':[], # stage1最终法向量
             'tri_id_map':[],# 三角形id图
-            'depth_gt': [],  # 平面真值深度图
-            'normal_gt': []  # 平面真值法向量图
+            'depth_gt': [],  # 刚拟合完的深度值
+            'normal_gt': []  # 刚拟合完的法向量
         }
         score = []
         
@@ -245,31 +247,47 @@ class PatchmatchNet(nn.Module):
                 _, _, height, width = depth.size()
                 device = depth.get_device()
 
-                # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
-                # 传入原分辨率的图片，里面会进行一个归一化操作 传入的是原分辨率的
-                # todo: 会产生0像素的三角形，这个地方以后可能更改一下逻辑
+                # ================================================================
+                # 1. 处理数据
+                # ================================================================
+                    # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
+                    # 传入原分辨率的图片，里面会进行一个归一化操作 传入的是原分辨率的
                 tri_infos = batch_convert_to_tri_infos_new(vertexs, lines, triangles, height * 2, width * 2, device)
 
+                del vertexs,lines,triangles
+
                 intrinsics_s1 = torch.unbind(intrinsics_mats['stage_1'].float(), 1)
-
-                # 根据stage的深度信息拟合平面
-                num_hypotheses=4
-                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,depth_max=depth_max)
-
-
-                depth_samples, score, view_weights,normal_samples = self.plane_patchmatch_agent.forward(
-                                                                    self.dense_plane_fitter,
-                                                                    depth_stage2, tri_infos,
-                                                                    ref_feature[f'stage_{l}'], src_features_l,
-                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights)
+                # 获得stage1参考图的内参矩阵
+                ref_intrinsics = intrinsics_s1[0]
 
                 # 批次里面最大三角形数量
                 max_tri_num = max(item['batch_num_tri'] for item in tri_infos)
                 max_tri_num = max(max_tri_num)
 
-                # 获得stage1参考图的内参矩阵
+                # 每个三角形的邻居面，如果只有两个面，另外一个面是自己 # [B, N_max, 3]
+                neighbor_indices_batched = build_neighbor_indices(tri_infos, max_tri_num,device)
 
-                ref_proj = intrinsics_s1[0]
+                # ================================================================
+                # 2. 传入PlanePatchmatch模型,根据stage2的深度信息拟合stage1的平面
+                # ================================================================
+
+                num_hypotheses=4
+                # 平面拟合
+                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,depth_max=depth_max)
+
+
+                (depth_samples, score, view_weights,normal_samples,edge_alphas,
+                 continuity_loss,continuity_s_loss) = self.plane_patchmatch_agent.forward(
+                                                                    self.dense_plane_fitter,
+                                                                    depth_stage2.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
+                                                                    ref_feature[f'stage_{l}'], src_features_l,
+                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights,
+                neighbor_indices_batched = neighbor_indices_batched
+                )
+
+                # ================================================================
+                # 3. 可视化结果，返回结果
+                # ================================================================
 
                 # 转化为tensor形式(B,H,W)
                 # 步骤1：去掉每个Tensor中长度为1的维度（把[1, H, W]转成[H, W]）
@@ -283,46 +301,37 @@ class PatchmatchNet(nn.Module):
                 before_guess_planes = normal_samples[0]  # [B, N_tri, 4]
 
                 # 取法向量
-                tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
+                # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
 
-                # 更新完之后的法向量图
-                output_plane['depth_pred']=depth # 目前放stage2 产生的深度图放大后
+                # 经过传播得到的平面
+                output_plane['depth_stage1_pixels']=depth # 目前放stage2 产生的深度图放大后
                 output_plane['normal_pred']=normal_samples[1]
 
-
-                # 操作是在1 / 2分辨率下面进行,少了一个edge—mat
-                # ym-need-modify 暂时不给其放梯度，
-                ref_stage1_feature = ref_feature['stage_1'].detach()
-                edge_alphas = self.edge_head(ref_stage1_feature, pred_depth_map=depth.detach(),
-                                             tri_infos=tri_infos,
-                                             tri_id_map=tri_id_map_tensor,
-                                             tri_normals=tri_normals)
-
                 # 进行planePatchMatch
-
                 visualizer = PlaneVisualizer(height, width, device)
                 # 没有进行传播得到的平面，刚拟合完的初始平面
                 output_plane['depth_gt'], output_plane['normal_gt'] = visualizer.render_from_planes(
                     before_guess_planes.detach(),
                     tri_id_map_tensor,
-                    ref_proj.detach(),
+                    ref_intrinsics.detach(),
                     depth_range=(depth_min, depth_max))
 
                 # 生成gt-stage-1的三角平面深度图和法向量图
                 # plane_hypothesis_svd_gt = self.dense_plane_fitter.By_SVD_Plane(
                 #     depth_stage2=depth_stage_1,
                 #     tri_id_map=tri_id_map_tensor,
-                #     intrinsics_s1=ref_proj,
+                #     intrinsics_s1=ref_intrinsics,
                 #     max_num_triangles=max_tri_num
                 # )
                 #
                 # depth_gt_plane_stage_1, normal_gt_plane_stage_1 = visualizer.render_from_planes(
-                #     plane_hypothesis_svd_gt, tri_id_map_tensor, ref_proj
+                #     plane_hypothesis_svd_gt, tri_id_map_tensor, ref_intrinsics
                 #     , depth_range=(depth_min, depth_max))
                 #
                 # output_plane['depth_gt'] = depth_gt_plane_stage_1
                 # output_plane['normal_gt'] = normal_gt_plane_stage_1
 
+                # planepatchmatch最终预测结果，里面也有两份一份用来上采样一份用来输出
                 depth = depth_samples
 
             
@@ -353,7 +362,9 @@ class PatchmatchNet(nn.Module):
                         "depth_patchmatch": depth_patchmatch,
                         "tri_infos": tri_infos,
                         "edge_alphas": edge_alphas,
-                        "output_plane":output_plane
+                        "output_plane":output_plane,
+                        "continuity_loss":continuity_loss, # 连续性损失
+                        "continuity_s_loss":continuity_s_loss
                     }
         else:
             num_depth = self.patchmatch_num_sample[0]
@@ -371,7 +382,9 @@ class PatchmatchNet(nn.Module):
                         "photometric_confidence": photometric_confidence,
                         "tri_infos": tri_infos,
                         "edge_alphas": edge_alphas,
-                        "output_plane": output_plane
+                        "output_plane": output_plane,
+                        "continuity_loss": continuity_loss,  # 连续性损失
+                        "continuity_s_loss": continuity_s_loss
                     }
         
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
