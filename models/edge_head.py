@@ -63,6 +63,15 @@ class EdgeHead(nn.Module):
         # 可学习缩放，用来调节 sigmoid 输入尺度（训练稳定）
         self.register_parameter("edge_scale", nn.Parameter(torch.tensor(10.0)))
 
+        # ==========================================
+        # 🔥 新增：闭门初始化 (Closed-gate Initialization)
+        # ==========================================
+        # 因为后面有 logits = mlp_out * self.edge_scale (10.0)
+        # 我们把 bias 设为 0.2，那么初始 logits 就是 0.2 * 10 = 2.0
+        # sigmoid(2.0) ≈ 0.88，这意味着一开始 88% 的概率被认为是边缘（阻断传播）
+        nn.init.constant_(self.edge_mlp[4].bias, 0.2)
+        nn.init.normal_(self.edge_mlp[4].weight, mean=0.0, std=0.01)
+
 
     def _compute_analytical_depth_diff(self, midpoints_norm, planes_t1, planes_t2, intrinsics, H, W):
         """

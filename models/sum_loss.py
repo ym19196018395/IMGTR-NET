@@ -6,17 +6,12 @@ import torch.nn.functional as F
 from utils import _sample_map
 
 
-class EdgeConsistencyLoss(nn.Module):
+class EdgeLabelGenerator(nn.Module):
     """
-    自监督 EdgeConsistencyLoss（BCE 形式），用于监督 edge alpha：
+    自监督 EdgeLabelGenerator（BCE 形式），用于监督 edge alpha：
     目标：利用 GT 深度图动态生成“断裂真值 (Ground Truth Label)”进行监督。
     逻辑流程：
-      1. 计算每条边的几何中点。
-      2. 在 GT 深度图上，围绕中点进行 3x3 局部采样。
-      3. 利用 tri_id_map 区分采样点属于 T1 还是 T2。
-      4. 计算 GT 深度差: diff = |Mean(T1) - Mean(T2)|。
-      5. 生成标签: Target = 1 if diff > threshold else 0。
-      6. 计算 BCE Loss。
+
     兼容输入：
       - pred_alpha_list: list 长度 B，每项 tensor [E_b]（EdgeHead 返回）
       - depth_map: [B,1,H,W]（用于内部 pool tri_depths，除非你提供 tri_depths_list）
@@ -45,35 +40,6 @@ class EdgeConsistencyLoss(nn.Module):
         self.depth_threshold = float(depth_threshold)
         self.sparsity_weight = float(sparsity_weight)
 
-    def _compute_edge_midpoints(self, v1, v2):
-        """
-        计算两个三角形公共边的中点 (向量化实现)
-        Args:
-            v1: [E, 3, 2] 三角形1的三个顶点坐标 (归一化 [-1, 1])
-            v2: [E, 3, 2] 三角形2的三个顶点坐标
-        Returns:
-            midpoints: [E, 1, 2] 边的中点坐标
-        """
-        # 寻找公共点：计算 v1 和 v2 顶点之间的两两距离
-        # v1: [E, 3, 1, 2], v2: [E, 1, 3, 2]
-        dist = torch.norm(v1.unsqueeze(2) - v2.unsqueeze(1), p=2, dim=-1)  # [E, 3, 3]
-
-        # 判定重合点：距离小于极小值 (考虑浮点误差)
-        mask = dist < 1e-4  # [E, 3, 3] bool
-
-        # 对于标准的三角网格，两个邻接三角形应该恰好有2个公共顶点
-        # 我们需要找到这2个顶点并求平均
-
-        # 方法：利用 mask 提取 v1 中属于公共边的顶点
-        # mask.any(dim=2) -> [E, 3]，表示 v1 的第 i 个点是否在 v2 中出现过
-        is_shared_v1 = mask.any(dim=2).float().unsqueeze(-1)  # [E, 3, 1]
-
-        # 计算中点：Sum(v1 * is_shared) / Sum(is_shared)
-        # 正常情况下 sum(is_shared) 应该是 2
-        denom = is_shared_v1.sum(dim=1).clamp(min=1.0)  # [E, 1]
-        midpoints = (v1 * is_shared_v1).sum(dim=1) / denom  # [E, 2]
-
-        return midpoints.unsqueeze(1)  # [E, 1, 2] 适配 grid_sample
 
     def _generate_gt_target(self, midpoints, gt_depth_map, tri_id_map, t1_ids, t2_ids):
         """
@@ -173,7 +139,7 @@ class EdgeConsistencyLoss(nn.Module):
         diag_stats = {'pos_ratio': 0.0, 'valid_ratio': 0.0}
 
         output_alphas_list = []
-
+        output_mask_list=[]
         for b in range(B):
             # 获取当前数据
             pred_alphas = pred_alphas_list[b]  # [E]
@@ -216,49 +182,9 @@ class EdgeConsistencyLoss(nn.Module):
                 valid_mask = valid_mask | is_boundary
 
             output_alphas_list.append(gt_targets)
-            # --- Step D: 计算 BCE Loss ---
-            # 只在 GT 有效的边上计算 Loss
-            if valid_mask.sum() > 0:
-                valid_pred = pred_alphas[valid_mask]
-                valid_target = gt_targets[valid_mask]
+            output_mask_list.append(valid_mask)
 
-                # BCE Loss
-                loss_bce = F.binary_cross_entropy(valid_pred, valid_target, reduction='sum')
-
-                total_bce_loss += loss_bce
-                total_valid_edges += valid_mask.sum().item()
-
-                # 统计正样本比例 (断裂边的比例)
-                diag_stats['pos_ratio'] += valid_target.sum().item()
-
-            diag_stats['valid_ratio'] += valid_mask.sum().item()
-
-            # --- Sparsity Loss (针对所有预测，无论 GT 是否有效) ---
-            # 鼓励预测值整体偏向 0
-            if self.sparsity_weight > 0:
-                total_sparsity_loss += pred_alphas.mean()
-
-        # 归一化 Loss
-        if total_valid_edges > 0:
-            final_bce = total_bce_loss / total_valid_edges
-            diag_stats['pos_ratio'] /= total_valid_edges
-        else:
-            final_bce = torch.tensor(0.0, device=device)
-
-        # Sparsity 平均
-        final_sparsity = (total_sparsity_loss / B) * self.sparsity_weight
-
-        total_loss = final_bce + final_sparsity
-
-        info = {
-            'bce': final_bce.item(),
-            'sparsity': final_sparsity.item() if isinstance(final_sparsity, torch.Tensor) else 0.0,
-            'total': total_loss.item(),
-            'pos_ratio': diag_stats['pos_ratio'],# 诊断：当前的 GT 阈值下，有多少比例的边被判定为断裂
-            'valid_edges': total_valid_edges  # 诊断：有多少边成功采样到了 GT
-        }
-
-        return total_loss, info,output_alphas_list
+        return output_alphas_list,output_mask_list
 
 
 def _sanity_check_and_report(device, B, N_max, all_edges_indices, pred_alphas_flat, gt_tri_depths, target_score=None):

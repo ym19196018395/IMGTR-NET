@@ -100,7 +100,7 @@ if args.dataset == 'dtu_whu':
     test_dataset = MVSDataset(args.trainpath, args.vallist, "test", 5, robust_train=False)
 
 # 进行了一个修改，对于有些数据不进行默认collate
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list, num_workers=8,
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list, num_workers=8,
                             drop_last=True)
 TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list, num_workers=4,
                            drop_last=False)
@@ -165,7 +165,7 @@ def train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (30 * args.summary_freq) == 0
+            do_summary_image = global_step % (5 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             total_loss, scalar_outputs, image_outputs = train_sample(sample, do_summary_image=do_summary_image,
                                                                      total_steps=total_steps,global_step=global_step)
@@ -237,6 +237,189 @@ def test():
             print("Iter {}/{}, test results = {}".format(batch_idx, len(TestImgLoader), avg_test_scalars.mean()))
     print("final", avg_test_scalars)
 
+def compute_edge_supervision_loss(
+        edge_label_generator,
+        pred_alphas_list,
+        gt_depth_map,
+        tri_infos,
+        tri_id_map
+):
+    """
+    封装边预测头 (EdgeHead) 的监督 Loss 计算全流程。
+    包含: 伪标签生成 -> Mask 过滤 -> 加权 BCE -> 稀疏性惩罚统计。
+    """
+    # 1. 生成 Stage 1 伪真值标签和有效掩码
+    gt_stage1_list, valid_mask_list = edge_label_generator(
+        pred_alphas_list=pred_alphas_list,
+        gt_depth_map=gt_depth_map,
+        tri_infos=tri_infos,
+        tri_id_map=tri_id_map
+    )
+
+    B = len(pred_alphas_list)
+    device = gt_depth_map.device  # 提前获取 device，避免后续报错
+
+    loss_alpha_sup = 0.0
+    total_sparsity_loss = 0.0
+
+    valid_bce_count = 0  # 记录有多少张图成功计算了 BCE
+    valid_sparsity_count = 0  # 记录有多少张图成功计算了稀疏性
+
+    for b in range(B):
+        pred_alphas = pred_alphas_list[b]
+
+        # 如果当前图没有任何边，直接跳过
+        if pred_alphas.numel() == 0:
+            continue
+
+        valid_mask = valid_mask_list[b]
+        gt_targets = gt_stage1_list[b]
+
+        # --- 统计稀疏性 (只针对有边的图) ---
+        total_sparsity_loss += pred_alphas.mean()
+        valid_sparsity_count += 1
+
+        # 如果当前图没有任何有效的 GT 边，跳过 BCE 计算
+        if valid_mask.sum() == 0:
+            continue
+
+        # --- 计算加权 BCE ---
+        valid_pred = pred_alphas[valid_mask]
+        valid_target = gt_targets[valid_mask]
+
+        loss_alpha_sup += compute_weighted_bce_core(valid_pred, valid_target)
+        valid_bce_count += 1
+
+    # ==========================================
+    # 聚合求平均 (防止除 0 并保持计算图连通)
+    # ==========================================
+
+    # 1. BCE Loss 平均
+    if valid_bce_count > 0:
+        loss_alpha_sup = loss_alpha_sup / valid_bce_count
+    else:
+        # 🔥 关键修复：加上 requires_grad=True
+        # 万一某个极端的 Batch 全被跳过了，直接返回 0.0 会导致 total_loss.backward() 找不到梯度图崩溃
+        loss_alpha_sup = torch.tensor(0.0, device=device, requires_grad=True)
+
+    # 2. 稀疏性 Loss 平均 (修复了你原来的 Bug)
+    if valid_sparsity_count > 0:
+        loss_sparsity = total_sparsity_loss / valid_sparsity_count
+    else:
+        loss_sparsity = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return loss_alpha_sup, loss_sparsity,gt_stage1_list
+
+def compute_edge_supervision_loss_new(
+        edge_label_generator,
+        pred_alphas_list,
+        gt_depth_map,
+        tri_infos,
+        tri_id_map,
+        final_planes,  # [B, N, 4] 传播后的平面
+        ref_intrinsics,  # [B, 3, 3] 参考视角的内参
+        global_step,  # 当前步数
+        total_steps,  # 总步数
+        geom_threshold=0.2  # 几何真值的断裂阈值
+):
+    """
+    封装边预测头 (EdgeHead) 的监督 Loss 计算全流程。
+    包含: 伪标签生成 -> Mask 过滤 -> 加权 BCE -> 稀疏性惩罚统计。
+    return: BCE_Loss, 稀疏性Loss, 混合后的真值列表(用于可视化)
+    """
+    # 1. 生成 Stage 1 伪真值标签和有效掩码
+    gt_stage1_list, valid_mask_list = edge_label_generator(
+        pred_alphas_list=pred_alphas_list,
+        gt_depth_map=gt_depth_map,
+        tri_infos=tri_infos,
+        tri_id_map=tri_id_map
+    )
+
+    B = len(pred_alphas_list)
+    device = gt_depth_map.device  # 提前获取 device，避免后续报错
+
+    H, W = gt_depth_map.shape[-2:]
+
+    # 2. 课程学习权重计算 现在不逐渐放开权重，而是直接将以前的权重归0
+    progress = global_step / total_steps
+    if progress < 0.3:
+        weight_new = 0.0
+    else:
+        weight_new = min((progress - 0.4) / 0.4, 1.0)
+
+    weight_old = 1.0 - weight_new
+
+    loss_alpha_sup = 0.0
+    total_sparsity_loss = 0.0
+
+    valid_bce_count = 0  # 记录有多少张图成功计算了 BCE
+    valid_sparsity_count = 0  # 记录有多少张图成功计算了稀疏性
+
+    edge_alphas_gt_list = []  # 记录最终用于监督的真值
+
+    for b in range(B):
+        pred_alphas = pred_alphas_list[b]
+
+        # 异常跳过
+        if pred_alphas.numel() == 0:
+            edge_alphas_gt_list.append(torch.empty(0, device=device))
+            continue
+
+        valid_mask = valid_mask_list[b]
+        gt_old = gt_stage1_list[b]
+
+        total_sparsity_loss += pred_alphas.mean()
+        valid_sparsity_count += 1
+
+        if valid_mask.sum() == 0:
+            edge_alphas_gt_list.append(gt_old)
+            continue
+
+        # 3. 新老师：动态几何标签
+        if weight_new > 0:
+            current_edges = tri_infos[0]['edges_list'][b].to(device)
+            midpoints_norm = tri_infos[0]['edges_midpoints'][b].to(device)
+            curr_intrinsics = ref_intrinsics[b]
+            curr_planes = final_planes[b]
+
+            gt_new = generate_geometric_edge_gt(
+                curr_planes, current_edges, midpoints_norm, curr_intrinsics, H, W, threshold=geom_threshold
+            )
+
+            # ==========================================
+            # 🔥 核心魔法：伯努利概率采样 (Stochastic Routing)
+            # ==========================================
+            # 生成一个与边数相同维度的随机张量 (0 ~ 1 之间)
+            random_prob = torch.rand(gt_old.shape, device=device)
+
+            # 当随机数小于 weight_new 时，使用新标签；否则使用旧标签
+            # 这样保证了 blended_gt 绝对是纯净的 0 或 1！
+            mask_use_new = random_prob < weight_new
+            blended_gt = torch.where(mask_use_new, gt_new, gt_old)
+        else:
+            blended_gt = gt_old
+
+        edge_alphas_gt_list.append(blended_gt)
+
+        # 5. 加权 BCE (此时喂进去的 target 绝对是干净的 0/1)
+        valid_pred = pred_alphas[valid_mask]
+        valid_target = blended_gt[valid_mask]
+
+        loss_alpha_sup += compute_weighted_bce_core(valid_pred, valid_target)
+        valid_bce_count += 1
+
+        # 聚合结果
+    if valid_bce_count > 0:
+        loss_alpha_sup = loss_alpha_sup / valid_bce_count
+    else:
+        loss_alpha_sup = torch.tensor(0.0, device=device, requires_grad=True)
+
+    if valid_sparsity_count > 0:
+        loss_sparsity = total_sparsity_loss / valid_sparsity_count
+    else:
+        loss_sparsity = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return loss_alpha_sup, loss_sparsity, edge_alphas_gt_list
 
 def get_dynamic_loss_weights(global_step, total_steps):
     """
@@ -277,6 +460,72 @@ def get_dynamic_loss_weights(global_step, total_steps):
     weight_spars = 1.0 + 1.0 * progress  # 从 1.0 涨到 2.0
 
     return weight_alpha, weight_cont, weight_spars
+
+
+
+
+def compute_weighted_bce_core(preds, targets):
+    """
+    纯粹的加权 BCE 计算核心 (防爆版)
+    输入必须是经过 valid_mask 筛选后的 1D tensor
+    """
+    preds = torch.clamp(preds, 1e-6, 1.0 - 1e-6)
+    num_pos = (targets > 0.5).sum().float()
+    num_neg = (targets <= 0.5).sum().float()
+
+    if num_pos < 1.0:
+        return F.binary_cross_entropy(preds, targets)
+
+    pos_weight = torch.clamp(num_neg / num_pos, min=1.0, max=10.0)
+
+    loss_pos = - pos_weight * targets * torch.log(preds)
+    loss_neg = - (1.0 - targets) * torch.log(1.0 - preds)
+    return (loss_pos + loss_neg).mean()
+
+
+def generate_geometric_edge_gt(final_planes, current_edges, midpoints_norm, intrinsics, H, W, threshold=10.0):
+    """
+    动态生成几何真值 (免受斜面干扰的绝对真值)
+    Args:
+        final_planes: [E, 4] 边的相关平面
+        current_edges: [E, 2] 边的邻接三角形索引
+        midpoints_norm: [E, 2] 边的中点
+    Returns:
+        geom_targets: [E] 几何真值 0 or 1
+    """
+    with torch.no_grad():
+        E = midpoints_norm.shape[0]
+        device = midpoints_norm.device
+
+        # 1. 坐标反投影
+        midpoints_uv = torch.zeros_like(midpoints_norm)
+        midpoints_uv[:, 0] = (midpoints_norm[:, 0] + 1.0) / 2.0 * (W - 1)
+        midpoints_uv[:, 1] = (midpoints_norm[:, 1] + 1.0) / 2.0 * (H - 1)
+
+        ones = torch.ones(E, 1, device=device)
+        uv_homo = torch.cat([midpoints_uv, ones], dim=-1)
+        K_inv = torch.inverse(intrinsics)  # [3, 3]
+        rays = torch.matmul(K_inv, uv_homo.unsqueeze(-1)).squeeze(-1)  # [E, 3]
+
+        # 2. 提取 T1 和 T2 平面并算深度
+        idx1, idx2 = current_edges[:, 0].long(), current_edges[:, 1].long()
+        planes_t1, planes_t2 = final_planes[idx1], final_planes[idx2]
+
+        n1, d1 = planes_t1[:, :3], planes_t1[:, 3:]
+        n2, d2 = planes_t2[:, :3], planes_t2[:, 3:]
+
+        denom1 = torch.sum(n1 * rays, dim=-1, keepdim=True).clamp_min(1e-6)
+        denom2 = torch.sum(n2 * rays, dim=-1, keepdim=True).clamp_min(1e-6)
+        depth1, depth2 = -d1 / denom1, -d2 / denom2
+
+        # 3. 产生几何标签
+        diff = torch.abs(depth1 - depth2).squeeze(-1)
+        geom_targets = (diff > threshold).float()
+
+        # 边界边强制为断裂
+        geom_targets[idx1 == idx2] = 1.0
+
+    return geom_targets
 
 def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
@@ -323,30 +572,77 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     depth_patchmatch = outputs["depth_patchmatch"]
 
     # 通过计算最终的损失
-    # 1. 主损失
+    # ====================================================
+    # 1. 深度主任务 Loss
+    # ====================================================
+    # 0-1掩码 用来损失函数的
+    valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
+    mask['stage_1']=valid_mask_s1
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
 
+    # ====================================================
+    # 2. 边预测头的混合监督 Loss
+    # ====================================================
     # EdgeConsistencyLoss（自监督 BCE）
-    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.2, sparsity_weight=1e-4)
-    loss_alpha_sup, info,edge_alphas_gt= edge_consistency_loss_fn(
+    intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
+    ref_intrinsics = intrinsics_s1[0]  # 参考视角的内参，形状必为 [B, 3, 3]
+    depth_threshold=0.4
+    edge_label_generator = EdgeLabelGenerator(depth_threshold=depth_threshold, sparsity_weight=1e-4)
+
+    # loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss(
+    #     edge_label_generator=edge_label_generator,
+    #     pred_alphas_list=outputs["edge_alphas"],
+    #     gt_depth_map=depth_gt[f'stage_1'],
+    #     tri_infos=outputs["tri_infos"],
+    #     tri_id_map=outputs["output_plane"]['tri_id_map'],
+    # )
+
+    # 两段式边预测头损失
+    loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss_new(
+        edge_label_generator=edge_label_generator,
         pred_alphas_list=outputs["edge_alphas"],
-        # 1/2分辨率图的深度图
-        gt_depth_map=depth_gt[f'stage_1'],  # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
+        gt_depth_map=depth_gt[f'stage_1'],
         tri_infos=outputs["tri_infos"],
-        tri_id_map=outputs["output_plane"]['tri_id_map']
+        tri_id_map=outputs["output_plane"]['tri_id_map'],
+        final_planes=outputs["output_plane"]["final_plane"],  # 假设这是 Propagator 传播后的最终平面
+        ref_intrinsics=ref_intrinsics,
+        global_step=global_step,  # 你的训练主循环需要维护这两个变量
+        total_steps=total_steps,
+        geom_threshold=depth_threshold
     )
+
     # =======================手动固定权重==================
+
     # 2.边缘监督 Loss
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
-    weight_alpha=10
-    loss_alpha_sup=loss_alpha_sup*weight_alpha
+    weight_alpha=5
+    loss_alpha_sup=loss_alpha_raw * weight_alpha + loss_sparsity_raw
 
     # 3.连续性正则化 Loss (Geometric Smoothness)
     # 因为它是正则化项，绝不能喧宾夺主。建议权重设为 0.1 ~ 0.5
-    lambda_c = 0.1
     # 4. 稀疏性惩罚 Loss (防止作弊)
     # 这个权重必须足够大，大到能抵消作弊带来的收益！如果 lambda_c * dist_error 大概是 0.5，那 lambda_s 至少要是 1.0 甚至 2.0
+
+    # 一开始不启动连续性约束，后面再打开，目前是直接打开
+    lambda_c = 0.1
     lambda_s = 1.0
+    # lambda_c, lambda_s = max_lambda_c, max_lambda_s
+
+    # progress = global_step / total_steps
+    # if progress < 0.05:
+    #     lambda_c, lambda_s = 0.0, 0.0
+    # elif progress < 0.3:
+    #     # 阶段 2：余弦平滑放开期 (Cosine Warm-up)
+    #     linear_ratio = (progress - 0.05) / (0.3 - 0.05)
+    #
+    #     # 利用余弦公式将线性的 0~1 映射到平滑的 0~1 曲线
+    #     # math.cos(math.pi) 是 -1，math.cos(0) 是 1
+    #     smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
+    #
+    #     lambda_c = max_lambda_c * smooth_ratio
+    #     lambda_s = max_lambda_s * smooth_ratio
+    # else:
+    #     lambda_c, lambda_s = max_lambda_c, max_lambda_s
 
     # =======================动态权重衰减==================
 
@@ -400,7 +696,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B,1, H, W]
         gt_mask_s1 = mask['stage_1']  # 假设形状 [B, 1,H, W]
 
-        valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
+
 
         # 获取 Stage 1 的 预测 深度 (planepatchmatch最终预测结果)
         pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B,H, W]
@@ -410,9 +706,6 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
         # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
         # normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
-
-        intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
-
 
         # normal_gt_s1 = compute_normal_map_perspective(
         #     gt_depth_s1,
@@ -449,11 +742,11 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             "根据深度真值生成的法向量": normal_gt_s1,
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图传播完
-            "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_pred'],
+            "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_final'],
             "经过平面传播预测的stage1深度值": depth_patchmatch['stage_1'][-1],
             # 新增：基于平面的深度图和法向量图，刚拟合
-            "没有经过平面传播，刚拟合完初始平面深度值": outputs["output_plane"]['depth_gt'],
-            "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_gt'] ,
+            "没有经过平面传播，刚拟合完初始平面深度值": outputs["output_plane"]['depth_no_pro'],
+            "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'] ,
             # 新增：边预测头预测值和真值
             "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
             "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
@@ -536,20 +829,23 @@ def test_sample(sample,detailed_summary=False):
     # 总损失：深度损失+边断裂损失+连续性损失
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
 
+    # ====================================================
+    # 2. 边预测头的混合监督 Loss
+    # ====================================================
     # EdgeConsistencyLoss（自监督 BCE）
-    edge_consistency_loss_fn = EdgeConsistencyLoss(depth_threshold=0.1, sparsity_weight=1e-4)
-    loss_alpha_sup, info, edge_alphas_gt = edge_consistency_loss_fn(
+    edge_label_generator = EdgeLabelGenerator(depth_threshold=0.2, sparsity_weight=1e-4)
+
+    loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss(
+        edge_label_generator=edge_label_generator,
         pred_alphas_list=outputs["edge_alphas"],
-        # 1/2分辨率图的深度图
         gt_depth_map=depth_gt[f'stage_1'],
-        # or pass GT depth if you want pseudo from GT (but keep pred_depth for continuity)
         tri_infos=outputs["tri_infos"],
         tri_id_map=outputs["output_plane"]['tri_id_map']
     )
 
     # # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
     weight_alpha = 10
-    loss_alpha_sup = loss_alpha_sup * weight_alpha
+    loss_alpha_sup = loss_alpha_raw * weight_alpha + loss_sparsity_raw
     loss = loss_depth + loss_alpha_sup
 
     # ================ 生成断裂图 ===============================================

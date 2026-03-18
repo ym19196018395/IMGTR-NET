@@ -176,8 +176,13 @@ class LearnedTrianglePropagator(nn.Module):
         super().__init__()
 
         # 1. 特征提取器: 从平面参数提取特征
-        # 输入: Plane(4) + Cost(1) = 5
-        self.encoder = nn.Linear(5, hidden_dim)
+        # 输入: Plane(4) + Cost(1) = 5 加入非线性激活函数，使其真正成为深度网络
+        self.encoder = nn.Sequential(
+            nn.Linear(5, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True)
+        )
 
         # 2. 门控网络 (Gating Network): 决定传播多少信息
         # hidden*2 (self+neigh)
@@ -192,15 +197,25 @@ class LearnedTrianglePropagator(nn.Module):
             nn.Sigmoid()
         )
 
-        # 3. 平面修正网络 (Refinement MLP) - 这是增加"深度学习含量"的关键
-        # 类似于 RAFT 的 Update Block
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)  # 可选，增加时序记忆
+        self.plane_head = nn.Linear(hidden_dim, 4)
 
-        self.plane_head = nn.Linear(hidden_dim, 4)  # 输出平面残差 delta_plane
+        # 依然保持你的优秀习惯：残差网络零初始化
+        # nn.init.constant_(self.plane_head.bias, 0.0)
+        # nn.init.normal_(self.plane_head.weight, mean=0.0, std=0.001)
 
-        # 残差网络初始化，防止残差网络一开始的随机值过大，导致整个深度图和法向量全部往一个地方偏
-        nn.init.constant_(self.plane_head.bias, 0.0)
-        nn.init.normal_(self.plane_head.weight, mean=0.0, std=0.001)
+        nn.init.zeros_(self.plane_head.weight)
+        nn.init.zeros_(self.plane_head.bias)
+
+        # 定义一个缩放因子，用于压制 d 的巨大数值
+        # 如果你的深度大多在几十到几百，100.0 是个好数值
+        # todo：如果后续训练数据集有变化要进行更改
+        self.d_scale_factor = 200
+
+        # 🔥 新增：敞门初始化
+        # 将 Bias 设为 2.0，Sigmoid(2.0) ≈ 0.88。
+        # 让网络默认给予邻居极高的注意力权重，除非 EdgeHead 强行出示红牌！
+        # nn.init.constant_(self.gate_net[2].bias, 2.0)
+        # nn.init.normal_(self.gate_net[2].weight, mean=0.0, std=0.01)
 
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs,ref_feature=None):
@@ -218,11 +233,15 @@ class LearnedTrianglePropagator(nn.Module):
         device = current_planes.device
 
         # ==========================================
-        # 1. 准备数据: Self & Neighbors
+        # 1. 准备数据: 缩放 d 防止量纲爆炸
         # ==========================================
+        # === 分离并缩放 d ===
+        n_curr = current_planes[..., :3]
+        d_curr_scaled = current_planes[..., 3:] / self.d_scale_factor
+        scaled_planes = torch.cat([n_curr, d_curr_scaled], dim=-1)
 
         # 构造输入特征: [Plane, Cost]
-        plane_feat = torch.cat([current_planes, current_costs], dim=-1)  # [B, N, 5]
+        plane_feat = torch.cat([scaled_planes, current_costs], dim=-1)  # [B, N, 5]
 
         # 编码特征: [B, N, H]
         hidden = self.encoder(plane_feat)
@@ -232,20 +251,20 @@ class LearnedTrianglePropagator(nn.Module):
         # [B, N, 3, H]
         neighbor_hidden = hidden[batch_idx, neighbor_indices]
         # [B, N, 3, 4]
-        neighbor_planes = current_planes[batch_idx, neighbor_indices]
+        # 计算几何差异时也必须用 scaled_planes!
+        neighbor_scaled_planes = scaled_planes[batch_idx, neighbor_indices]
 
         # 邻居 Cost 仅作为置信度
         # current_costs: [B, N, 1] -> neighbor_costs: [B, N, 3, 1]
         neighbor_costs = current_costs[batch_idx, neighbor_indices]  # [B, N, 3, 1]
 
-        # === ✅ 修正点 3: 计算平面参数差异 (几何特征) ===
         # 你的平面参数是 (n, d)。如果两个三角形共面，它们的 (n, d) 应该极其相似。
         # 我们让网络看到这个差异，网络就能学会："如果差异很小，且中间没 Edge，那大概率是同一个大平面，权重给高点"
         # self_planes_expand: [B, N, 1, 4]
-        self_planes_expand = current_planes.unsqueeze(2)
+        self_scaled_expand = scaled_planes.unsqueeze(2)
 
         # plane_diff: [B, N, 3, 4]
-        plane_diff = neighbor_planes - self_planes_expand
+        plane_diff = neighbor_scaled_planes - self_scaled_expand
 
         # ==========================================
         # 2. 软门控 (Soft Gating) - 替代硬截断
@@ -275,15 +294,13 @@ class LearnedTrianglePropagator(nn.Module):
         physics_guidance = 1.0 - edge_probs.unsqueeze(-1)  # [B, N, 3, 1]
         final_weights = raw_weights * physics_guidance
 
-        # 归一化权重 (包括自己)
-        # 假设自己的权重是 1.0 (残差连接的思想)
-        # weights = Softmax([w1, w2, w3, w_self])
-        # 这里为了简化，直接用加权平均
 
         # ==========================================
         # 3. 软传播 (Weighted Aggregation)
         # ==========================================
         # 聚合邻居平面: Sum(w_i * p_i)
+        # 聚合真实的平面参数 (这里用真实值聚合，保证物理意义正确)
+        neighbor_planes = current_planes[batch_idx, neighbor_indices]
         # [B, N, 3, 1] * [B, N, 3, 4] -> sum(dim=2) -> [B, N, 4]
         weighted_neighbor_planes = (final_weights * neighbor_planes).sum(dim=2)
         sum_weights = final_weights.sum(dim=2) + 1e-6
@@ -292,28 +309,50 @@ class LearnedTrianglePropagator(nn.Module):
         # 这种混合方式保证了数值稳定性
         aggregated_planes = (weighted_neighbor_planes + current_planes) / (sum_weights + 1.0)
 
+        # 在加入残差前，必须让被平均拉短的法向量归一化一下，防止自身平面值因为聚合过于小了
+        agg_n_raw = aggregated_planes[..., :3]
+        agg_d_raw = aggregated_planes[..., 3:]
+
+        # 计算平均后法向量的真实长度 (加 clamp 防止除零)
+        norm_scale = torch.norm(agg_n_raw, p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+
+        # n 和 d 必须同时除以这个长度！保持平面方程物理意义不变！
+        agg_n = agg_n_raw / norm_scale
+        agg_d = agg_d_raw / norm_scale
+
+        aggregated_planes_norm = torch.cat([agg_n, agg_d], dim=-1)
+
         # ==========================================
         # 4. MLP Refinement (Deep Learning Part)
         # ==========================================
-        # 利用聚合后的特征，预测一个残差来微调平面
-        # 这就完全是一个 Deep 的过程了
+        # 再次缩放以喂给网络
+        agg_d_scaled = agg_d / self.d_scale_factor
+        scaled_agg_planes = torch.cat([agg_n, agg_d_scaled], dim=-1)
 
-        # 更新 hidden state (模拟 GRU)
-        # Input: 聚合后的平面特征 (这里简化为再次编码)
-        agg_feat = torch.cat([aggregated_planes, current_costs], dim=-1)
+        agg_feat = torch.cat([scaled_agg_planes, current_costs], dim=-1)
         agg_hidden = self.encoder(agg_feat)
 
-        # 预测残差 delta: [B, N, 4]
-        delta_plane = self.plane_head(agg_hidden)
+        # 网络输出的 d_delta 是相对缩小尺度的
+        delta_plane_scaled = self.plane_head(agg_hidden)
 
-        # 更新平面
-        new_planes = aggregated_planes + delta_plane
+        # 把 d_delta 放大回真实尺度
+        delta_n = delta_plane_scaled[..., :3]
+        delta_d = delta_plane_scaled[..., 3:] * self.d_scale_factor
+        delta_plane = torch.cat([delta_n, delta_d], dim=-1)
 
-        # 归一化法向量 (前3维)
-        new_n = F.normalize(new_planes[..., :3], dim=-1)
-        new_d = new_planes[..., 3:]
+        # 更新真实的、未缩放的平面
+        new_planes = aggregated_planes_norm + delta_plane
 
-        final_planes = torch.cat([new_n, new_d], dim=-1)
+        # 最终输出强制保障几何合法性
+        new_n_raw = new_planes[..., :3]
+        new_d_raw = new_planes[..., 3:]
+
+        final_norm_scale = torch.norm(new_n_raw, p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+
+        new_n_final = new_n_raw / final_norm_scale
+        new_d_final = new_d_raw / final_norm_scale
+
+        final_planes = torch.cat([new_n_final, new_d_final], dim=-1)
 
         return final_planes
 
@@ -568,7 +607,7 @@ class PlanePatchMatchModule(nn.Module):
         # ==========================================
         # 使用优化后的 get_plane_hypotheses 直接得到 [B, N, K, 4]
         # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
-        # todo:在这里目前不用前向平行平面，因为我感觉有点破坏整个平面的光滑性
+        # todo:暂时不需要假设了，直接用拟合的结果,用了假设之后导致平面传播的一塌糊涂，很失败
         hypotheses = self.fitter.get_plane_hypotheses(
             depth_stage2=depth_stage2,
             tri_id_map=tri_id_map,
@@ -621,20 +660,21 @@ class PlanePatchMatchModule(nn.Module):
 
         # best_planes: [B, N_tri, 4] (更新后的三角形平面)
         # ym-debug 为了验证是否是聚合导致测试出问题
-        best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
-        # best_planes = before_best_guess_planes
+        # best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
 
-        # ==========================================
-        # 5. 通过边预测头得到边的断裂概率
-        # ==========================================
+        best_planes = before_best_guess_planes
 
-        # 渲染当前分辨率的第一次最佳深度图供 EdgeHead 使用
-        current_coarse_depth, _ = visualizer.render_from_planes(
+        # 渲染没有经过传播的 深度图和法向量图 后续用
+        no_prop_depth, no_propa_normal = visualizer.render_from_planes(
             best_planes.detach(),  # 注意 detach，不传导梯度
             tri_id_map,
             ref_intrinsics,
             depth_range=(depth_min, depth_max)
         )
+
+        # ==========================================
+        # 5. 通过边预测头得到边的断裂概率
+        # ==========================================
 
         # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
         edge_alphas = self.edge_head(
@@ -644,7 +684,7 @@ class PlanePatchMatchModule(nn.Module):
             intrinsics=ref_intrinsics  # [B, 3, 3] 相机内参
         )
 
-        # C. 转换为三角形级别格式 [B, N_max, 3]
+        # 转换为三角形级别格式 [B, N_max, 3]
         edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
             edge_alphas, tri_infos, max_tri_num, device
         )
@@ -656,38 +696,35 @@ class PlanePatchMatchModule(nn.Module):
         # torch.min(dim=2) 会同时返回最小值(values)和对应索引(indices)
         current_costs = tri_costs.min(dim=2)[0].unsqueeze(-1) # [B, N, 1]
 
+        # === 暴力测试：强行抹除所有边缘，让传播彻底放飞自我 ===
+        # edge_probs_for_prop = torch.zeros_like(edge_probs_tensor)
+
         for iter_idx in range(self.propagator_iter):
-            # 6.1 传播 得到
+            # 6.1 传播 得到新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
                 current_costs=current_costs,
                 neighbor_indices=neighbor_indices_batched,
-                edge_probs=edge_probs_tensor # 暂时不让边预测头互相影响，后续肯定会要做到互相影响
+                edge_probs=edge_probs_tensor.detach() # 暂时不让边预测头互相影响
             )
 
-            # 6.2 重新评估新平面的代价 (极其重要！)
-            # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
-            new_planes_k1 = new_planes.unsqueeze(2)
+            # 6.2 重新评估新平面的代价 (极其重要：在此处设立绝对的梯度防火墙！)
+            # 使用 torch.no_grad() 彻底阻断这一整块代码的梯度图构建
+            with torch.no_grad():
+                # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
+                new_planes_k1 = new_planes.unsqueeze(2)
 
-            # 将三角形平面广播到像素级
-            pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
+                # 将三角形平面广播到像素级
+                pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
 
-            # 计算像素代价
-            pixel_costs_new = self.compute_costs(
-                ref_feature, src_features, ref_proj, src_projs,
-                pixel_hypo, None, ref_intrinsics,is_debug=False
-            )
+                # 计算像素代价
+                pixel_costs_new = self.compute_costs(
+                    ref_feature, src_features, ref_proj, src_projs,
+                    pixel_hypo, None, ref_intrinsics, is_debug=False
+                )
 
-            # 重新聚合成三角形级代价 -> [B, N, 1]
-            tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
-            # todo：看看之后是否做一个判断，loss比之前高就不替换，不然则替换. 并且断裂概率是不是要做一个更新
-            # 🔥 极度关键：防止 NaN 和异常大值
-            if torch.isnan(tri_costs_new).any() or torch.isinf(tri_costs_new).any():
-                print(
-                    f"🚨🚨 [WARNING] NaN detected in propagated costs at iter {iter_idx}! Falling back to previous costs.")
-                tri_costs_new = current_costs  # 回滚，自保
-            else:
-                tri_costs_new = torch.clamp(tri_costs_new, -100.0, 100.0)  # 防止数值爆炸
+                # 重新聚合成三角形级代价 -> [B, N, 1]
+                tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
 
             # 6.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
@@ -720,23 +757,28 @@ class PlanePatchMatchModule(nn.Module):
         #     invalid_mask=invalid_mask
         # )
 
-        # ym-modify 目前的逻辑是假设一个三角的像素处于同一个平面
+        # 将最终平面分别转化为深度图和法向量图
+        # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
         final_depth, final_normal = visualizer.render_from_planes(
-            final_planes,
+            final_planes.detach(),
             tri_id_map,
             ref_intrinsics,
             depth_range=(depth_min, depth_max))
 
         # 组装输出 (PatchMatchNet 通常需要 List 格式)
         # todo:一个是刚拟合完毕的，另外一个是经过传播处理的
-        depth_samples = [current_coarse_depth,final_depth]  # List[[B, 2, H, W]]
-        # 拟合的初始平面
-        normal_samples= [before_best_guess_planes,final_normal]
+        depth_samples = [no_prop_depth,final_depth]  # List[[B, 2, H, W]]
+        # 法向量
+        normal_samples= [no_propa_normal,final_normal]
 
         # Score (Confidence) = -min_cost
         score = -torch.min(pixel_costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
 
-        return (depth_samples, score, view_weights,normal_samples,edge_alphas,
+        return (depth_samples, score,
+                view_weights,
+                normal_samples,
+                final_planes,
+                edge_alphas,
                 continuity_loss,continuity_s_loss)
 
     # ==========================================
@@ -892,14 +934,17 @@ class PlanePatchMatchModule(nn.Module):
             #     raw_fp = raw_sim[:, 1, ...].mean().item()
             #     raw_rnd = raw_sim[:, 2, ...].mean().item()
             #     print(f"✅ [Check Input] Raw SVD: {raw_svd:.4f} | FP: {raw_fp:.4f} | Rnd: {raw_rnd:.4f}")
+
+            # todo:暂时不用学习型
             # similarity 是 [B*K, G, H, W]，我们在 G 维度取平均
-            # score_i = similarity.mean(dim=1, keepdim=True)  # [B*K, 1, H, W]
+            score_i = similarity.mean(dim=1, keepdim=True)  # [B*K, 1, H, W]
 
 
             # --- E. 计算代价 (Cost Regression) --- ❌
             # similarity_net: [B*K, G, H, W] -> [B*K, 1, H, W]
             # cost 越小越好，correlation 越大越好，所以取负
-            score_i = self.similarity_net(similarity)
+
+            # score_i = self.similarity_net(similarity)
             cost_i = -score_i  # [B*K, 1, H, W]
 
             # ============debug专用========================
@@ -1712,19 +1757,19 @@ class DensePlaneFitter(nn.Module)   :
         # ==========[Hypothesis 1] 前向平行 (Fronto-Parallel)=====
         # 利用现成的 centroids[:, 2] (平均深度)
 
-        mean_depth = centroids[:, 2].view(B, max_num_triangles, 1, 1)
-
-        normal_fp = torch.zeros((B, max_num_triangles, 1, 3), device=device)
-        normal_fp[..., 2] = -1.0
-        d_fp = mean_depth  # d = z
-
-        hypo_fp = torch.cat([normal_fp, d_fp], dim=-1)  # [B, N, 1, 4]
-
-        # todo:用了前向平行平面，如果不用需要将这里注释，并且self.K - 2 变为 self.K - 1
-        hypo_list.append(hypo_fp)
+        # mean_depth = centroids[:, 2].view(B, max_num_triangles, 1, 1)
+        #
+        # normal_fp = torch.zeros((B, max_num_triangles, 1, 3), device=device)
+        # normal_fp[..., 2] = -1.0
+        # d_fp = mean_depth  # d = z
+        #
+        # hypo_fp = torch.cat([normal_fp, d_fp], dim=-1)  # [B, N, 1, 4]
+        #
+        # # todo:用了前向平行平面，如果不用需要将这里注释，并且self.K - 2 变为 self.K - 1
+        # hypo_list.append(hypo_fp)
 
         # ==========[Hypothesis 2+] 随机扰动 (Vectorized Jitter)======
-        num_random = self.K - 2
+        num_random = self.K - 1
         if num_random > 0:
             # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
             base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)

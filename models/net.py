@@ -210,11 +210,12 @@ class PatchmatchNet(nn.Module):
         continuity_loss = [] # 连续性损失
         continuity_s_loss = [] # 正则化损失，防止边断裂概率都为1
         output_plane={
+            'final_plane':[], # 最终结果平面 B,N,4
            'depth_stage1_pixels':[],# stage2放大后产生的深度图
-            'normal_pred':[], # stage1最终法向量
+            'normal_final':[], # 传播后stage1最终平面
             'tri_id_map':[],# 三角形id图
-            'depth_gt': [],  # 刚拟合完的深度值
-            'normal_gt': []  # 刚拟合完的法向量
+            'depth_no_pro': [],  # 刚拟合完的深度值
+            'normal_no_pro': []  # 刚拟合完的法向量
         }
         score = []
         
@@ -276,7 +277,7 @@ class PatchmatchNet(nn.Module):
                 self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,depth_max=depth_max)
 
 
-                (depth_samples, score, view_weights,normal_samples,edge_alphas,
+                (depth_samples, score, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
                  continuity_loss,continuity_s_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage2.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
@@ -297,24 +298,18 @@ class PatchmatchNet(nn.Module):
 
                 output_plane['tri_id_map'] = tri_id_map_tensor
 
-                # 刚拟合平面的初始状态，没进行传播
-                before_guess_planes = normal_samples[0]  # [B, N_tri, 4]
+                # stage2 产生的深度图放大后，patchmatch产生的深度图
+                output_plane['depth_stage1_pixels']=depth
+                # 经过传播得到的平面
+                output_plane['normal_final']=normal_samples[1]
+
+                # 没有进行传播得到的平面，刚拟合完的初始平面
+                # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
+                output_plane['depth_no_pro'] = depth_samples[0]
+                output_plane['normal_no_pro'] = normal_samples[0]
 
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
-
-                # 经过传播得到的平面
-                output_plane['depth_stage1_pixels']=depth # 目前放stage2 产生的深度图放大后
-                output_plane['normal_pred']=normal_samples[1]
-
-                # 进行planePatchMatch
-                visualizer = PlaneVisualizer(height, width, device)
-                # 没有进行传播得到的平面，刚拟合完的初始平面
-                output_plane['depth_gt'], output_plane['normal_gt'] = visualizer.render_from_planes(
-                    before_guess_planes.detach(),
-                    tri_id_map_tensor,
-                    ref_intrinsics.detach(),
-                    depth_range=(depth_min, depth_max))
 
                 # 生成gt-stage-1的三角平面深度图和法向量图
                 # plane_hypothesis_svd_gt = self.dense_plane_fitter.By_SVD_Plane(
@@ -332,6 +327,7 @@ class PatchmatchNet(nn.Module):
                 # output_plane['normal_gt'] = normal_gt_plane_stage_1
 
                 # planepatchmatch最终预测结果，里面也有两份一份用来上采样一份用来输出
+                depth_samples[0]=depth_samples[1]
                 depth = depth_samples
 
             
