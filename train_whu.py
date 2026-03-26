@@ -3,10 +3,10 @@ import os
 
 import math
 
-from models.sum_loss import *
+from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -145,7 +145,7 @@ print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in mo
 
 
 # main function
-def train():
+def  train():
     # 学习率调度器初始化
     milestones = [int(epoch_idx) for epoch_idx in args.lrepochs.split(':')[0].split(',')]
     lr_gamma = 1 / float(args.lrepochs.split(':')[1])
@@ -311,41 +311,32 @@ def compute_edge_supervision_loss(
     return loss_alpha_sup, loss_sparsity,gt_stage1_list
 
 def compute_edge_supervision_loss_new(
-        edge_label_generator,
         pred_alphas_list,
-        gt_depth_map,
+        gt_stage0_list,  # 从阶段 A 传来的高精度基础真值
+        valid_mask_list,  # 从阶段 A 传来的有效掩码
         tri_infos,
-        tri_id_map,
-        final_planes,  # [B, N, 4] 传播后的平面
-        ref_intrinsics,  # [B, 3, 3] 参考视角的内参
-        global_step,  # 当前步数
-        total_steps,  # 总步数
-        geom_threshold=0.2  # 几何真值的断裂阈值
+        final_planes,  # [B, N, 4] Stage 1 传播后的平面
+        ref_intrinsics,  # [B, 3, 3] 必须是 Stage 1 的内参
+        H, W,  # 必须是 Stage 1 的图像高宽
+        global_step,
+        total_steps,
+        geom_threshold=0.2
 ):
     """
-    封装边预测头 (EdgeHead) 的监督 Loss 计算全流程。
-    包含: 伪标签生成 -> Mask 过滤 -> 加权 BCE -> 稀疏性惩罚统计。
-    return: BCE_Loss, 稀疏性Loss, 混合后的真值列表(用于可视化)
+        纯粹的边预测头 (EdgeHead) 监督 Loss 计算与标签混合。
+        包含: 几何标签生成 -> 伯努利混合 -> 加权 BCE -> 稀疏性惩罚统计。
     """
-    # 1. 生成 Stage 1 伪真值标签和有效掩码
-    gt_stage1_list, valid_mask_list = edge_label_generator(
-        pred_alphas_list=pred_alphas_list,
-        gt_depth_map=gt_depth_map,
-        tri_infos=tri_infos,
-        tri_id_map=tri_id_map
-    )
 
     B = len(pred_alphas_list)
-    device = gt_depth_map.device  # 提前获取 device，避免后续报错
-
-    H, W = gt_depth_map.shape[-2:]
+    device = final_planes.device  # 提前获取 device，避免后续报错
 
     # 2. 课程学习权重计算 现在不逐渐放开权重，而是直接将以前的权重归0
     progress = global_step / total_steps
-    if progress < 0.3:
+    if progress < 0.4:
         weight_new = 0.0
     else:
-        weight_new = min((progress - 0.4) / 0.4, 1.0)
+        # weight_new = min((progress - 0.4) / 0.4, 1.0)
+        weight_new = 0.0
 
     weight_old = 1.0 - weight_new
 
@@ -366,7 +357,7 @@ def compute_edge_supervision_loss_new(
             continue
 
         valid_mask = valid_mask_list[b]
-        gt_old = gt_stage1_list[b]
+        gt_old = gt_stage0_list[b]
 
         total_sparsity_loss += pred_alphas.mean()
         valid_sparsity_count += 1
@@ -476,7 +467,7 @@ def compute_weighted_bce_core(preds, targets):
     if num_pos < 1.0:
         return F.binary_cross_entropy(preds, targets)
 
-    pos_weight = torch.clamp(num_neg / num_pos, min=1.0, max=10.0)
+    pos_weight = torch.clamp(num_neg / num_pos, min=1.0, max=25.0)
 
     loss_pos = - pos_weight * targets * torch.log(preds)
     loss_neg = - (1.0 - targets) * torch.log(1.0 - preds)
@@ -586,8 +577,29 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # EdgeConsistencyLoss（自监督 BCE）
     intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
     ref_intrinsics = intrinsics_s1[0]  # 参考视角的内参，形状必为 [B, 3, 3]
+
+    intrinsics_s0 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_0'].float(), 1)
+    ref_intrinsics_s0 = intrinsics_s0[0]  # [B, 3, 3]
+
     depth_threshold=0.4
-    edge_label_generator = EdgeLabelGenerator(depth_threshold=depth_threshold, sparsity_weight=1e-4)
+    edge_label_generator = EdgeLabelGenerator(relative_threshold=depth_threshold)
+
+
+    # ----------------------------------------------------
+    # 阶段 A：外部预生成 Stage 0 分辨率的基础伪标签
+    # ym-add 用原分辨率的图像来计算真值，使得真值更加的准确
+    # ----------------------------------------------------
+    gt_stage0_list, valid_mask_list = edge_label_generator(
+        pred_alphas_list=outputs["edge_alphas"],
+        gt_depth_map=depth_gt['stage_0'],  # Stage 0 的高清深度图
+        tri_infos=outputs["tri_infos"],
+        depth_min=sample_cuda["depth_min"],
+        depth_max=sample_cuda["depth_max"]
+    )
+
+    # ----------------------------------------------------
+    # 阶段 B：送入 Loss 函数进行动态混合和计算
+    # ----------------------------------------------------
 
     # loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss(
     #     edge_label_generator=edge_label_generator,
@@ -597,16 +609,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     #     tri_id_map=outputs["output_plane"]['tri_id_map'],
     # )
 
+    H1, W1 = depth_gt['stage_1'].shape[-2:]
     # 两段式边预测头损失
     loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss_new(
-        edge_label_generator=edge_label_generator,
         pred_alphas_list=outputs["edge_alphas"],
-        gt_depth_map=depth_gt[f'stage_1'],
+        gt_stage0_list=gt_stage0_list,
+        valid_mask_list=valid_mask_list,
         tri_infos=outputs["tri_infos"],
-        tri_id_map=outputs["output_plane"]['tri_id_map'],
-        final_planes=outputs["output_plane"]["final_plane"],  # 假设这是 Propagator 传播后的最终平面
-        ref_intrinsics=ref_intrinsics,
-        global_step=global_step,  # 你的训练主循环需要维护这两个变量
+        final_planes=outputs["output_plane"]["final_plane"],
+        ref_intrinsics=ref_intrinsics,  # Stage 1 内参
+        H=H1, W=W1,  # Stage 1 高宽
+        global_step=global_step,
         total_steps=total_steps,
         geom_threshold=depth_threshold
     )
@@ -624,21 +637,22 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 这个权重必须足够大，大到能抵消作弊带来的收益！如果 lambda_c * dist_error 大概是 0.5，那 lambda_s 至少要是 1.0 甚至 2.0
 
     # 一开始不启动连续性约束，后面再打开，目前是直接打开
-    lambda_c = 0.1
-    lambda_s = 1.0
+    max_lambda_c = 0.5
+    max_lambda_s = 1.0
     # lambda_c, lambda_s = max_lambda_c, max_lambda_s
 
-    # progress = global_step / total_steps
-    # if progress < 0.05:
+    progress = global_step / total_steps
+
+    if progress < 0.05:
+        lambda_c, lambda_s = 0.0, 0.0
+    else:  # ← 延长 warm-up 区间
+        lambda_c, lambda_s = max_lambda_c, max_lambda_s
+
+    # if progress < 0.02:
     #     lambda_c, lambda_s = 0.0, 0.0
-    # elif progress < 0.3:
-    #     # 阶段 2：余弦平滑放开期 (Cosine Warm-up)
-    #     linear_ratio = (progress - 0.05) / (0.3 - 0.05)
-    #
-    #     # 利用余弦公式将线性的 0~1 映射到平滑的 0~1 曲线
-    #     # math.cos(math.pi) 是 -1，math.cos(0) 是 1
+    # elif progress < 0.6:  # ← 延长 warm-up 区间
+    #     linear_ratio = (progress - 0.02) / (0.6 - 0.02)
     #     smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
-    #
     #     lambda_c = max_lambda_c * smooth_ratio
     #     lambda_s = max_lambda_s * smooth_ratio
     # else:
@@ -657,6 +671,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 边断裂损失
     loss.backward()
 
+    # todo：将梯度限制maxmax_norm以内
+    # ← 必须在这里，backward 之后才有梯度可以裁剪
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
 
@@ -670,7 +688,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     if do_summary_image:
         # ================ 生成断裂图 ===============================================
         image_outputs_pre = generate_edge_alpha_overlays(
-            ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+            ref_imgs=sample["imgs"]['stage_0'][:, 0],  # 注意取 ref 图
             edge_alphas_list=outputs["edge_alphas"],
             edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
             device=device,
@@ -681,7 +699,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         ref_img_edge_alpha_pre = image_outputs_pre["ref_img_edge_alpha"]
 
         image_outputs_gt = generate_edge_alpha_overlays(
-            ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 注意取 ref 图
+            ref_imgs=sample["imgs"]['stage_0'][:, 0],  # 注意取 ref 图
             edge_alphas_list=edge_alphas_gt,
             edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
             device=device,
@@ -737,7 +755,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             "patchmatch预测的stage1深度值": outputs["output_plane"]['depth_stage1_pixels'],
             # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
             # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
-            "ref_img": sample["imgs"]['stage_1'][:, 0],
+            "ref_img": sample["imgs"]['stage_0'][:, 0],
             # 新增：基于像素点的法向量图
             "根据深度真值生成的法向量": normal_gt_s1,
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,

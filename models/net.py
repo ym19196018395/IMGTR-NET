@@ -76,6 +76,7 @@ class Refinement(nn.Module):
         # depth map:[B,1,H/2,W/2]
         self.conv1 = ConvBnReLU(1, 8)
         self.conv2 = ConvBnReLU(8, 8)
+        # 转置卷积（反卷积）
         self.deconv = nn.ConvTranspose2d(8, 8, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False)
         
         self.bn = nn.BatchNorm2d(8)
@@ -95,7 +96,7 @@ class Refinement(nn.Module):
         # depth residual
         res = self.res(self.conv3(cat))
         del cat
-
+        # 上采样后的原始深度 + res 预测残差
         depth = F.interpolate(depth, scale_factor=2, mode="nearest") + res
         # convert the normalized depth back
         depth = depth * (depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1)) + depth_min.view(batch_size,1,1,1)
@@ -213,7 +214,8 @@ class PatchmatchNet(nn.Module):
             'final_plane':[], # 最终结果平面 B,N,4
            'depth_stage1_pixels':[],# stage2放大后产生的深度图
             'normal_final':[], # 传播后stage1最终平面
-            'tri_id_map':[],# 三角形id图
+            'tri_id_map':[],# 三角形stage1下的id图
+            'tri_id_map_stage0': [],  # 三角形stage1下的id图
             'depth_no_pro': [],  # 刚拟合完的深度值
             'normal_no_pro': []  # 刚拟合完的法向量
         }
@@ -274,7 +276,9 @@ class PatchmatchNet(nn.Module):
 
                 num_hypotheses=4
                 # 平面拟合
-                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,depth_max=depth_max)
+                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,
+                                                           depth_max=depth_max,
+                                                           depth_min=depth_min)
 
 
                 (depth_samples, score, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
@@ -293,10 +297,13 @@ class PatchmatchNet(nn.Module):
                 # 转化为tensor形式(B,H,W)
                 # 步骤1：去掉每个Tensor中长度为1的维度（把[1, H, W]转成[H, W]）
                 processed_list = [tensor.squeeze(0) for tensor in tri_infos[0]['tri_id_map']]
+                processed_list_stage0 = [tensor.squeeze(0) for tensor in tri_infos[0]['tri_id_map_stage0']]
                 # 步骤2：在第0维（batch维）堆叠，得到[B, H, W]
                 tri_id_map_tensor = torch.stack(processed_list, dim=0)
+                tri_id_map_stage0_tensor = torch.stack(processed_list_stage0, dim=0)
 
                 output_plane['tri_id_map'] = tri_id_map_tensor
+                output_plane['tri_id_map_stage0'] = tri_id_map_stage0_tensor
 
                 # stage2 产生的深度图放大后，patchmatch产生的深度图
                 output_plane['depth_stage1_pixels']=depth

@@ -184,6 +184,17 @@ class LearnedTrianglePropagator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
+        # ym-add,新增一个自己的门控网络来计算自身权重，而不是固定为1
+        self.self_gate_net = nn.Sequential(
+            nn.Linear(hidden_dim + 1, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        # 初始化：bias=2.0，让自身初始权重偏高（保守起步，不要一开始就乱传播）
+        nn.init.constant_(self.self_gate_net[2].bias, 2.0)
+        nn.init.zeros_(self.self_gate_net[2].weight)
+
         # 2. 门控网络 (Gating Network): 决定传播多少信息
         # hidden*2 (self+neigh)
         # + edge(1)
@@ -200,8 +211,8 @@ class LearnedTrianglePropagator(nn.Module):
         self.plane_head = nn.Linear(hidden_dim, 4)
 
         # 依然保持你的优秀习惯：残差网络零初始化
-        # nn.init.constant_(self.plane_head.bias, 0.0)
-        # nn.init.normal_(self.plane_head.weight, mean=0.0, std=0.001)
+        nn.init.constant_(self.plane_head.bias, 0.0)
+        nn.init.normal_(self.plane_head.weight, mean=0.0, std=0.001)
 
         nn.init.zeros_(self.plane_head.weight)
         nn.init.zeros_(self.plane_head.bias)
@@ -218,7 +229,7 @@ class LearnedTrianglePropagator(nn.Module):
         # nn.init.normal_(self.gate_net[2].weight, mean=0.0, std=0.01)
 
     def forward(self, current_planes, current_costs, neighbor_indices,
-                edge_probs,ref_feature=None):
+                edge_probs,area_confidence=None,ref_feature=None):
         """
         Args:
             current_planes: [B, N, 4]
@@ -295,7 +306,18 @@ class LearnedTrianglePropagator(nn.Module):
         final_weights = raw_weights * physics_guidance
 
 
-        # ==========================================
+        self_gate_input = torch.cat([hidden, current_costs], dim=-1)  # [B,N,H+1]
+        self_weight_raw = self.self_gate_net(self_gate_input)  # [B,N,1]
+
+        if area_confidence is not None:
+            # area_confidence: [B, N] → [B, N, 1]
+            # 面积小的三角形（噪点）自身权重被压低，迫使其接受邻居平面
+            area_conf = area_confidence.unsqueeze(-1).clamp(0.05, 1.0)  # [B,N,1]
+            self_weight = self_weight_raw * area_conf  # [B,N,1]
+        else:
+            self_weight = self_weight_raw
+
+            # ==========================================
         # 3. 软传播 (Weighted Aggregation)
         # ==========================================
         # 聚合邻居平面: Sum(w_i * p_i)
@@ -305,9 +327,14 @@ class LearnedTrianglePropagator(nn.Module):
         weighted_neighbor_planes = (final_weights * neighbor_planes).sum(dim=2)
         sum_weights = final_weights.sum(dim=2) + 1e-6
 
+        # 自身贡献
+        weighted_self_planes = self_weight * current_planes
+
         # 混合: (Sum_W * Neighbors + 1.0 * Self) / (Sum_W + 1.0)
         # 这种混合方式保证了数值稳定性
-        aggregated_planes = (weighted_neighbor_planes + current_planes) / (sum_weights + 1.0)
+        # 统一归一化（自身权重和邻居权重在同一分母下竞争）
+        total_w = (sum_weights + self_weight).clamp(min=1e-6)  # [B,N,1]
+        aggregated_planes = (weighted_neighbor_planes + weighted_self_planes) / total_w
 
         # 在加入残差前，必须让被平均拉短的法向量归一化一下，防止自身平面值因为聚合过于小了
         agg_n_raw = aggregated_planes[..., :3]
@@ -356,105 +383,315 @@ class LearnedTrianglePropagator(nn.Module):
 
         return final_planes
 
-    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs,aligned_midpoints_norm, intrinsics,H, W):
+    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs,aligned_midpoints_norm, intrinsics,
+                                H, W,depth_min,depth_max):
         """
-        纯粹的连续性损失 (C0 Continuity Loss) - 包含坐标反投影
+           基于逆深度的 C0 连续性损失 (防坍缩修正版)
 
-        Args:
-            planes: [B, N, 4] (n, d) 当前平面参数 (Camera Space)
-            neighbor_indices: [B, N, 3] 邻居索引
-            edge_probs: [B, N, 3] 边缘概率
-            aligned_midpoints_norm: [B, N, 3, 2] 完美对齐的边中点坐标，值域 [-1, 1]
-            intrinsics: [B, 3, 3] 相机内参矩阵
-        """
-        B, N, _, _ = aligned_midpoints_norm.shape
+           Args:
+               planes:                [B, N, 4]
+               neighbor_indices:      [B, N, 3] — 每个三角形3条边的对面三角形ID
+               edge_probs:            [B, N, 3] — EdgeHead 输出的断裂概率 (detach 后传入)
+               aligned_midpoints_norm:[B, N, 3, 2] — 每条边的归一化中点坐标
+               intrinsics:            [B, 3, 3]
+               H, W:                  图像尺寸
+           Returns:
+               continuity_loss (scalar), diagnostic_dict
+           """
+        B, N, K, _ = aligned_midpoints_norm.shape  # K=3
         device = planes.device
 
-        # ==========================================
-        # 0. 解除归一化: [-1, 1] -> 像素坐标 [0, W-1] / [0, H-1]
-        # ==========================================
-        midpoints_uv = torch.zeros_like(aligned_midpoints_norm)
-        midpoints_uv[..., 0] = (aligned_midpoints_norm[..., 0] + 1.0) / 2.0 * (W - 1)
-        midpoints_uv[..., 1] = (aligned_midpoints_norm[..., 1] + 1.0) / 2.0 * (H - 1)
+        # ============================================================
+        # Step 1: 像素坐标 + 齐次化
+        # ============================================================
+        px = (aligned_midpoints_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B,N,3]
+        py = (aligned_midpoints_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B,N,3]
+        ones = torch.ones_like(px)  # [B,N,3]
 
-        # ==========================================
-        # 1. 将像素坐标 (UV) 反投影回相机坐标 (XYZ)
-        # ==========================================
+        # [B, N, 3, 3] — 最后一维是 [u, v, 1]
+        uv_homo = torch.stack([px, py, ones], dim=-1)
 
-        # 1.1 构造齐次像素坐标 [B, N, 3, 3] -> (u, v, 1)
-        ones = torch.ones(B, N, 3, 1, device=device)
-        uv_homo = torch.cat([midpoints_uv, ones], dim=-1)
+        # ============================================================
+        # Step 2: 正确反投影为射线方向
+        # K_inv: [B,3,3] → [B,1,1,3,3] for broadcasting
+        # ============================================================
+        K_inv = torch.inverse(intrinsics)  # [B,3,3]
+        K_inv_exp = K_inv[:, None, None, :, :]  # [B,1,1,3,3]
+        uv_exp = uv_homo.unsqueeze(-1)  # [B,N,3,3,1]
 
-        # 1.2 计算归一化射线方向 (Ray Direction)
-        # K_inv * uv
-        # intrinsics: [B, 3, 3] -> [B, 1, 3, 3] -> inv
-        K_inv = torch.inverse(intrinsics).unsqueeze(1)  # [B, 1, 3, 3]
+        # K_inv @ [u,v,1]^T = ray_dir, shape: [B,N,3,3]
+        rays = (K_inv_exp @ uv_exp).squeeze(-1)  # [B,N,3,3]
 
-        # 矩阵乘法: K_inv @ uv_homo.T
-        # uv_homo: [B, N, 3, 3] -> permute -> [B, N, 3, 3, 1]
-        # 为了方便计算，我们把 dim=2 (3个顶点) 和 dim=1 (N个三角) 合并处理或者直接广播
-        # 这里使用 Einstein Summation 更加清晰:
-        # B: batch, n: num_tri, v: num_vert, i/j: matrix dims
-        rays = torch.einsum('blij,bnvj->bnvi', K_inv, uv_homo)  # [B, N, 3, 3]
+        # ============================================================
+        # Step 3: 当前平面在中点的深度
+        # planes: [B,N,4] → n:[B,N,3], d:[B,N,1]
+        # ============================================================
+        n_curr = planes[:, :, :3]  # [B,N,3]
+        d_curr = planes[:, :, 3:]  # [B,N,1]
 
-        # 1.3 利用平面方程求解深度 Z
-        # 平面方程: n * X + d = 0  =>  n * (Z * ray) + d = 0
-        # => Z * (n * ray) = -d
-        # => Z = -d / (n * ray)
+        # [B,N,1,3] × [B,N,3,3] → dot product → [B,N,3]
+        n_curr_exp = n_curr.unsqueeze(2)  # [B,N,1,3]
+        denom_curr = (n_curr_exp * rays).sum(dim=-1)  # [B,N,3]
+        denom_curr = torch.where(torch.abs(denom_curr) < 1e-6, torch.tensor(1e-6, device=device), denom_curr)
+        depth_curr = -d_curr / denom_curr  # [B,N,3]
 
-        # planes: [B, N, 4] -> n:[B, N, 1, 3], d:[B, N, 1, 1]
-        n_curr = planes[:, :, :3].unsqueeze(2)  # [B, N, 1, 3]
-        d_curr = planes[:, :, 3:].unsqueeze(2)  # [B, N, 1, 1]
+        # ============================================================
+        # Step 4: 邻居平面深度 (完全 detach，作为 target)
+        # ============================================================
+        batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, K)
+        # neighbor_planes: [B,N,3,4]
+        neighbor_planes = planes[batch_idx, neighbor_indices].detach()
 
-        # 分母: n * ray
-        denom = torch.sum(n_curr * rays, dim=-1, keepdim=True)  # [B, N, 3, 1]
+        n_neigh = neighbor_planes[..., :3]  # [B,N,3,3]
+        d_neigh = neighbor_planes[..., 3:]  # [B,N,3,1]
 
-        # 防止除零 (加上极小值)
-        denom = torch.where(torch.abs(denom) < 1e-6, torch.tensor(1e-6, device=device), denom)
+        denom_neigh = (n_neigh * rays).sum(dim=-1, keepdim=True)  # [B,N,3,1]
+        denom_neigh = torch.where(torch.abs(denom_neigh) < 1e-6, torch.tensor(1e-6, device=device), denom_neigh)
+        depth_neigh = (-d_neigh / denom_neigh).squeeze(-1)  # [B,N,3]
 
-        depth = -d_curr / denom  # [B, N, 3, 1] (每个顶点的深度)
+        # ============================================================
+        # Step 5: 深度范围保护 + 逆深度
+        # ============================================================
+        # depth_curr = depth_curr.clamp(min=depth_min, max=depth_max)
+        # depth_neigh = depth_neigh.clamp(min=depth_min, max=depth_max)
+        depth_curr = torch.abs(depth_curr)
+        depth_neigh = torch.abs(depth_neigh)
 
-        # 1.4 恢复相机坐标 XYZ
-        # XYZ = depth * ray
-        mid_points = rays * depth  # [B, N, 3, 3] (Camera Space XYZ)
+        inv_curr = 1.0 / depth_curr  # [B,N,3]
+        inv_neigh = 1.0 / depth_neigh  # [B,N,3]
 
-        # ==========================================
-        # 2. 计算连续性损失 (Discontinuity Loss)
-        # ==========================================
+        # ============================================================
+        # Step 6: 尺度不变的相对深度误差 (Relative Depth Error)
+        # 核心：彻底解决深远场景下的逆深度数值湮灭问题
+        # ============================================================
+        depth_diff = torch.abs(depth_curr - depth_neigh)
+        depth_sum = depth_curr + depth_neigh + 1e-6
 
-        # 获取邻居平面
-        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
-        neighbor_planes = planes[batch_idx, neighbor_indices]  # [B, N, 3, 4]
+        # relative_error 范围永远在 [0, 1) 之间
+        relative_error = depth_diff / depth_sum  # [B, N, 3]
 
-        n_neigh = neighbor_planes[..., :3]  # [B, N, 3, 3]
-        d_neigh = neighbor_planes[..., 3:]  # [B, N, 3, 1]
+        # ============================================================
+        # Step 7: Edge 门控
+        # 关键修正：
+        #   (a) edge_probs 必须在调用前已 detach，不参与本损失的梯度
+        #   (b) 用 (1 - prob) 而非 exp(-prob)，门控范围更清晰 [0,1]
+        #   (c) 自环边（边界，idx==自身）权重强制为 0
+        # ============================================================
+        gate = (1.0 - edge_probs)  # [B,N,3], edge_probs 应在外部 detach 传入
 
-        # 这里的逻辑：
-        # 我们用当前的平面恢复了 3D 点 (mid_points)，这说明 mid_points 一定完全满足当前平面方程。
-        # 现在的 Loss 是看这些点是否 *也满足* 邻居的平面方程。
+        # 自环边不施加连续性惩罚（边界天然不连续）
+        is_self_loop = (neighbor_indices == torch.arange(N, device=device)[None, :, None])
+        gate = gate.masked_fill(is_self_loop, 0.0)
 
-        # 代入邻居平面方程: | n_neigh * X_mid + d_neigh |
-        # mid_points: [B, N, 3, 3]
-        dot_val = torch.sum(n_neigh * mid_points, dim=-1, keepdim=True)  # [B, N, 3, 1]
+        # ============================================================
+        # Step 8: 聚合 —— 避免空三角形导致除零
+        # ============================================================
+        # 赋予一个合理的 loss 权重系数（建议 10.0）
+        # 这样算出来的 relative_error (一般在 0.01~0.1 级别)
+        # 乘上 10 之后，能落在 0.1~1.0 之间，与 depth_loss 匹配
+        continuity_scale = 10.0
+        weighted_error = relative_error * gate * continuity_scale
 
-        # 距离误差
-        dist_error = torch.abs(dot_val + d_neigh)  # [B, N, 3, 1]
-        dist_error = dist_error.squeeze(-1)  # [B, N, 3]
+        weight_sum = gate.sum().clamp(min=1.0)
+        continuity_loss = weighted_error.sum() / weight_sum
 
-        # ==========================================
-        # 3. Edge 门控与 Loss 聚合
-        # ==========================================
+        with torch.no_grad():
+            print(f"[PLANE DIVERSITY]"
+                  f" cont_loss_val={continuity_loss:.6f}"  # 法向量方差，如果接近0则全相同
+                  f" rel_error_mean={relative_error.mean():.6f}"  # 偏移量方差
+                  f" gate_mean={gate.mean():.6f}"
+                  f" weight_sum={weight_sum:.6f}"
+                  f" depth_curr_mean={depth_curr.mean():.4f}"
+                  f" depth_neigh_mean={depth_neigh.mean():.4f}")
 
-        # 权重: EdgeProb越大(边界)，权重越小
-        continuity_weight = torch.exp(-edge_probs)  # [B, N, 3]
+        return continuity_loss, 0.0
 
-        # 主 Loss，连续性损失 (受 EdgeProb 控制)
-        loss = (dist_error * continuity_weight).mean()
+    def compute_smoothness_loss(self, planes, planes_anchor, neighbor_indices, edge_probs,
+                                aligned_midpoints_norm, ref_feature,
+                                current_costs, pixel_counts_down,
+                                H, W, depth_min, depth_max):
+        """
+        置信度自适应弹性光滑性约束 v3（修正版）
 
-        # 正则项: 防止 EdgeProb 偷懒全输出 1
-        sparsity_loss = edge_probs.mean()
+        修正内容：
+          1. cost_conf：cost 为负值，越接近 0 越可信，修正了符号逻辑
+          2. w_feat：改为跨边两侧采样，计算边两侧的特征差异，物理意义正确
+          3. 修正 w_nd 的广播维度错误
 
-        return loss,sparsity_loss
+        Args:
+            planes:                [B, N, 4]  当前平面（有梯度）
+            planes_anchor:         [B, N, 4]  锚点平面（传播前 detach）
+            neighbor_indices:      [B, N, 3]
+            edge_probs:            [B, N, 3]  断裂概率（外部 detach 后传入）
+            aligned_midpoints_norm:[B, N, 3, 2]  每条边的归一化中点坐标 [-1,1]
+            ref_feature:           [B, C, Hf, Wf]  backbone 特征图
+            current_costs:         [B, N, 1]  光度匹配代价（负值，越接近0越好）
+            pixel_counts_down:     [B, N]     下采样后三角形像素数
+            H, W:                  Stage1 图像尺寸
+            depth_min/max:         [B] 或 float
+
+        Returns:
+            smooth_loss (scalar tensor)
+        """
+        B, N, K, _ = aligned_midpoints_norm.shape  # K=3
+        device = planes.device
+        C = ref_feature.shape[1]
+
+        batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, 3)
+
+        # ── d 统一缩放 ────────────────────────────────────────────────
+        d_scale = 200.0
+
+        def scale_planes(p):
+            return torch.cat([p[..., :3], p[..., 3:] / d_scale], dim=-1)
+
+        planes_s = scale_planes(planes)  # [B,N,4] 有梯度
+        anchor_s = scale_planes(planes_anchor.detach())  # [B,N,4] 无梯度
+
+        # ============================================================
+        # Step 1: W_nD 尺度矩阵（IMGTR Eq.7）
+        # W_nD = diag(Rd, Rd, Rd, 1)
+        # ============================================================
+        if isinstance(depth_min, torch.Tensor):
+            d_range = (depth_max - depth_min).view(B, 1)
+        else:
+            d_range = torch.full((B, 1), float(depth_max - depth_min),
+                                 dtype=torch.float32, device=device)
+
+        Rd = (d_range / d_scale).clamp(min=0.5, max=8.0)  # [B,1]
+
+        # w_nd: [B, 1, 4]，后续通过广播作用于 [B,N,3,4] 和 [B,N,4]
+        w_nd = torch.cat([
+            Rd.expand(B, 3),  # [B,3]  n 分量权重
+            torch.ones(B, 1, device=device)  # [B,1]  d 分量权重
+        ], dim=-1).unsqueeze(1)  # [B,1,4]
+
+        # ============================================================
+        # Step 2: 跨边特征差异权重
+        # 在边中点两侧各采样一个点，差异大→边界强→光滑权重低
+        # ============================================================
+        # epsilon：归一化坐标下约 1 个像素的偏移
+        eps_x = 2.0 / max(W - 1, 1)
+        eps_y = 2.0 / max(H - 1, 1)
+
+        mid = aligned_midpoints_norm  # [B,N,3,2]
+
+        # 沿 x 方向两侧偏移采样（也可以用 y 方向，x+y 更稳健但计算量翻倍）
+        mid_plus = mid.clone()
+        mid_minus = mid.clone()
+        mid_plus[..., 0] = (mid[..., 0] + eps_x).clamp(-1.0, 1.0)
+        mid_minus[..., 0] = (mid[..., 0] - eps_x).clamp(-1.0, 1.0)
+
+        def sample_feature(coords):
+            """
+            coords: [B, N, 3, 2]
+            返回 L2 归一化后的特征 [B, N, 3, C]
+            """
+            flat = coords.reshape(B, 1, N * K, 2)  # [B,1,N*3,2]
+            feat = F.grid_sample(
+                ref_feature, flat,
+                mode='bilinear', align_corners=True, padding_mode='border'
+            )  # [B, C, 1, N*3]
+            feat = feat.squeeze(2).permute(0, 2, 1)  # [B, N*3, C]
+            feat = feat.view(B, N, K, C)  # [B, N, 3, C]
+            return F.normalize(feat, p=2, dim=-1)  # [B, N, 3, C]
+
+        feat_plus = sample_feature(mid_plus)  # [B,N,3,C]
+        feat_minus = sample_feature(mid_minus)  # [B,N,3,C]
+
+        # 跨边特征差异幅度：差异大 → 该边是物体边界 → 不施加光滑约束
+        cross_diff = (feat_plus - feat_minus).norm(p=2, dim=-1)  # [B,N,3]
+
+        # 全局归一化到 [0,1]
+        cross_max = cross_diff.max().clamp(min=1e-6)
+        cross_norm = cross_diff / cross_max  # [B,N,3]
+
+        # 特征权重：差异越小（平坦区域）→ w_feat 越大 → 光滑惩罚越强
+        w_feat = (1.0 - cross_norm).clamp(0.0, 1.0)  # [B,N,3]
+
+        # ============================================================
+        # Step 3: EdgeHead 断裂门控
+        # ============================================================
+        gate_edge = (1.0 - edge_probs).clamp(min=0.0)  # [B,N,3]
+
+        is_boundary = (neighbor_indices ==
+                       torch.arange(N, device=device)[None, :, None])
+        gate_edge = gate_edge.masked_fill(is_boundary, 0.0)
+
+        # 综合光滑门控：特征差异小 AND 几何连续 才施加光滑约束
+        gate_smooth = w_feat * gate_edge  # [B,N,3]
+
+        # ============================================================
+        # Step 4: 光滑项——相邻平面参数差异（IMGTR Eq.7）
+        # ============================================================
+        plane_self = planes_s.unsqueeze(2).expand(-1, -1, 3, -1)  # [B,N,3,4]
+        plane_neigh = planes_s[batch_idx, neighbor_indices].detach()  # [B,N,3,4]
+        plane_diff = plane_self - plane_neigh  # [B,N,3,4]
+
+        # w_nd [B,1,4] → 广播到 [B,N,3,4]（通过 unsqueeze(2)）
+        smooth_err = ((plane_diff ** 2) * w_nd.unsqueeze(2)).sum(dim=-1)  # [B,N,3]
+        smooth_err = smooth_err.clamp(max=2.0)
+
+        # ============================================================
+        # Step 5: 弹性锚点置信度
+        #
+        # cost 约定：越接近 0 越好（当前值为负，如 -4.4 表示差，-0.5 表示好）
+        # 修正：cost_conf = (cost - cost_min) / (0 - cost_min)
+        #       cost_min 设为你实际 cost 的下界（比实际最低值再低一点）
+        # ============================================================
+        cost_min = -8.0  # 根据你的 debug 输出，cost 约在 [-5, 0]，给一点余量
+        cost_val = current_costs.squeeze(-1)  # [B,N]
+
+        # cost 越接近 0 → cost_conf 越高
+        cost_conf = ((cost_val - cost_min) / (0.0 - cost_min)).clamp(0.0, 1.0)  # [B,N]
+
+        # 面积置信度：下采样后像素数，小三角形置信度低
+        area_conf = (pixel_counts_down / 5.0).clamp(0.0, 1.0)  # [B,N]
+
+        # 综合置信度：两者相乘，任意一个低都削弱锚点
+        anchor_confidence = area_conf * cost_conf  # [B,N]
+
+        # alpha_anchor：最大 3（强锚点），最小 0（无锚点，允许被邻居同化）
+        alpha_anchor = anchor_confidence * 3.0  # [B,N]
+
+        # ============================================================
+        # Step 6: 锚点项
+        # ============================================================
+        anchor_diff = planes_s - anchor_s  # [B,N,4] 有梯度
+
+        # w_nd [B,1,4] → 广播到 [B,N,4]
+        anchor_err = ((anchor_diff ** 2) * w_nd).sum(dim=-1)  # [B,N]
+        anchor_err = anchor_err.clamp(max=2.0)
+
+        # ============================================================
+        # Step 7: 加权聚合
+        # ============================================================
+        # 光滑项
+        w_sum_smooth = gate_smooth.sum().clamp(min=1.0)
+        loss_smooth = (smooth_err * gate_smooth).sum() / w_sum_smooth
+
+        # 锚点项：排除 padding（像素数为 0 的三角形）
+        valid_tri = (pixel_counts_down > 0)  # [B,N]
+        anchor_w = alpha_anchor * valid_tri.float()  # [B,N]
+        w_sum_anchor = anchor_w.sum().clamp(min=1.0)
+        loss_anchor = (anchor_err * anchor_w).sum() / w_sum_anchor
+
+        total_loss = loss_smooth + loss_anchor
+
+        # ── 诊断 ─────────────────────────────────────────────────────
+        with torch.no_grad():
+            bad_ratio = (anchor_confidence < 0.1).float().mean()
+            print(f"[SMOOTH] total={float(total_loss):.5f}"
+                  f" smooth={float(loss_smooth):.5f}"
+                  f" anchor={float(loss_anchor):.5f}"
+                  f" w_feat={float(w_feat.mean()):.4f}"
+                  f" gate={float(gate_smooth.mean()):.4f}"
+                  f" bad_tri={float(bad_ratio):.3f}"
+                  f" anchor_conf={float(anchor_confidence.mean()):.3f}"
+                  f" cost_conf={float(cost_conf.mean()):.3f}"
+                  f" area_conf={float(area_conf.mean()):.3f}")
+
+        return total_loss
 
 class SimilarityNet(nn.Module):
     def __init__(self, G):
@@ -602,6 +839,25 @@ class PlanePatchMatchModule(nn.Module):
 
         ref_intrinsics = intrinsics_s1[0]
 
+        pixel_counts = []
+        for b in range(B):
+            counts = tri_infos[0]['tri_pixel_counts'][b].to(device)  # [N_b]
+            pad_len = max_tri_num - counts.shape[0]
+            if pad_len > 0:
+                counts = F.pad(counts, (0, pad_len), value=1.0)
+            pixel_counts.append(counts)
+
+        area_confidence_raw = torch.stack(pixel_counts, dim=0)  # [B, N_max]
+        # area_confidence = (area_confidence_raw / 5.0).clamp(0.05, 1.0)  # ← 阈值从30改为5
+
+        centroids_norm = self.fitter.collate_centroids_norm(
+            tri_infos[0]['centers_list'], device
+        )
+
+        # 在进入传播循环前，计算 pixel_costs
+        # 将特征从计算图中剥离，保护 FeatureNet 不受 Stage 1 毒害
+        src_features_detached = [f.detach() for f in src_features]
+
         # ==========================================
         # 2. 拟合与生成 (Fitting & Generation)，根据stage2预测深度来拟合生成假设平面
         # ==========================================
@@ -634,11 +890,12 @@ class PlanePatchMatchModule(nn.Module):
         # 计算所有假设的代价,计算了每个像素点的代价，但是后面会转化成一个个三角形所以不影响
         # costs: [B, H, W, K]
         pixel_costs = self.compute_costs(
-            ref_feature, src_features,
+            ref_feature.detach(), src_features_detached,
             ref_proj, src_projs,
             current_hypotheses,
             None,
-            ref_intrinsic=ref_intrinsics
+            ref_intrinsic=ref_intrinsics,
+            is_debug=False
         )
 
         # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
@@ -660,13 +917,13 @@ class PlanePatchMatchModule(nn.Module):
 
         # best_planes: [B, N_tri, 4] (更新后的三角形平面)
         # ym-debug 为了验证是否是聚合导致测试出问题
-        # best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
+        best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
 
-        best_planes = before_best_guess_planes
+        # best_planes = before_best_guess_planes
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
         no_prop_depth, no_propa_normal = visualizer.render_from_planes(
-            best_planes.detach(),  # 注意 detach，不传导梯度
+            best_planes.detach() ,  # 注意 detach，不传导梯度
             tri_id_map,
             ref_intrinsics,
             depth_range=(depth_min, depth_max)
@@ -696,35 +953,51 @@ class PlanePatchMatchModule(nn.Module):
         # torch.min(dim=2) 会同时返回最小值(values)和对应索引(indices)
         current_costs = tri_costs.min(dim=2)[0].unsqueeze(-1) # [B, N, 1]
 
-        # === 暴力测试：强行抹除所有边缘，让传播彻底放飞自我 ===
-        # edge_probs_for_prop = torch.zeros_like(edge_probs_tensor)
-
+        planes_anchor = current_planes.detach().clone()
         for iter_idx in range(self.propagator_iter):
+            # if(iter_idx==2):
+            #     # todo:之后可以微调边预测头，目前不要
+            #     edge_alphas = self.edge_head(
+            #         feat=ref_feature.detach(),
+            #         tri_infos=tri_infos,
+            #         tri_planes=current_planes.detach(),  # <--- 梯度防火墙
+            #         intrinsics=ref_intrinsics
+            #     )
+
             # 6.1 传播 得到新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
                 current_costs=current_costs,
                 neighbor_indices=neighbor_indices_batched,
                 edge_probs=edge_probs_tensor.detach() # 暂时不让边预测头互相影响
+
+            )
+            # 对传播进行一个保护
+            new_planes = fitter_module.enforce_depth_hard_constraint(
+                planes=new_planes,
+                centroids_norm=centroids_norm,
+                intrinsics=ref_intrinsics,
+                depth_min=depth_min,
+                depth_max=depth_max,
+                H=H, W=W
             )
 
             # 6.2 重新评估新平面的代价 (极其重要：在此处设立绝对的梯度防火墙！)
             # 使用 torch.no_grad() 彻底阻断这一整块代码的梯度图构建
-            with torch.no_grad():
-                # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
-                new_planes_k1 = new_planes.unsqueeze(2)
+            # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
+            new_planes_k1 = new_planes.unsqueeze(2)
 
-                # 将三角形平面广播到像素级
-                pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
+            # 将三角形平面广播到像素级
+            pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
 
-                # 计算像素代价
-                pixel_costs_new = self.compute_costs(
-                    ref_feature, src_features, ref_proj, src_projs,
-                    pixel_hypo, None, ref_intrinsics, is_debug=False
-                )
+            # 计算像素代价
+            pixel_costs_new = self.compute_costs(
+                ref_feature.detach(), src_features_detached, ref_proj, src_projs,
+                pixel_hypo, None, ref_intrinsics, is_debug=False
+            )
 
-                # 重新聚合成三角形级代价 -> [B, N, 1]
-                tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
+            # 重新聚合成三角形级代价 -> [B, N, 1]
+            tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
 
             # 6.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
@@ -733,18 +1006,42 @@ class PlanePatchMatchModule(nn.Module):
 
         final_planes = current_planes
 
+        edge_alphas = self.edge_head(
+            feat=ref_feature.detach(),
+            tri_infos=tri_infos,
+            tri_planes=current_planes.detach(),  # <--- 梯度防火墙
+            intrinsics=ref_intrinsics
+        )
+
         # ==========================================
         # 7. 渲染与输出和计算损失
         # ==========================================
 
-        continuity_loss, continuity_s_loss = 0,0
+        continuity_loss, continuity_s_loss = 0.0,0.0
         # continuity_loss,continuity_s_loss = self.propagator.compute_continuity_loss(
         #     planes=final_planes,
         #     neighbor_indices=neighbor_indices_batched,
         #     edge_probs=edge_probs_tensor.detach(),  # 不让其受影响
         #     aligned_midpoints_norm=aligned_midpoints_norm,
         #     intrinsics=ref_intrinsics,
-        #     H=H,W=W)
+        #     H=H,W=W,
+        #     depth_min=min(depth_min),depth_max=max(depth_max))
+
+
+
+        # 计算光滑性损失
+        # continuity_loss = self.propagator.compute_smoothness_loss(
+        #     planes=current_planes,
+        #     planes_anchor=planes_anchor,
+        #     neighbor_indices=neighbor_indices_batched,
+        #     edge_probs=edge_probs_tensor.detach(),
+        #     aligned_midpoints_norm=aligned_midpoints_norm,  # [B, N, 3, 2]
+        #     ref_feature=ref_feature,  # EdgeHead 里 proj 后的特征 [B,D,H,W]
+        #     current_costs=current_costs,  # [B,N_max,1]
+        #     pixel_counts_down=area_confidence_raw,  # [B,N_max] 下采样像素数（未clamp）
+        #     H=H, W=W,
+        #     depth_min=depth_min,
+        #     depth_max=depth_max)
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)
         invalid_mask = (tri_id_map < 0)
@@ -760,16 +1057,16 @@ class PlanePatchMatchModule(nn.Module):
         # 将最终平面分别转化为深度图和法向量图
         # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
         final_depth, final_normal = visualizer.render_from_planes(
-            final_planes.detach(),
+            final_planes,
             tri_id_map,
             ref_intrinsics,
             depth_range=(depth_min, depth_max))
 
         # 组装输出 (PatchMatchNet 通常需要 List 格式)
         # todo:一个是刚拟合完毕的，另外一个是经过传播处理的
-        depth_samples = [no_prop_depth,final_depth]  # List[[B, 2, H, W]]
+        depth_samples = [no_prop_depth.detach(),final_depth]  # List[[B, 2, H, W]]
         # 法向量
-        normal_samples= [no_propa_normal,final_normal]
+        normal_samples= [no_propa_normal.detach(),final_normal]
 
         # Score (Confidence) = -min_cost
         score = -torch.min(pixel_costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
@@ -1087,7 +1384,7 @@ class PlanePatchMatchModule(nn.Module):
         return tri_costs
 
 class DensePlaneFitter(nn.Module)   :
-    def __init__(self, height_s1, width_s1, device, num_hypotheses=3, perturbation_range=0.05, depth_max=None):
+    def __init__(self, height_s1, width_s1, device, num_hypotheses=3, perturbation_range=0.05, depth_max=None,depth_min=None):
         """
         拟合平面，并根据拟合平面生成假设
         Args:
@@ -1104,7 +1401,10 @@ class DensePlaneFitter(nn.Module)   :
         self.device = device
         self.K = max(2, num_hypotheses)  # 保证至少有 Best + FP
         self.noise_scale = perturbation_range
-        self.depth_max = depth_max # 这是对特别小的三角形进行的一个保底处理
+
+        # 这是对特别小的三角形进行的一个保底处理
+        self.depth_max = depth_max
+        self.depth_min = depth_min
 
         # 1. 生成 Stage 1 的像素坐标网格 (u, v)
         y_range = torch.arange(0, self.H, dtype=torch.float32, device=device)
@@ -1706,45 +2006,60 @@ class DensePlaneFitter(nn.Module)   :
         d_vals = -torch.sum(normals * centroids, dim=1, keepdim=True)
 
         # ==========================================================
-        # 3.5 异常三角平面处理 (Fallbacks) - 修复梯度报错版
-        # 我们不使用 if invalid_tris.any() 来做 in-place 修改,而是始终使用 torch.where 生成一个新的 tensor
+        # 3.5 🔥 新增：基于物理射线的异常三角平面过滤与替换 🔥
         # ==========================================================
-        invalid_tris = (counts < 3)
+        # 我们利用质心处的精确物理射线来检验拟合出的平面是否“爆炸”
 
-        # if invalid_tris.any():
-        #     # 1. 法向量设为指向相机 (0, 0, -1) 或者 (0, 0, 1) 取决于你的坐标系定义
-        #     # 假设: n=[0,0,-1], d=depth_max -> -1*z + d = 0 -> z = d
-        #     normals[invalid_tris] = torch.tensor([0.0, 0.0, -1.0], device=self.device)
-        #
-        #     # 2. d 值直接设为最大深度 (将平面推到最远背景处)
-        #     # 这样它的 Cost 会非常高，第一轮传播就会被邻居覆盖掉
-        #     d_vals[invalid_tris, 0] = min(self.depth_max)
+        with torch.no_grad():  # 校验掩码的生成不需要梯度
+            # 1. 构造从相机中心指向质心的射线方向
+            # centroid 本身就是相机坐标系下的 3D 点，所以它就是未归一化的射线方向
+            rays = centroids.clone()  # [Total, 3]
 
-        # 1. 准备 Fallback 的值
-        # 扩展成和 normals 一样的形状
-        fallback_n = torch.tensor([0.0, 0.0, -1.0], device=device, dtype=normals.dtype)
-        fallback_n = fallback_n.view(1, 3).expand_as(normals)
+            # 2. 射线与拟合平面求交，计算交点深度
+            # Z = -d * ray_z / (n \cdot ray)
+            denom = torch.sum(normals * rays, dim=1, keepdim=True)  # [Total, 1]
+            denom_safe = torch.where(denom.abs() < 1e-4, torch.full_like(denom, 1e-4), denom)
 
-        # 2. 准备 Mask
-        # invalid_tris 是 [Total], 需要变成 [Total, 3] 才能用于 where
-        mask_n = invalid_tris.unsqueeze(1).expand_as(normals)
+            # ray_z 就是 centroids[:, 2:3]
+            depth_est = (-d_vals * rays[:, 2:3] / denom_safe).abs()  # [Total, 1]
 
-        # 3. ✅ 使用 torch.where (Out-of-place)
-        # 如果 mask 为 True，取 fallback，否则保持原样
-        # 这会创建一个全新的 tensor，旧的 normals 保留用于梯度计算
-        normals = torch.where(mask_n, fallback_n, normals)
+            # 3. 判断是否为异常平面 (包含点数不足的情况)
+            # 兼容深度极值的类型
+            #  核心修复：兼容 depth_min/max 是 [B] 形状的 Tensor
+            if isinstance(self.depth_min, torch.Tensor):
+                # 将 [B] 扩展并 reshape 为 [Total, 1] 以对齐 depth_est
+                d_min_val = self.depth_min.view(B, 1).expand(B, max_num_triangles).reshape(total_bins, 1)
+                d_max_val = self.depth_max.view(B, 1).expand(B, max_num_triangles).reshape(total_bins, 1)
+            else:
+                # 兼容外部传入的是 list 或标量的情况
+                d_min_val = min(self.depth_min) if isinstance(self.depth_min, list) else float(self.depth_min)
+                d_max_val = max(self.depth_max) if isinstance(self.depth_max, list) else float(self.depth_max)
 
-        # --- 处理 d_vals ---
-        ## 1. 准备 Fallback d
-        max_d = min(self.depth_max) # 给一个保底值
-        fallback_d = torch.full_like(d_vals, max_d)
+            invalid_tris = (counts < 3).unsqueeze(1)  # 点数不足，必错 [Total, 1]
+            is_bad_geom = (depth_est < d_min_val * 0.5) | \
+                          (depth_est > d_max_val * 2.0) | \
+                          (~torch.isfinite(depth_est))  # 几何爆炸 [Total, 1]
 
-        ## 2. 准备 Mask [Total, 1]
-        mask_d = invalid_tris.unsqueeze(1)
+            is_invalid = invalid_tris | is_bad_geom  # [Total, 1]
 
-        ## 3. ✅ 使用 torch.where
-        d_vals = torch.where(mask_d, fallback_d, d_vals)
+            # (可选) 打印过滤日志
+            bad_ratio = is_invalid.float().mean()
+            if bad_ratio > 0.05:
+                print(f"[HYPO GEN] SVD 拟合拦截异常平面: {bad_ratio * 100:.2f}%")
 
+        # 4. 准备安全的 Fallback 平面 (前向平行平面)
+        # 遵守网络约定：法向强制指向相机 [0, 0, -1]
+        fallback_n = torch.zeros_like(normals)
+        fallback_n[:, 2] = -1.0  # [Total, 3]
+
+        # 截距：因为 nz 是 -1，所以 d = +Z
+        safe_z = centroids[:, 2:3].clone()  # [Total, 1]
+        safe_z = torch.where(counts.unsqueeze(1) < 3, d_max_val, safe_z)
+        fallback_d = safe_z  # [Total, 1]  <-- 注意这里没有负号了！
+
+        # 5. 使用 torch.where 执行安全的 Out-of-place 替换 (保持梯度连贯)
+        normals = torch.where(is_invalid.expand_as(normals), fallback_n, normals)
+        d_vals = torch.where(is_invalid, fallback_d, d_vals)
 
         # [Hypothesis 0] 原始拟合结果 [B, N, 1, 4]
         hypo_0 = torch.cat([normals, d_vals], dim=1).view(B, max_num_triangles, 1, 4)
@@ -1769,23 +2084,23 @@ class DensePlaneFitter(nn.Module)   :
         # hypo_list.append(hypo_fp)
 
         # ==========[Hypothesis 2+] 随机扰动 (Vectorized Jitter)======
-        num_random = self.K - 1
-        if num_random > 0:
-            # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
-            base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)
-            base_d = hypo_0[..., 3:].expand(-1, -1, num_random, -1)
-
-            # 生成噪声
-            rand_n = (torch.rand_like(base_n) - 0.5) * self.noise_scale * 2.0
-            # d 的扰动范围需要大一点
-            rand_d = (torch.rand_like(base_d) - 0.5) * self.noise_scale
-
-            # 应用噪声
-            new_n = F.normalize(base_n + rand_n, dim=-1)
-            new_d = base_d + rand_d
-
-            hypo_random = torch.cat([new_n, new_d], dim=-1)
-            hypo_list.append(hypo_random)
+        # num_random = self.K - 2
+        # if num_random > 0:
+        #     # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
+        #     base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)
+        #     base_d = hypo_0[..., 3:].expand(-1, -1, num_random, -1)
+        #
+        #     # 生成噪声
+        #     rand_n = (torch.rand_like(base_n) - 0.5) * self.noise_scale * 2.0
+        #     # d 的扰动范围需要大一点
+        #     rand_d = (torch.rand_like(base_d) - 0.5) * self.noise_scale
+        #
+        #     # 应用噪声
+        #     new_n = F.normalize(base_n + rand_n, dim=-1)
+        #     new_d = base_d + rand_d
+        #
+        #     hypo_random = torch.cat([new_n, new_d], dim=-1)
+        #     hypo_list.append(hypo_random)
 
         # 最终拼接 [B, N, K, 4]
         hypotheses = torch.cat(hypo_list, dim=2)
@@ -2138,6 +2453,161 @@ class DensePlaneFitter(nn.Module)   :
         d_vals = torch.tensor([-10.0], device=device).view(1, 1, 1).expand(B, max_tri, -1)
         return torch.cat([normals, d_vals], dim=-1)
 
+    def collate_centroids_norm(self,centroids_norm_list, device):
+        """
+        centroids_norm_list: List[B] of Tensor [N_b, 2]
+        返回: [B, N_max, 2]，不足 N_max 的位置用 0 填充
+        """
+        B = len(centroids_norm_list)
+        N_max = max(c.shape[0] for c in centroids_norm_list)
+
+        out = torch.zeros(B, N_max, 2, device=device)
+        for b, c in enumerate(centroids_norm_list):
+            N_b = c.shape[0]
+            out[b, :N_b, :] = c.to(device)
+
+        return out  # [B, N_max, 2]
+
+    def enforce_depth_hard_constraint(self,planes, centroids_norm, intrinsics, depth_min, depth_max, H, W):
+        """
+        对传播后的平面进行基于真实物理射线的深度硬截断保护。
+        利用广播机制完美兼容深度极值为 Tensor 或标量的情况。
+
+        Args:
+            planes: [B, N, 4] 需要校验的平面参数
+            centroids_norm: [B, N, 2] 三角形质心的归一化坐标 [-1, 1]
+            intrinsics: [B, 3, 3] 相机内参
+            depth_min/max: Tensor [B] 或标量/列表，场景的深度极值
+            H, W: 图像高宽
+
+        Returns:
+            planes_clean: [B, N, 4] 剔除爆炸参数后的安全平面
+        """
+        B, N, _ = planes.shape
+        device = planes.device
+
+        # ==========================================
+        # 1. 坐标还原与射线计算
+        # ==========================================
+        u_px = (centroids_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B, N]
+        v_px = (centroids_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B, N]
+        uv_homo = torch.stack([u_px, v_px, torch.ones_like(u_px)], dim=-1)  # [B, N, 3]
+
+        K_inv = torch.inverse(intrinsics)  # [B, 3, 3]
+        rays = torch.einsum('bij,bnj->bni', K_inv, uv_homo)  # [B, N, 3]
+
+        # ==========================================
+        # 2. 精确计算平面在质心处的物理深度
+        # ==========================================
+        n = planes[..., :3]  # [B, N, 3]
+        d = planes[..., 3:]  # [B, N, 1]
+
+        denom = (n * rays).sum(dim=-1, keepdim=True)  # [B, N, 1]
+        denom_safe = torch.where(denom.abs() < 1e-4, torch.full_like(denom, 1e-4), denom)
+        depth_est = (-d / denom_safe).abs()  # [B, N, 1]
+
+        # ==========================================
+        # 3. 动态处理边界极值与掩码判定
+        # ==========================================
+        if isinstance(depth_min, torch.Tensor):
+            d_min_val = depth_min.view(-1, 1, 1)  # [B, 1, 1] 方便广播
+            d_max_val = depth_max.view(-1, 1, 1)
+        else:
+            # 兼容 list 或单个数字
+            d_min_val = min(depth_min) if isinstance(depth_min, list) else float(depth_min)
+            d_max_val = max(depth_max) if isinstance(depth_max, list) else float(depth_max)
+
+        # 查杀异常值：容忍度 0.5倍 ~ 2.0倍
+        is_bad = (depth_est < d_min_val * 0.5) | \
+                 (depth_est > d_max_val * 2.0) | \
+                 (~torch.isfinite(depth_est))  # [B, N, 1]
+
+        # ==========================================
+        # 4. 构造安全前向平行平面 (规避 full_like 报错)
+        # ==========================================
+        replace_depth = (d_min_val + d_max_val) / 2.0
+
+        fp_n = torch.zeros_like(n)
+        fp_n[..., 2] = -1.0  # 🔥 修改 1：强制法向指向相机 (z 分量为 -1)
+
+        # 核心：因为方程是 n*P + d = 0，代入 n=[0,0,-1] 和 Z=replace_depth
+        # 得到 -replace_depth + d = 0，即 d = +replace_depth
+        fp_d = torch.zeros_like(d) + replace_depth  # 🔥 修改 2：d 取正值 (去掉减号)
+
+        fp_planes = torch.cat([fp_n, fp_d], dim=-1)  # [B, N, 4]
+
+        # ==========================================
+        # 5. 执行替换与防断流
+        # ==========================================
+        planes_clean = torch.where(is_bad.expand_as(planes), fp_planes, planes)
+
+        # 诊断输出（可注释掉，仅在极值爆发时提醒）
+        with torch.no_grad():
+            bad_ratio = is_bad.float().mean()
+            if bad_ratio > 0.05:
+                print(f"[HARD CONSTRAINT] 警告: 拦截了 {bad_ratio * 100:.2f}% 的数值崩溃平面！")
+
+        return planes_clean
+
+    def filter_invalid_planes(self,planes, depth_min, depth_max,
+                              centroids_norm, intrinsics, H, W):
+        """
+        修复svd拟合的平面
+        planes:          [B, N, 4]
+        centroids_norm:  [B, N, 2]  归一化坐标 [-1, 1]（来自 tri_infos）
+        intrinsics:      [B, 3, 3]
+        depth_min/max:   [B] 或 float
+        """
+        B, N, _ = planes.shape
+        device = planes.device
+
+        # [-1,1] → 像素坐标
+        u_px = (centroids_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B,N]
+        v_px = (centroids_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B,N]
+        ones = torch.ones_like(u_px)
+        uv_homo = torch.stack([u_px, v_px, ones], dim=-1)  # [B,N,3]
+
+        # 用 K_inv 得到射线方向（与 compute_continuity_loss 完全一致）
+        K_inv = torch.inverse(intrinsics)  # [B,3,3]
+        rays = torch.einsum('bij,bnj->bni', K_inv, uv_homo)  # [B,N,3]
+
+        # 计算深度
+        n = planes[..., :3]  # [B,N,3]
+        d = planes[..., 3:]  # [B,N,1]
+
+        denom = (n * rays).sum(dim=-1, keepdim=True)  # [B,N,1]
+        denom_safe = torch.where(denom.abs() < 1e-4,
+                                 torch.full_like(denom, 1e-4), denom)
+        depth_est = (-d / denom_safe).abs()  # [B,N,1]
+
+        # 异常掩码
+        d_min = depth_min.view(B, 1, 1) if isinstance(depth_min, torch.Tensor) \
+            else torch.full((B, 1, 1), depth_min, device=device)
+        d_max = depth_max.view(B, 1, 1) if isinstance(depth_max, torch.Tensor) \
+            else torch.full((B, 1, 1), depth_max, device=device)
+
+        is_invalid = (depth_est < d_min * 0.5) | \
+                     (depth_est > d_max * 2.0) | \
+                     (~torch.isfinite(depth_est))
+
+        # 替换为前向平行平面
+        valid_depth = depth_est.masked_fill(is_invalid, float('nan'))
+        batch_mean = valid_depth.nanmean(dim=1, keepdim=True)
+        fallback = (d_min + d_max) / 2.0
+        batch_mean = torch.where(torch.isnan(batch_mean), fallback, batch_mean)
+
+        fp_planes = torch.zeros_like(planes)
+        fp_planes[..., 2] = 1.0
+        fp_planes[..., 3:] = -batch_mean.expand(B, N, 1)
+
+        planes_clean = torch.where(is_invalid.expand_as(planes), fp_planes, planes)
+
+        with torch.no_grad():
+            ratio = is_invalid.float().mean()
+            if ratio > 0.005:
+                print(f"[FILTER] 异常平面 {ratio * 100:.2f}%")
+
+        return planes_clean, is_invalid.squeeze(-1)
 
 class PlaneVisualizer:
     def __init__(self, height, width, device):
@@ -2246,13 +2716,23 @@ class PlaneVisualizer:
                       (n_map[..., 1] * v_bar) + \
                       (n_map[..., 2] * 1.0)
 
-        dot_product[torch.abs(dot_product) < 1e-6] = 1e-6
+        valid_dot = torch.abs(dot_product) > 0.01  # [B,H,W]
+        dot_product = torch.where(
+            valid_dot,
+            dot_product,
+            torch.sign(dot_product + 1e-10) * 0.01  # 保留符号，限制最小绝对值
+        )
 
-        depth_map = -d_map / dot_product
+        depth_map = (-d_map / dot_product).abs()
 
-        # 解释：无论是平面法向反了(n -> -n)，还是点积反了，
-        # 我们都知道物体肯定在相机前面，所以直接要由距离的模长。
-        depth_map = depth_map.abs()
+
+        # dot_product[torch.abs(dot_product) < 1e-6] = 1e-6
+        #
+        # depth_map = -d_map / dot_product
+        #
+        # # 解释：无论是平面法向反了(n -> -n)，还是点积反了，
+        # # 我们都知道物体肯定在相机前面，所以直接要由距离的模长。
+        # depth_map = depth_map.abs()
 
         # ==========================================
         # 4. 数值截断 (Clamp) - 解决 900/160 问题
@@ -2271,12 +2751,21 @@ class PlaneVisualizer:
                     max_d = max_d.view(-1, 1, 1)
                 max_d = max_d.to(depth_map.device)
 
-            # 现在无论是 float 还是 Tensor[B,1,1]，clamp 都能处理
             depth_map = torch.clamp(depth_map, min=min_d, max=max_d)
+
+            # ── 修复：min_d 可能是 [B,1,1] tensor，不能直接 float() ──
+            # 用 expand_as 广播成与 depth_map 相同形状，再用 where 填充
+            if isinstance(min_d, torch.Tensor):
+                fill_val = min_d.expand_as(depth_map)
+            else:
+                fill_val = torch.full_like(depth_map, float(min_d))
+
+            depth_map = torch.where(valid_dot, depth_map, fill_val)
         else:
             # 即使没有给定范围，也要限制一下无穷大
             depth_map = torch.clamp(depth_map, max=600.0)
 
+        print(f"Depth Max: {depth_map.max().item()}, Dot Min: {dot_product.abs().min().item()}")
         # ym-needmodify
         fill_value = depth_map.mean()
 

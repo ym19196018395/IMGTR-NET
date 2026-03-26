@@ -39,7 +39,7 @@ python train_whu.py --dataset dtu_whu --batch_size 4 --epochs 10 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/train.txt --vallist lists/whu/test.txt \
---logdir ./checkpoints/tensorboard_train3 \
-2>&1 | tee txt_logs/${timestamp}_3_关闭连续性约束.log \
+--logdir ./checkpoints/tensorboard_cp \
+2>&1 | tee txt_logs/${timestamp}_cp_开启连续性约束.log \
  "$@"
 

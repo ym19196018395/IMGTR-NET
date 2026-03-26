@@ -69,8 +69,8 @@ class EdgeHead(nn.Module):
         # 因为后面有 logits = mlp_out * self.edge_scale (10.0)
         # 我们把 bias 设为 0.2，那么初始 logits 就是 0.2 * 10 = 2.0
         # sigmoid(2.0) ≈ 0.88，这意味着一开始 88% 的概率被认为是边缘（阻断传播）
-        nn.init.constant_(self.edge_mlp[4].bias, 0.2)
-        nn.init.normal_(self.edge_mlp[4].weight, mean=0.0, std=0.01)
+        # nn.init.constant_(self.edge_mlp[4].bias, 0.2)
+        # nn.init.normal_(self.edge_mlp[4].weight, mean=0.0, std=0.01)
 
 
     def _compute_analytical_depth_diff(self, midpoints_norm, planes_t1, planes_t2, intrinsics, H, W):
@@ -145,7 +145,7 @@ class EdgeHead(nn.Module):
 
         feat_proj = self.proj(feat)  # [B, D, H, W]
         output_alphas_list = []
-
+        # todo:后面改成并行运算
         for b in range(B):
             current_edges = tri_infos[0]['edges_list'][b].to(device)  # [E, 2]
             current_planes = tri_planes[b].to(device)  # [N_max, 4]
@@ -205,4 +205,104 @@ class EdgeHead(nn.Module):
 
         return output_alphas_list
 
+
+class EdgeLabelGenerator:
+    '''
+    通过跨边双点正交采样，来判断边是否断裂，专门针对于whudata数据集倾斜摄影
+    '''
+    def __init__(self, relative_threshold=0.05, pixel_step=1.0):
+        # relative_threshold: 允许的深度突变占总起伏的比例 (例如 5%)
+        self.relative_threshold = relative_threshold
+        self.pixel_step = pixel_step
+
+    def __call__(self, pred_alphas_list, gt_depth_map, tri_infos, depth_min, depth_max):
+        B = len(pred_alphas_list)
+        device = gt_depth_map.device
+        _, _, H0, W0 = gt_depth_map.shape
+
+        gt_labels_list = []
+        valid_mask_list = []
+
+        # 计算在 [-1, 1] 归一化坐标系下的单像素步长
+        step_u = self.pixel_step * (2.0 / W0)
+        step_v = self.pixel_step * (2.0 / H0)
+        step_tensor = torch.tensor([step_u, step_v], device=device).view(1, 2)  # [1, 2]
+
+        # 计算当前场景的有效起伏范围 (例如 530 - 500 = 30)
+        # 支持传入的可能是 Tensor 也可能是 float
+        d_min_val = min(depth_min) if isinstance(depth_min, list) else float(depth_min)
+        d_max_val = max(depth_max) if isinstance(depth_max, list) else float(depth_max)
+        scene_depth_range = max(d_max_val - d_min_val, 1.0)  # 防止除零
+
+        for b in range(B):
+            pred_alphas = pred_alphas_list[b]
+            E = pred_alphas.shape[0]
+
+            if E == 0:
+                gt_labels_list.append(torch.empty(0, device=device))
+                valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=device))
+                continue
+
+            # 1. 获取端点与中点
+            # endpoints: [E, 2, 2] (V1, V2)
+            endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
+            v1 = endpoints[:, 0, :]  # [E, 2]
+            v2 = endpoints[:, 1, :]  # [E, 2]
+
+            midpoints = (v1 + v2) / 2.0  # [E, 2]
+
+            # 2. 计算正交法向量 (Orthogonal Vector)
+            edge_vec = v2 - v1  # [E, 2]
+            # 顺时针/逆时针旋转90度: (x, y) -> (-y, x)
+            ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
+            ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)  # 归一化为单位向量 [E, 2]
+
+            # 3. 生成探测点 (Probe Points)
+            scaled_ortho = ortho_vec * step_tensor  # [E, 2]
+            probe_left = midpoints + scaled_ortho
+            probe_right = midpoints - scaled_ortho
+
+            # 限制在 [-1, 1] 范围内，防止越界
+            probe_left = probe_left.clamp(-1.0, 1.0)
+            probe_right = probe_right.clamp(-1.0, 1.0)
+
+            # 4. 采样 GT 深度
+            depth_b = gt_depth_map[b:b + 1]  # [1, 1, H0, W0]
+
+            # grid_sample 需要 shape [1, E, 1, 2]
+            depth_left = F.grid_sample(
+                depth_b, probe_left.view(1, E, 1, 2),
+                align_corners=True, padding_mode='border'
+            ).squeeze()  # [E]
+
+            depth_right = F.grid_sample(
+                depth_b, probe_right.view(1, E, 1, 2),
+                align_corners=True, padding_mode='border'
+            ).squeeze()  # [E]
+
+            # 5. 判定断裂与有效性
+            depth_diff = torch.abs(depth_left - depth_right)
+            # 除以场景的有效深度范围，而不是绝对深度之和
+            # 引入相对深度阈值
+            relative_diff = depth_diff / scene_depth_range
+
+            # 断裂判定：突变高度超过了场景总起伏的 5%
+            is_break = relative_diff > self.relative_threshold
+            labels = is_break.float()  # [E]
+
+            # 有效掩码：探测的两个点都必须有 GT 深度 (排除边界黑边干扰)
+            valid_mask = (depth_left > 1e-4) & (depth_right > 1e-4)
+
+            # --- 强制边界边断裂 ---
+            # 如果这条边只属于一个三角形 (边界边)，必须强制为断裂
+            current_edges = tri_infos[0]['edges_list'][b].to(device)
+            is_boundary = (current_edges[:, 0] == current_edges[:, 1])
+            labels[is_boundary] = 1.0
+            # 边界边不需要探测点必须有效，强制视为有效
+            valid_mask[is_boundary] = True
+
+            gt_labels_list.append(labels)
+            valid_mask_list.append(valid_mask)
+
+        return gt_labels_list, valid_mask_list
 

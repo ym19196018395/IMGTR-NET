@@ -1044,14 +1044,16 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
     tri_infos: list length B, 每项为 dict:
                 {
                     'batch_num_tri': int,三角形的数量
-                    'centroids': [B,n_tri,2] 每个三角形的质点
-                    'vertices': [B,n_tri,3,2] 每个三角形的顶点
+                    'centers_list': [B,n_tri,2] 每个三角形的质点
+                    'vertices_list': [B,n_tri,3,2] 每个三角形的顶点
                     'edges_list' :边两个邻接面，如果只有一个面，则是两个相等的面id
                     ‘edges_pixels’:进行了一个归一化处理边像素点集合
-                    'tri_id_map': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效) <--- 新增
+                    'tri_id_map': [B, H/2, W/2] 密集三角形索引图 (值域 0~N-1, -1为无效)
                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
                     'tri_edge_ids_list':每个三角形的边ID列表
                     'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
+                    'tri_pixel_counts_list':每个三角形的数量 # List[B] of [N_tri]
+                    'tri_id_map_stage0': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效)
                 }
     """
 
@@ -1063,11 +1065,19 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
     edges_pixels = []
     boundary_local_idxs_per_batch = []
     edges_midpoints_list=[] #边中点
+    edges_endpoints_list = []  # 边端点
 
-    # 新增：存储每个样本的 tri_id_map
+    # 存储每个样本的 tri_id_map 储存stage1 分辨率下的
     tri_id_maps_list = []
+
+    # 存储每个样本的 tri_id_map 储存stage0 分辨率下的
+    tri_id_maps_stage0_list=[]
+
     # ym-add-26.3.7 每个三角形的边ID列表
     tri_edge_ids_list = []
+
+    # ym-add-26.3.22 每个三角形在stage1的个数
+    tri_pixel_counts_list = []
 
     # 合并后的单次遍历
     for b in range(len(vertexs_batch)):
@@ -1112,6 +1122,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                 # 'valid_points': pts.cpu().numpy() 不需要这个了
             })
 
+
         # 转换为Tensor [N_tri, 3]
         if len(current_tri_edge_ids) > 0:
             tri_edge_ids_tensor = torch.from_numpy(
@@ -1129,6 +1140,8 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         # 转换为 Float 才能进 interpolate，但在 nearest 模式下数值不会变
         input_tensor = current_tri_id_map.unsqueeze(1).float()
 
+        tri_id_maps_stage0_list.append(current_tri_id_map)
+
         # warning: recompute_scale_factor=False 是为了兼容新版 PyTorch
         tri_id_map_down = F.interpolate(
             input_tensor,scale_factor=0.5,mode='nearest',recompute_scale_factor=False
@@ -1139,7 +1152,26 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         # 将下采样好的,map 加入列表
         tri_id_maps_list.append(tri_id_map_down)
 
+        # ======= 统计每个三角形的像素个数==============
+        tri_id_map_flat = tri_id_map_down.view(-1)  # [H/2 * W/2]
+        n_tri = len(triangles_batch[b])
+
+        # 用 bincount 一次性统计所有三角形的像素数
+        # 过滤掉 -1（无效区域）
+        valid_mask = tri_id_map_flat >= 0
+        valid_ids = tri_id_map_flat[valid_mask]
+
+        # bincount 得到每个三角形ID出现的次数
+        pixel_counts_down = torch.bincount(
+            valid_ids, minlength=n_tri
+        ).int()  # [n_tri]，每个三角形在下采样图里的像素数
+
+        # 加入 tri_infos
+        tri_pixel_counts_list.append(pixel_counts_down)
+
+        # ===============================================================
         # 3. 获取原始坐标的三角形信息 (不进行缩放)
+        # ===============================================================
         # 注意：这里我们传入 H, W 主要是为了 edge_pixels 的处理，vertex 不受 scale_ratio 影响
         tri_info = convert_to_tri_infos_normal_new(vertexs, lines, current_triangles_data, H, W, device, scale_ratio)
 
@@ -1162,7 +1194,10 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         #     prefix="stage1_tri_ids"
         # )
 
+        # ===============================================================
         # 4. 处理从 convert_to_tri_infos_normal 返回的数据
+        # ===============================================================
+
         centroids_py = tri_info['centroids']  # list of np.ndarray (2,) 原始坐标
         vertices_py = tri_info['vertices']  # list of np.ndarray (3,2) 原始坐标
         edges_py = tri_info['edges']  # list of dicts
@@ -1204,6 +1239,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         boundary_local_idxs = []
         current_pixels = []
         current_midpoints = []  # 收集当前batch的边中点
+        current_endpoints = []  # 新增：收集当前batch的边端点
 
         for i, ed in enumerate(edges_py):
             # 获取像素集合
@@ -1238,8 +1274,10 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
             if pts is not None:
                 p1, p2 = pts
                 current_midpoints.append([(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0])
+                current_endpoints.append([[p1[0], p1[1]], [p2[0], p2[1]]])  # 🔥 新增：收集原像素坐标下的端点
             else:
                 current_midpoints.append([0.0, 0.0])
+                current_endpoints.append([[0.0, 0.0], [0.0, 0.0]])  # 🔥 新增：保底防报错
                 raise RuntimeError(f"线段没有端点")
 
 
@@ -1257,10 +1295,18 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
             mid_np[:, 1] = (mid_np[:, 1] / div_h) * 2.0 - 1.0
 
             midpoints_tensor = torch.from_numpy(mid_np).to(device)
+
+            end_np = np.array(current_endpoints, dtype=np.float32)  # [E, 2, 2] (注意这里是3维)
+            # Numpy 的广播机制允许我们直接对最后一维(x, y)进行归一化
+            end_np[:, :, 0] = (end_np[:, :, 0] / div_w) * 2.0 - 1.0
+            end_np[:, :, 1] = (end_np[:, :, 1] / div_h) * 2.0 - 1.0
+            endpoints_tensor = torch.from_numpy(end_np).to(device)
         else:
             midpoints_tensor = torch.zeros((0, 2), dtype=torch.float32, device=device)
+            endpoints_tensor = torch.zeros((0, 2, 2), dtype=torch.float32, device=device)  # 🔥 新增：处理空边情况
 
         edges_midpoints_list.append(midpoints_tensor)
+        edges_endpoints_list.append(endpoints_tensor)  # 新增：将 tensor 放入 list 中
         edges_pixels.append(current_pixels)
         boundary_local_idxs_per_batch.append(boundary_local_idxs)
 
@@ -1273,9 +1319,12 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         'edges_list': edges_list,
         'edges_pixels': edges_pixels,
         'tri_id_map': tri_id_maps_list,
+        'tri_id_map_stage0':tri_id_maps_stage0_list,
         'boundary_local_idxs_per_batch': boundary_local_idxs_per_batch,
         'tri_edge_ids_list': tri_edge_ids_list,
-        'edges_midpoints': edges_midpoints_list # List[B] of [E, 2]
+        'edges_midpoints': edges_midpoints_list, # List[B] of [E, 2]
+        'edges_endpoints': edges_endpoints_list,  # List[B] of [E, 2, 2]
+        'tri_pixel_counts': tri_pixel_counts_list  # List[B] of [N_tri]
     })
 
     return new_tri_infos
