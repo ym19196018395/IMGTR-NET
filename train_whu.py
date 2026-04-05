@@ -5,6 +5,7 @@ import math
 
 from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
+from models.net import compute_normal_cosine_loss
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import torch
@@ -177,13 +178,13 @@ def  train():
                 save_images(logger, 'train', image_outputs, global_step)
 
             print(
-                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},'
-                'continuity_loss:{:.3f},continuity_s_loss:{:.3f}'
+                '\nEpoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},'
+                'continuity_loss:{:.3f},smoothness_loss:{:.3f},normal_loss:{:.3f}'
                 'total loss:{:.3f}, time = {:.3f}'.format(
                     epoch_idx, args.epochs, batch_idx,
                     len(TrainImgLoader),
                     loss_depth,loss_alpha_sup,
-                    scalar_outputs['continuity_loss'],scalar_outputs['continuity_s_loss'],
+                    scalar_outputs['continuity_loss'],scalar_outputs['smoothness_loss'],scalar_outputs['normal_loss'],
                     total_loss,time.time() - start_time))
 
             del scalar_outputs, image_outputs
@@ -453,8 +454,6 @@ def get_dynamic_loss_weights(global_step, total_steps):
     return weight_alpha, weight_cont, weight_spars
 
 
-
-
 def compute_weighted_bce_core(preds, targets):
     """
     纯粹的加权 BCE 计算核心 (防爆版)
@@ -467,7 +466,7 @@ def compute_weighted_bce_core(preds, targets):
     if num_pos < 1.0:
         return F.binary_cross_entropy(preds, targets)
 
-    pos_weight = torch.clamp(num_neg / num_pos, min=1.0, max=25.0)
+    pos_weight = torch.clamp(num_neg / num_pos, min=1.0, max=40.0)
 
     loss_pos = - pos_weight * targets * torch.log(preds)
     loss_neg = - (1.0 - targets) * torch.log(1.0 - preds)
@@ -518,6 +517,22 @@ def generate_geometric_edge_gt(final_planes, current_edges, midpoints_norm, intr
 
     return geom_targets
 
+
+def get_smooth_weight(progress, start_prog, end_prog, max_weight):
+    """
+    计算平滑过渡的权重 (Cosine Annealing)
+    在 start_prog 之前为 0，在 end_prog 之后为 max_weight。
+    中间区间呈 S 型平滑上升。
+    """
+    if progress <= start_prog:
+        return 0.0
+    if progress >= end_prog:
+        return max_weight
+
+    linear_ratio = (progress - start_prog) / (end_prog - start_prog)
+    smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
+    return max_weight * smooth_ratio
+
 def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     model.train()
@@ -553,10 +568,28 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 启用梯度异常检测
     # torch.autograd.set_detect_anomaly(True)
 
+    # 一开始不启动连续性约束和光滑性约束，后面再打开，目前是直接打开
+    progress = global_step / total_steps
+    # 连续性约束和光滑性约束权重
+    max_lambda_c = 100.0
+    max_lambda_s = 3.0
+    max_lambda_n = 0.3 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
+    weight_alpha = 1
+
+    # 1. 连通性约束 (Continuity, C0):
+    lambda_c = get_smooth_weight(progress, start_prog=0.2, end_prog=0.4, max_weight=max_lambda_c)
+
+    # 2. 光滑性约束 (Smoothness, C1):
+    lambda_s = get_smooth_weight(progress, start_prog=0.4, end_prog=0.6, max_weight=max_lambda_s)
+
+    # 3. 法向约束 (Normal Loss, Absolute Orientation):
+    lambda_n = get_smooth_weight(progress, start_prog=0.5, end_prog=0.7, max_weight=max_lambda_n)
+
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
-                    vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'])
+                    vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'],
+                    lambda_c,lambda_s)
 
     depth_est = outputs["refined_depth"]
 
@@ -581,9 +614,22 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     intrinsics_s0 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_0'].float(), 1)
     ref_intrinsics_s0 = intrinsics_s0[0]  # [B, 3, 3]
 
-    depth_threshold=0.4
-    edge_label_generator = EdgeLabelGenerator(relative_threshold=depth_threshold)
+    depth_threshold=0.3
+    edge_label_generator = EdgeLabelGenerator(pt2plane_threshold=depth_threshold)
 
+    # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
+    # 获取 Stage 1 的 GT 深度和 Mask
+    gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B,1, H, W]
+    gt_mask_s1 = mask['stage_1']  # 假设形状 [B, 1,H, W]
+
+    # 获取 Stage 1 的 预测 深度 (planepatchmatch最终预测结果)
+    pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B,H, W]
+
+    # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
+    gt_normals_math, gt_normals_vis = compute_normal_map_torch(depth_gt['stage_0'], ref_intrinsics_s0,mask=None, smooth=True)
+
+    # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
+    # normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
 
     # ----------------------------------------------------
     # 阶段 A：外部预生成 Stage 0 分辨率的基础伪标签
@@ -593,8 +639,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         pred_alphas_list=outputs["edge_alphas"],
         gt_depth_map=depth_gt['stage_0'],  # Stage 0 的高清深度图
         tri_infos=outputs["tri_infos"],
-        depth_min=sample_cuda["depth_min"],
-        depth_max=sample_cuda["depth_max"]
+        intrinsics=ref_intrinsics_s0,
+        gt_normal_map=gt_normals_math,
     )
 
     # ----------------------------------------------------
@@ -624,49 +670,31 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         geom_threshold=depth_threshold
     )
 
-    # =======================手动固定权重==================
+    # ====================================================
+    # 3. 损失函数的混合
+    # ====================================================
 
-    # 2.边缘监督 Loss
+    # 计算法向量损失
+    normal_loss = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
+                                             tri_id_map=outputs["output_plane"]['tri_id_map'],
+                                             gt_normals_math_s0=gt_normals_math,
+                                             depth_stage_1=depth_gt['stage_1'],
+                                             )
+    # 边缘监督 Loss
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
-    weight_alpha=5
+
     loss_alpha_sup=loss_alpha_raw * weight_alpha + loss_sparsity_raw
 
     # 3.连续性正则化 Loss (Geometric Smoothness)
     # 因为它是正则化项，绝不能喧宾夺主。建议权重设为 0.1 ~ 0.5
-    # 4. 稀疏性惩罚 Loss (防止作弊)
-    # 这个权重必须足够大，大到能抵消作弊带来的收益！如果 lambda_c * dist_error 大概是 0.5，那 lambda_s 至少要是 1.0 甚至 2.0
-
-    # 一开始不启动连续性约束，后面再打开，目前是直接打开
-    max_lambda_c = 0.5
-    max_lambda_s = 1.0
-    # lambda_c, lambda_s = max_lambda_c, max_lambda_s
-
-    progress = global_step / total_steps
-
-    if progress < 0.05:
-        lambda_c, lambda_s = 0.0, 0.0
-    else:  # ← 延长 warm-up 区间
-        lambda_c, lambda_s = max_lambda_c, max_lambda_s
-
-    # if progress < 0.02:
-    #     lambda_c, lambda_s = 0.0, 0.0
-    # elif progress < 0.6:  # ← 延长 warm-up 区间
-    #     linear_ratio = (progress - 0.02) / (0.6 - 0.02)
-    #     smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
-    #     lambda_c = max_lambda_c * smooth_ratio
-    #     lambda_s = max_lambda_s * smooth_ratio
-    # else:
-    #     lambda_c, lambda_s = max_lambda_c, max_lambda_s
-
-    # =======================动态权重衰减==================
-
-    # weight_alpha, lambda_c, lambda_s = get_dynamic_loss_weights(global_step, total_steps)
+    # 4.光滑性约束
 
     continuity_loss = outputs["continuity_loss"] * lambda_c
-    continuity_s_loss = outputs["continuity_s_loss"] * lambda_s
+    smoothness_loss = outputs["smoothness_loss"] * lambda_s
+    normal_loss = normal_loss * lambda_n
 
-    # 总损失：深度损失+边断裂损失+连续性损失
-    loss = loss_depth + loss_alpha_sup + continuity_loss + continuity_s_loss
+    # 总损失：深度损失+边断裂损失+连续性损失+光滑性约束
+    loss = loss_depth + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss
 
     # 边断裂损失
     loss.backward()
@@ -682,9 +710,14 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                       "loss_depth": loss_depth,
                       "loss_alpha_sup": loss_alpha_sup,
                       "continuity_loss":continuity_loss,
-                      "continuity_s_loss":continuity_s_loss}
+                      "smoothness_loss":smoothness_loss,
+                      "normal_loss":normal_loss}
 
     image_outputs = []
+
+    # ====================================================
+    # 4.可视化
+    # ====================================================
     if do_summary_image:
         # ================ 生成断裂图 ===============================================
         image_outputs_pre = generate_edge_alpha_overlays(
@@ -709,21 +742,6 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
         ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
 
-        # === 生成基于像素的法向量图 (使用上面定义的函数) ================================
-        # 获取 Stage 1 的 GT 深度和 Mask
-        gt_depth_s1 = depth_gt['stage_1']  # 假设形状 [B,1, H, W]
-        gt_mask_s1 = mask['stage_1']  # 假设形状 [B, 1,H, W]
-
-
-
-        # 获取 Stage 1 的 预测 深度 (planepatchmatch最终预测结果)
-        pred_depth_s1 = depth_patchmatch['stage_1'][-1]  # 假设形状 [B,H, W]
-
-        # 1. 生成 GT 法向量 (传入 mask 去除无效区域)
-        normal_gt_s1 = compute_normal_map_torch(gt_depth_s1, mask=gt_mask_s1, smooth=False)
-
-        # 2. 生成 预测 法向量 (同样传入 mask，或者你可以传入 threshold 后的 mask)
-        # normal_pred_s1 = compute_normal_map_torch(pred_depth_s1, mask=gt_mask_s1, smooth=False)
 
         # normal_gt_s1 = compute_normal_map_perspective(
         #     gt_depth_s1,
@@ -752,12 +770,12 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         image_outputs = {  # 暂时注释一些图片，输出的图片太多了
             "最终预测结果": depth_est['stage_0'] * mask['stage_0'],
             "stage1深度真值": depth_gt['stage_1'] ,
-            "patchmatch预测的stage1深度值": outputs["output_plane"]['depth_stage1_pixels'],
-            # "depth_patchmatch_stage_2": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
+            "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
+            "patchmatch预测的stage2深度值": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
             # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
             "ref_img": sample["imgs"]['stage_0'][:, 0],
             # 新增：基于像素点的法向量图
-            "根据深度真值生成的法向量": normal_gt_s1,
+            "根据深度真值生成的法向量": gt_normals_vis,
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图传播完
             "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_final'],

@@ -1646,95 +1646,96 @@ def check_tensor(name, t):
         raise RuntimeError(f"Inf found in {name}")
 
 
-def compute_normal_map_torch(depth_tensor, mask=None, smooth=True):
+def compute_normal_map_torch(depth_tensor, intrinsics, mask=None, smooth=True):
     """
-    在 GPU 上从深度图生成法向量图。
-
-    Args:
-        depth_tensor (torch.Tensor): 深度图，形状可以是 [B, 1, H, W] 或 [B, H, W]。
-                                     如果是 [B, 3, H, W]，会自动取第一个通道。
-        mask (torch.Tensor, optional): 有效像素掩码，形状同 depth_tensor。
-                                       无效区域的法向量会被置为 0 (黑色) 或特定颜色。
-        smooth (bool): 是否进行简单的高斯平滑以减少噪声（推荐 True）。
-
-    Returns:
-        normal_map (torch.Tensor): 形状 [B, 3, H, W]，数值范围 [0, 1]，用于 tensorboard 可视化。
+    (修复终极版) 在 GPU 上利用 3D 点云叉乘法，从深度图生成绝对精确的物理法向量。
     """
-    # 1. 维度处理
     if depth_tensor.dim() == 3:
-        depth_tensor = depth_tensor.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
-
+        depth_tensor = depth_tensor.unsqueeze(1)
     if depth_tensor.shape[1] == 3:
-        # 如果输入是 3 通道 (比如已经是 RGB 渲染)，取均值或单通道作为深度
         depth_tensor = depth_tensor.mean(dim=1, keepdim=True)
 
     B, C, H, W = depth_tensor.shape
     device = depth_tensor.device
 
-    # 2. 高斯平滑 (减少深度图噪声导致的法向量破碎)
+    # 1. 高斯平滑 (保留你的设计，这对对抗深度图噪声很有帮助)
     if smooth:
-        # 简单的 3x3 高斯核
         gaussian_kernel = torch.tensor([[1., 2., 1.],
                                         [2., 4., 2.],
                                         [1., 2., 1.]], device=device) / 16.0
         gaussian_kernel = gaussian_kernel.view(1, 1, 3, 3)
-        # Reflect pad 避免边缘伪影
         depth_tensor = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
         depth_tensor = F.conv2d(depth_tensor, gaussian_kernel)
 
-    # 3. 定义 Sobel 算子 (计算梯度 dz/dx, dz/dy)
-    sobel_x = torch.tensor([[-1., 0., 1.],
-                            [-2., 0., 2.],
-                            [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1., -2., -1.],
-                            [0., 0., 0.],
-                            [1., 2., 1.]], device=device).view(1, 1, 3, 3)
+    # =======================================================
+    # 2. 🚀 核心重构：反投影到 3D 点云 (绝对物理空间)
+    # =======================================================
+    v, u = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    u = u.view(1, 1, H, W).float()
+    v = v.view(1, 1, H, W).float()
 
-    # 4. 计算梯度
-    # Padding 保证尺寸不变
-    depth_pad = F.pad(depth_tensor, (1, 1, 1, 1), mode='reflect')
-    dzdx = F.conv2d(depth_pad, sobel_x)
-    dzdy = F.conv2d(depth_pad, sobel_y)
+    fx = intrinsics[:, 0, 0].view(B, 1, 1, 1)
+    fy = intrinsics[:, 1, 1].view(B, 1, 1, 1)
+    cx = intrinsics[:, 0, 2].view(B, 1, 1, 1)
+    cy = intrinsics[:, 1, 2].view(B, 1, 1, 1)
 
-    # 5. 构造法向量 (-dz/dx, -dz/dy, 1)
-    # 注意：这里 Z 轴设为 1，如果你想要更强的凹凸感，可以把 dzdx, dzdy 乘以一个系数 (sensitivity)
-    normal_x = -dzdx
-    normal_y = -dzdy
-    normal_z = torch.ones_like(normal_x)
+    X = (u - cx) * depth_tensor / fx
+    Y = (v - cy) * depth_tensor / fy
+    Z = depth_tensor
 
-    # 堆叠通道 [B, 3, H, W]
-    normals = torch.cat([normal_x, normal_y, normal_z], dim=1)
+    # 构造 3D 坐标张量: [B, 3, H, W]
+    P_3D = torch.cat([X, Y, Z], dim=1)
 
-    # 6. 归一化 (Normalize)
-    # norm = sqrt(x^2 + y^2 + z^2)
-    norm = torch.norm(normals, dim=1, keepdim=True)
-    # 避免除 0
-    normals = normals / (norm + 1e-8)
+    # =======================================================
+    # 3. 提取空间切线向量 (Tangent Vectors)
+    # =======================================================
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3, 3)
 
-    # 7. 映射到 [0, 1] 区间用于可视化
-    # 原范围 [-1, 1] -> 新范围 [0, 1]
-    # RGB 对应关系: R:X(左右), G:Y(上下), B:Z(指向相机)
-    normal_map = (normals + 1.0) / 2.0
+    # 扩展为 depthwise 卷积核 (处理 3 个通道 X, Y, Z)
+    sobel_x_3 = sobel_x.repeat(3, 1, 1, 1)
+    sobel_y_3 = sobel_y.repeat(3, 1, 1, 1)
 
-    # normals_vis = normals.clone()
-    # normals_vis[:, 2, :, :] = -normals_vis[:, 2, :, :]  # 翻转 Z 用于显示
-    # normal_map = (normals_vis + 1.0) / 2.0
+    P_pad = F.pad(P_3D, (1, 1, 1, 1), mode='reflect')
 
-    # 8. 应用 Mask (如果有)
+    # 切线向量 dP/du 和 dP/dv
+    # 注：除以 8.0 还原真实导数量级 (在叉乘归一化后其实会消掉，但保持严格物理量纲是好习惯)
+    dP_du = F.conv2d(P_pad, sobel_x_3, groups=3) / 8.0
+    dP_dv = F.conv2d(P_pad, sobel_y_3, groups=3) / 8.0
+
+    # =======================================================
+    # 4. 叉乘求法向 & 视角消歧
+    # =======================================================
+    # u方向(右) 叉乘 v方向(下) 得到 Z方向(向里/远离相机)
+    normals_math = torch.cross(dP_du, dP_dv, dim=1)
+    normals_math = F.normalize(normals_math, p=2, dim=1)
+
+    # 强制物理消歧：法向量必须朝向相机 (Z < 0)
+    normals_math = normals_math * torch.sign(-normals_math[:, 2:3, :, :])
+
+    # 防除零容错
+    zero_mask = (normals_math[:, 2:3, :, :] == 0.0).float()
+    normals_math = normals_math + zero_mask * 1e-6
+    normals_math = F.normalize(normals_math, p=2, dim=1)
+
+    # =======================================================
+    # 5. 构造可视化图 & Mask
+    # =======================================================
+    normals_vis = normals_math.clone()
+    normals_vis[:, 2, :, :] = -normals_vis[:, 2, :, :]  # 翻转 Z
+    normals_vis[:, 1, :, :] = -normals_vis[:, 1, :, :]  # 翻转 Y
+    normal_vis_map = (normals_vis + 1.0) / 2.0
+
     if mask is not None:
-        if mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-        if mask.shape[1] == 3:  # 如果 mask 是 3 通道，取单通道
-            mask = mask[:, :1, :, :]
+        if mask.dim() == 3: mask = mask.unsqueeze(1)
+        if mask.shape[1] == 3: mask = mask[:, :1, :, :]
+        if mask.shape[-2:] != normal_vis_map.shape[-2:]:
+            mask = F.interpolate(mask.float(), size=normal_vis_map.shape[-2:], mode='nearest')
 
-        # 确保 mask 大小匹配 (防止上采样带来的细微尺寸差异)
-        if mask.shape[-2:] != normal_map.shape[-2:]:
-            mask = F.interpolate(mask.float(), size=normal_map.shape[-2:], mode='nearest')
+        normals_math = normals_math * mask
+        normal_vis_map = normal_vis_map * mask
 
-        # 将无效区域设为黑色 (0,0,0) 或者灰色 (0.5, 0.5, 0.5)
-        normal_map = normal_map * mask
-
-    return normal_map
+    return normals_math, normal_vis_map
 
 def compute_normal_map_perspective(depth_tensor, intrinsics, mask=None, smooth=True):
     """

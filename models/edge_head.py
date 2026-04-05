@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,7 +50,7 @@ class EdgeHead(nn.Module):
         #   - Depth Diff (1 dim)
         #   - Normals (3+3=6 dims) -> T1 normal, T2 normal
         #   - Edge Feature (tri_feat_dim) -> 中点处的图像特征
-        self.edge_stat_dim = 1 + 6
+        self.edge_stat_dim = 1
         mlp_in = tri_feat_dim + self.edge_stat_dim
 
         self.edge_mlp = nn.Sequential(
@@ -173,9 +174,9 @@ class EdgeHead(nn.Module):
             depth_diff = torch.clamp(depth_diff, max=500.0)
 
             # --- Step C: 整合法向量 ---
-            n1 = planes_t1[:, :3]
-            n2 = planes_t2[:, :3]
-            normal_feat = torch.cat([n1, n2], dim=1)  # [E, 6]
+            # n1 = planes_t1[:, :3]
+            # n2 = planes_t2[:, :3]
+            # normal_feat = torch.cat([n1, n2], dim=1)  # [E, 6]
 
             # --- Step D: 单点采样边特征 ---
             # 直接提取中点这 1 个点的特征，利用 CNN 自带感受野，避免越界污染
@@ -185,7 +186,7 @@ class EdgeHead(nn.Module):
             ).view(feat_proj.shape[1], num_edges).permute(1, 0)  # [E, D]
 
             # --- Step E: MLP 预测 ---
-            mlp_input = torch.cat([edge_feats, normal_feat, depth_diff], dim=1)  # [E, D+6+1]
+            mlp_input = torch.cat([edge_feats, depth_diff], dim=1)  # [E, D+6+1]
 
             logits = self.edge_mlp(mlp_input).squeeze(1) * self.edge_scale
             alphas = torch.sigmoid(logits)  # [E]
@@ -208,88 +209,112 @@ class EdgeHead(nn.Module):
 
 class EdgeLabelGenerator:
     '''
-    通过跨边双点正交采样，来判断边是否断裂，专门针对于whudata数据集倾斜摄影
+    终极版：专门针对 C0 连续性（深度遮挡断裂）的伪标签生成器
+    采用 Point-to-Plane 物理垂直距离判定，完美免疫倾斜墙面，
+    并将 C1 连续性（法向折痕）的阻断任务完全交由传播模块的 gate_net 自适应学习。
     '''
-    def __init__(self, relative_threshold=0.05, pixel_step=1.0):
-        # relative_threshold: 允许的深度突变占总起伏的比例 (例如 5%)
-        self.relative_threshold = relative_threshold
+
+    def __init__(self, pt2plane_threshold=0.4, pixel_step=1.25):
+        # 绝对物理阈值：点到平面垂直距离（单位通常为米）
+        # 0.4 米足以抓出遮挡边缘（如车顶到地面），同时放过平滑的斜面和连通的折痕
+        self.pt2plane_threshold = pt2plane_threshold
         self.pixel_step = pixel_step
 
-    def __call__(self, pred_alphas_list, gt_depth_map, tri_infos, depth_min, depth_max):
-        B = len(pred_alphas_list)
+    def __call__(self, pred_alphas_list, gt_depth_map, tri_infos, intrinsics, gt_normal_map):
+        B, _, H0, W0 = gt_depth_map.shape
         device = gt_depth_map.device
-        _, _, H0, W0 = gt_depth_map.shape
 
         gt_labels_list = []
         valid_mask_list = []
 
-        # 计算在 [-1, 1] 归一化坐标系下的单像素步长
         step_u = self.pixel_step * (2.0 / W0)
         step_v = self.pixel_step * (2.0 / H0)
-        step_tensor = torch.tensor([step_u, step_v], device=device).view(1, 2)  # [1, 2]
-
-        # 计算当前场景的有效起伏范围 (例如 530 - 500 = 30)
-        # 支持传入的可能是 Tensor 也可能是 float
-        d_min_val = min(depth_min) if isinstance(depth_min, list) else float(depth_min)
-        d_max_val = max(depth_max) if isinstance(depth_max, list) else float(depth_max)
-        scene_depth_range = max(d_max_val - d_min_val, 1.0)  # 防止除零
+        step_tensor = torch.tensor([step_u, step_v], device=device).view(1, 2)
 
         for b in range(B):
             pred_alphas = pred_alphas_list[b]
             E = pred_alphas.shape[0]
 
+            # 防御性编程：如果没有边，直接返回空 Tensor
             if E == 0:
                 gt_labels_list.append(torch.empty(0, device=device))
                 valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=device))
                 continue
 
             # 1. 获取端点与中点
-            # endpoints: [E, 2, 2] (V1, V2)
             endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
             v1 = endpoints[:, 0, :]  # [E, 2]
             v2 = endpoints[:, 1, :]  # [E, 2]
-
             midpoints = (v1 + v2) / 2.0  # [E, 2]
 
             # 2. 计算正交法向量 (Orthogonal Vector)
             edge_vec = v2 - v1  # [E, 2]
             # 顺时针/逆时针旋转90度: (x, y) -> (-y, x)
             ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
-            ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)  # 归一化为单位向量 [E, 2]
+            ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)  # [E, 2]
 
-            # 3. 生成探测点 (Probe Points)
+            # 3. 生成探测点 (Probe Points) 并防越界
             scaled_ortho = ortho_vec * step_tensor  # [E, 2]
-            probe_left = midpoints + scaled_ortho
-            probe_right = midpoints - scaled_ortho
+            probe_left = (midpoints + scaled_ortho).clamp(-1.0, 1.0)
+            probe_right = (midpoints - scaled_ortho).clamp(-1.0, 1.0)
 
-            # 限制在 [-1, 1] 范围内，防止越界
-            probe_left = probe_left.clamp(-1.0, 1.0)
-            probe_right = probe_right.clamp(-1.0, 1.0)
+            # --- 提取当前 Batch 的内参 ---
+            curr_K = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
+            fx, fy = curr_K[0, 0], curr_K[1, 1]
+            cx, cy = curr_K[0, 2], curr_K[1, 2]
 
-            # 4. 采样 GT 深度
+            # --- 采样深度和法向 ---
             depth_b = gt_depth_map[b:b + 1]  # [1, 1, H0, W0]
+            normal_b = gt_normal_map[b:b + 1]  # [1, 3, H0, W0]
 
-            # grid_sample 需要 shape [1, E, 1, 2]
-            depth_left = F.grid_sample(
-                depth_b, probe_left.view(1, E, 1, 2),
-                align_corners=True, padding_mode='border'
-            ).squeeze()  # [E]
+            # 🔥 安全维度处理：使用 view() 和 permute() 保证 E=1 时不会崩溃
+            depth_left = F.grid_sample(depth_b, probe_left.view(1, E, 1, 2), align_corners=True).view(E)
+            depth_right = F.grid_sample(depth_b, probe_right.view(1, E, 1, 2), align_corners=True).view(E)
 
-            depth_right = F.grid_sample(
-                depth_b, probe_right.view(1, E, 1, 2),
-                align_corners=True, padding_mode='border'
-            ).squeeze()  # [E]
+            normal_left = F.grid_sample(normal_b, probe_left.view(1, E, 1, 2), align_corners=True).view(3, E).permute(1,
+                                                                                                                      0)
+            normal_right = F.grid_sample(normal_b, probe_right.view(1, E, 1, 2), align_corners=True).view(3, E).permute(
+                1, 0)
 
-            # 5. 判定断裂与有效性
-            depth_diff = torch.abs(depth_left - depth_right)
-            # 除以场景的有效深度范围，而不是绝对深度之和
-            # 引入相对深度阈值
-            relative_diff = depth_diff / scene_depth_range
+            # =======================================================
+            # 核心降维打击：计算 3D 点坐标 (X, Y, Z)
+            # =======================================================
+            # 把 [-1, 1] 的坐标转回像素坐标 [0, W0-1]
+            u_left = (probe_left[:, 0] + 1.0) / 2.0 * (W0 - 1)
+            v_left = (probe_left[:, 1] + 1.0) / 2.0 * (H0 - 1)
+            u_right = (probe_right[:, 0] + 1.0) / 2.0 * (W0 - 1)
+            v_right = (probe_right[:, 1] + 1.0) / 2.0 * (H0 - 1)
 
-            # 断裂判定：突变高度超过了场景总起伏的 5%
-            is_break = relative_diff > self.relative_threshold
-            labels = is_break.float()  # [E]
+            # 射线反投影
+            X_L = (u_left - cx) * depth_left / fx
+            Y_L = (v_left - cy) * depth_left / fy
+            P_left = torch.stack([X_L, Y_L, depth_left], dim=1)  # [E, 3]
 
+            X_R = (u_right - cx) * depth_right / fx
+            Y_R = (v_right - cy) * depth_right / fy
+            P_right = torch.stack([X_R, Y_R, depth_right], dim=1)  # [E, 3]
+
+            # =======================================================
+            # 唯一判定: 真正的遮挡断层 (Point-to-Plane Distance)
+            # =======================================================
+            vec_L2R = P_right - P_left  # [E, 3]
+
+            # 计算 P_right 到 "P_left所在平面" 的垂直距离: D = |(P_R - P_L) · N_L|
+            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * normal_left, dim=1))  # [E]
+
+            # 对称地，计算 P_left 到 "P_right所在平面" 的垂直距离
+            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * normal_right, dim=1))  # [E]
+
+            # 取两者较大的那个作为最终距离（增加鲁棒性）
+            pt2plane_dist = torch.max(dist_to_plane_L, dist_to_plane_R)
+
+            # 断裂条件：点到平面距离大于物理阈值
+            is_break = pt2plane_dist > self.pt2plane_threshold
+            labels = is_break.float()
+
+            # =======================================================
+            # 掩码与边界处理
+            # =======================================================
             # 有效掩码：探测的两个点都必须有 GT 深度 (排除边界黑边干扰)
             valid_mask = (depth_left > 1e-4) & (depth_right > 1e-4)
 
@@ -298,6 +323,7 @@ class EdgeLabelGenerator:
             current_edges = tri_infos[0]['edges_list'][b].to(device)
             is_boundary = (current_edges[:, 0] == current_edges[:, 1])
             labels[is_boundary] = 1.0
+
             # 边界边不需要探测点必须有效，强制视为有效
             valid_mask[is_boundary] = True
 

@@ -66,6 +66,57 @@ class FeatureNet(nn.Module):
         return output_feature
 
 
+class GeometricRefinement(nn.Module):
+    def __init__(self, in_channels=16):  # 👈 精准匹配你 FeatureNet 的 stage_1 通道数
+        super(GeometricRefinement, self).__init__()
+
+        # 提取 Stage 1 的高频特征 (16 -> 16)
+        # 假设 ConvBnReLU(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv0 = ConvBnReLU(in_channels, 16, 3, 1, 1)
+
+        # 提取低分辨率深度特征 (1 -> 16)
+        self.conv1 = ConvBnReLU(1, 16, 3, 1, 1)
+        self.conv2 = ConvBnReLU(16, 16, 3, 1, 1)
+
+        # 反卷积上采样深度特征
+        self.deconv = nn.ConvTranspose2d(16, 16, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False)
+        self.bn = nn.BatchNorm2d(16)
+
+        # 融合 RGB特征 与 深度特征 (16 + 16 = 32)
+        self.conv3 = ConvBnReLU(32, 16, 3, 1, 1)
+
+        # 预测残差 (16 -> 1)
+        self.res = nn.Conv2d(16, 1, 3, padding=1, bias=False)
+
+    def forward(self, ref_feature, depth_0, depth_min, depth_max):
+        """
+        ref_feature: Stage 1 的特征 [B, 16, H/2, W/2]
+        depth_0: Stage 2 的深度图 [B, 1, H/4, W/4]
+        """
+        batch_size = depth_min.size(0)
+
+        # 1. 深度归一化到 [0, 1]
+        d_min = depth_min.view(batch_size, 1, 1, 1)
+        d_max = depth_max.view(batch_size, 1, 1, 1)
+        depth_norm = (depth_0 - d_min) / (d_max - d_min + 1e-6)
+
+        # 2. 特征提取
+        feat_out = self.conv0(ref_feature)
+        depth_out = F.relu(self.bn(self.deconv(self.conv2(self.conv1(depth_norm)))), inplace=True)
+
+        # 3. 拼接并预测残差
+        cat = torch.cat((depth_out, feat_out), dim=1)
+        res = self.res(self.conv3(cat))
+
+        # 4. 🔥 致命修复：双线性插值基础面 (绝不使用 nearest)
+        depth_up = F.interpolate(depth_norm, scale_factor=2, mode="bilinear", align_corners=False)
+
+        # 5. 加残差并反归一化
+        depth_refined_norm = depth_up + res
+        depth_refined = depth_refined_norm * (d_max - d_min) + d_min
+
+        return depth_refined
+
 class Refinement(nn.Module):
     def __init__(self):
         
@@ -162,8 +213,10 @@ class PatchmatchNet(nn.Module):
                                                             feat_channels=num_features[1],
                                                             propagator_iter=3)
 
+        self.stage1_refine = GeometricRefinement(in_channels=16)
 
-    def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1):
+
+    def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1,lambda_c, lambda_s):
         
 
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
@@ -244,11 +297,19 @@ class PatchmatchNet(nn.Module):
 
                 # 根据stage2粗深度图来拟合stage1的法向量和深度图
                 tri_infos = []
-                depth_stage2 = depth_patchmatch['stage_2'][-1]
+                depth_stage2_raw = depth_patchmatch['stage_2'][-1]
+
+                # 利用 Stage 1 的高频图像特征，进行保边平滑上采样
+                depth_stage1_init = self.stage1_refine(
+                    ref_feature=ref_feature[f'stage_{l}'].detach(),  # [B, 16, H/2, W/2]
+                    depth_0=depth_stage2_raw.detach(),  # [B, 1, H/4, W/4]
+                    depth_min=depth_min,
+                    depth_max=depth_max
+                )
 
                 # 获得stage1的长和宽
-                _, _, height, width = depth.size()
-                device = depth.get_device()
+                _, _, height, width = depth_stage1_init.size()
+                device = depth_stage1_init.get_device()
 
                 # ================================================================
                 # 1. 处理数据
@@ -282,12 +343,13 @@ class PatchmatchNet(nn.Module):
 
 
                 (depth_samples, score, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
-                 continuity_loss,continuity_s_loss) = self.plane_patchmatch_agent.forward(
+                 continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
-                                                                    depth_stage2.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
+                                                                    depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
                                                                     ref_feature[f'stage_{l}'], src_features_l,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights,
-                neighbor_indices_batched = neighbor_indices_batched
+                neighbor_indices_batched = neighbor_indices_batched,
+                lambda_c=lambda_c,lambda_s=lambda_s
                 )
 
                 # ================================================================
@@ -306,7 +368,7 @@ class PatchmatchNet(nn.Module):
                 output_plane['tri_id_map_stage0'] = tri_id_map_stage0_tensor
 
                 # stage2 产生的深度图放大后，patchmatch产生的深度图
-                output_plane['depth_stage1_pixels']=depth
+                output_plane['depth_stage1_pixels']=depth_stage1_init
                 # 经过传播得到的平面
                 output_plane['normal_final']=normal_samples[1]
 
@@ -334,7 +396,7 @@ class PatchmatchNet(nn.Module):
                 # output_plane['normal_gt'] = normal_gt_plane_stage_1
 
                 # planepatchmatch最终预测结果，里面也有两份一份用来上采样一份用来输出
-                depth_samples[0]=depth_samples[1]
+                depth_samples[0]=depth_stage1_init
                 depth = depth_samples
 
             
@@ -367,7 +429,7 @@ class PatchmatchNet(nn.Module):
                         "edge_alphas": edge_alphas,
                         "output_plane":output_plane,
                         "continuity_loss":continuity_loss, # 连续性损失
-                        "continuity_s_loss":continuity_s_loss
+                        "smoothness_loss":smoothness_loss # 光滑性损失
                     }
         else:
             num_depth = self.patchmatch_num_sample[0]
@@ -387,7 +449,7 @@ class PatchmatchNet(nn.Module):
                         "edge_alphas": edge_alphas,
                         "output_plane": output_plane,
                         "continuity_loss": continuity_loss,  # 连续性损失
-                        "continuity_s_loss": continuity_s_loss
+                        "smoothness_loss": smoothness_loss
                     }
         
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
@@ -422,6 +484,75 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     # 将损失去求一个平均
 
     return loss
+
+
+def compute_normal_cosine_loss(final_planes, tri_id_map, gt_normals_math_s0, depth_stage_1):
+    """
+    计算 Stage 1 预测平面与 Stage 0 GT 法向量之间的余弦相似度损失。
+
+    Args:
+        final_planes: [B, N, 4] Stage 1 的平面参数
+        tri_id_map: [B, H, W] Stage 1 的三角形 ID 图
+        gt_normals_math_s0: [B, 3, H0, W0] Stage 0 的数学真值法向量 [-1, 1]
+        depth_stage_1: [B, 1, H, W] Stage 1 的预测/GT 深度，用于过滤无效背景
+
+    Returns:
+        normal_loss: 标量 Loss
+    """
+    B, N, _ = final_planes.shape
+    _, H, W = tri_id_map.shape
+    device = final_planes.device
+
+    # =======================================================
+    # 步骤 A: 对 Stage 0 的 GT 法向量进行正确的下采样
+    # =======================================================
+    # 必须使用 bilinear 插值，防止法向量出现最近邻的“马赛克锯齿”
+    gt_normals_s1 = F.interpolate(
+        gt_normals_math_s0,
+        size=(H, W),  # 直接对齐目标尺寸，比 scale_factor 更安全
+        mode='bilinear',
+        align_corners=False
+    )
+    # 🌟 极其关键：插值后向量长度缩水，必须重新 L2 归一化
+    gt_normals_s1 = F.normalize(gt_normals_s1, p=2, dim=1)
+
+    # =======================================================
+    # 步骤 B: 高效提取 Stage 1 预测的“纯数学”法向量
+    # =======================================================
+    # 1. 取出预测的法向量 n [B, N, 3]，并归一化
+    pred_tri_normals = final_planes[..., :3]
+    pred_tri_normals = F.normalize(pred_tri_normals, p=2, dim=-1)
+
+    # 2. 处理无效区域 ID (将 -1 暂时替换为 0 以防查表越界)
+    safe_id_map = tri_id_map.clone()
+    invalid_mask = (safe_id_map < 0)
+    safe_id_map[invalid_mask] = 0
+
+    # 3. 极其高效的查表渲染 (替代复杂的 for 循环)
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
+    pred_pixel_normals = pred_tri_normals[batch_idx, safe_id_map]  # [B, H, W, 3]
+    pred_pixel_normals = pred_pixel_normals.permute(0, 3, 1, 2)  # [B, 3, H, W]
+
+    # =======================================================
+    # 步骤 C: 计算余弦相似度损失
+    # =======================================================
+    # 1. 计算点积 sum(N_pred * N_gt)
+    cos_sim = torch.sum(pred_pixel_normals * gt_normals_s1, dim=1, keepdim=True)  # [B, 1, H, W]
+
+    # 2. 转换为 Loss (1.0 - cos_sim)，完全同向时 Loss 为 0
+    loss_map = 1.0 - cos_sim
+
+    # 3. 构建有效 mask (去除原来 tri_id_map < 0 的区域，以及深度为 0 的背景)
+    valid_mask = (~invalid_mask.unsqueeze(1)) & (depth_stage_1 > 1e-4)
+
+    # 4. 最终法向损失
+    normal_loss = loss_map[valid_mask].mean()
+
+    # 容错：如果整张图全部无效（极少见），返回 0 梯度
+    if torch.isnan(normal_loss):
+        normal_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return normal_loss
 
 def adjust_image_dims(
         images: List[torch.Tensor], intrinsics: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor, int, int]:
