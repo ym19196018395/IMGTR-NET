@@ -301,8 +301,8 @@ class PatchmatchNet(nn.Module):
 
                 # 利用 Stage 1 的高频图像特征，进行保边平滑上采样
                 depth_stage1_init = self.stage1_refine(
-                    ref_feature=ref_feature[f'stage_{l}'].detach(),  # [B, 16, H/2, W/2]
-                    depth_0=depth_stage2_raw.detach(),  # [B, 1, H/4, W/4]
+                    ref_feature=ref_feature[f'stage_{l}'],  # [B, 16, H/2, W/2]
+                    depth_0=depth_stage2_raw,  # [B, 1, H/4, W/4]
                     depth_min=depth_min,
                     depth_max=depth_max
                 )
@@ -346,8 +346,9 @@ class PatchmatchNet(nn.Module):
                  continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
-                                                                    ref_feature[f'stage_{l}'], src_features_l,
-                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights,
+                                                                    ref_feature[f'stage_{l}'].detach(),
+                                                                    [f.detach() for f in src_features_l],
+                ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
                 lambda_c=lambda_c,lambda_s=lambda_s
                 )

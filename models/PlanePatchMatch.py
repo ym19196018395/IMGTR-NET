@@ -820,33 +820,31 @@ class PlanePatchMatchModule(nn.Module):
         # ==========================================
         # 计算所有假设的代价,计算了每个像素点的代价，但是后面会转化成一个个三角形所以不影响
         # costs: [B, H, W, K]
-        with torch.no_grad():
-            pixel_costs = self.compute_costs(
-                ref_feature.detach(), src_features_detached,
-                ref_proj, src_projs,
-                current_hypotheses,
-                None,
-                ref_intrinsic=ref_intrinsics,
-                is_debug=False
-            )
+        pixel_costs = self.compute_costs(
+            ref_feature.detach(), src_features_detached,
+            ref_proj, src_projs,
+            current_hypotheses,
+            view_weights=view_weights,
+            ref_intrinsic=ref_intrinsics,
+            is_debug=False
+        )
 
-            # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
-            # 不在基于单个像素了，保证一个整体的出现
+        # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
+        # 不在基于单个像素了，保证一个整体的出现
 
-            # 1. 聚合 Cost: [B, H, W, K] -> [B, N_tri, K]
-            tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
+        # 1. 聚合 Cost: [B, H, W, K] -> [B, N_tri, K]
+        tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
 
-            # 2. 三角形级选择 (Triangle-wise Argmin)
-            # best_tri_idx: [B, N_tri] (每个三角形选择了第几个假设 0~K-1)
-            best_tri_idx = torch.argmin(tri_costs, dim=2)
+        # 2. 三角形级选择 (Triangle-wise Argmin)
+        # best_tri_idx: [B, N_tri] (每个三角形选择了第几个假设 0~K-1)
+        best_tri_idx = torch.argmin(tri_costs, dim=2)
 
-            # 3. 提取最佳平面参数
-            # hypotheses: [B, N_tri, K, 4]
-            # 我们需要根据 best_tri_idx 从 K 个假设中 Gather 出最好的那个
+        # 3. 提取最佳平面参数
+        # hypotheses: [B, N_tri, K, 4]
+        # 我们需要根据 best_tri_idx 从 K 个假设中 Gather 出最好的那个
 
-            # 构造 Gather Index: [B, N_tri, 1, 4]
-            gather_idx = best_tri_idx.view(B, max_tri_num, 1, 1).expand(-1, -1, 1, 4)
-
+        # 构造 Gather Index: [B, N_tri, 1, 4]
+        gather_idx = best_tri_idx.view(B, max_tri_num, 1, 1).expand(-1, -1, 1, 4)
 
         # best_planes: [B, N_tri, 4] (更新后的三角形平面)
         # ym-debug 为了验证是否是聚合导致测试出问题
@@ -877,7 +875,8 @@ class PlanePatchMatchModule(nn.Module):
                 # 传入 detach 后的特征即可，这里只为清洗噪声，不需要传导梯度给 CNN
                 pixel_costs = self.compute_costs(
                     ref_feature.detach(), src_features_detached,
-                    ref_proj, src_projs, pixel_candidates, None, ref_intrinsics, is_debug=False
+                    ref_proj, src_projs, pixel_candidates, view_weights=view_weights,
+                    ref_intrinsic=ref_intrinsics, is_debug=False
                 )
                 tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)  # [B, N, 4]
 
@@ -941,14 +940,6 @@ class PlanePatchMatchModule(nn.Module):
 
         planes_anchor = current_planes.detach().clone()
         for iter_idx in range(self.propagator_iter):
-            # if(iter_idx==2):
-            #     # todo:之后可以微调边预测头，目前不要
-            #     edge_alphas = self.edge_head(
-            #         feat=ref_feature.detach(),
-            #         tri_infos=tri_infos,
-            #         tri_planes=current_planes.detach(),  # <--- 梯度防火墙
-            #         intrinsics=ref_intrinsics
-            #     )
 
             # 6.1 传播 得到新平面
             new_planes = self.propagator(
@@ -980,7 +971,9 @@ class PlanePatchMatchModule(nn.Module):
             # 计算像素代价
             pixel_costs_new = self.compute_costs(
                 ref_feature.detach(), src_features_detached, ref_proj, src_projs,
-                pixel_hypo, None, ref_intrinsics, is_debug=False
+                pixel_hypo,view_weights=view_weights,
+                ref_intrinsic=ref_intrinsics,
+                is_debug=False
             )
 
             # 重新聚合成三角形级代价 -> [B, N, 1]
@@ -1011,7 +1004,7 @@ class PlanePatchMatchModule(nn.Module):
         smoothness_loss = 0.0
         if lambda_s > 0.0:
             smoothness_loss = self.propagator.compute_smoothness_loss(
-                planes=current_planes,
+                planes=final_planes,
                 neighbor_indices=neighbor_indices_batched,
                 edge_probs=edge_probs_tensor.detach(),  # 必须 detach
                 centroids_norm=centroids_norm,  # 传入归一化质心 [B, N, 2]
@@ -1157,6 +1150,10 @@ class PlanePatchMatchModule(nn.Module):
 
         total_cost = 0
 
+        # 🔥 修复 1：准备累加特征，而不是累加分数
+        similarity_sum = 0.0
+        weight_sum = 0.0
+
         # 遍历所有源视图
         for i, (src_feat, src_proj) in enumerate(zip(src_features, src_projs)):
             # --- A. 计算相对变换 (Projective Space) ---
@@ -1201,68 +1198,39 @@ class PlanePatchMatchModule(nn.Module):
 
             del warped_src, warped_src_grouped  # 释放显存
 
-            # ================== debug专用 ==================================
-            # if i == 0:
-            #     # similarity: [B*K, G, H, W] -> Mean over G -> [B*K, 1, H, W]
-            #     raw_sim = similarity.mean(dim=1).view(B, K, H, W)
-            #
-            #     raw_svd = raw_sim[:, 0, ...].mean().item()
-            #     raw_fp = raw_sim[:, 1, ...].mean().item()
-            #     raw_rnd = raw_sim[:, 2, ...].mean().item()
-            #     print(f"✅ [Check Input] Raw SVD: {raw_svd:.4f} | FP: {raw_fp:.4f} | Rnd: {raw_rnd:.4f}")
-
-            # todo:暂时不用学习型
-            # similarity 是 [B*K, G, H, W]，我们在 G 维度取平均
-            score_i = similarity.mean(dim=1, keepdim=True)  # [B*K, 1, H, W]
-
-
-            # --- E. 计算代价 (Cost Regression) --- ❌
-            # similarity_net: [B*K, G, H, W] -> [B*K, 1, H, W]
-            # cost 越小越好，correlation 越大越好，所以取负
-
-            # score_i = self.similarity_net(similarity)
-            cost_i = -score_i  # [B*K, 1, H, W]
-
-            # ============debug专用========================
-            if i == 0 and is_debug:  # 只看第一个源视图
-                # Reshape 回 [B, K, 1, H, W]
-                temp_score = score_i.view(B, K, 1, H, W)
-                score_0 = temp_score[:, 0, ...].mean().item()
-                score_1 = temp_score[:, 1, ...].mean().item()
-                # score_2 = temp_score[:, 2, ...].mean().item()
-                # score_3 = temp_score[:, 3, ...].mean().item()
-                print(f"\n[Debug] Raw Similarity Mean | Hypo 0 (SVD): {score_0:.4f} | Hypo 1 (FP): {score_1:.4f}")
-
-            # ========== 特征扭曲debug =====================================
-            # if i == 0 :  # 你需要自己加个计数器或者只跑一个 batch
-            #     import torchvision.utils as vutils
-            #     # Reshape 为 [B, K, C, H, W]
-            #     debug_warp = warped_src.view(B, K, C, H, W)
-            #
-            #     # 取 Hypo 0 (SVD) 和 Hypo 1 (FP)
-            #     # 归一化到 0-1 以便显示
-            #     img_0 = debug_warp[0, 0, :3].detach().cpu()  # 取前3个通道当RGB
-            #     img_1 = debug_warp[0, 2, :3].detach().cpu()
-            #
-            #     # 归一化
-            #     img_0 = (img_0 - img_0.min()) / (img_0.max() - img_0.min())
-            #     img_1 = (img_1 - img_1.min()) / (img_1.max() - img_1.min())
-            #
-            #     vutils.save_image(img_0, "debug_warp_svd.png")
-            #     vutils.save_image(img_1, "debug_warp_fp.png")
-            #     print("📸 已保存 debug_warp_svd.png 和 debug_warp_fp.png")
-
-            # --- F. 应用视图权重 (View Weights) ---
+            # =========================================================
+            # 获取视图权重，并进行加权累加 (早期融合)
+            # =========================================================
             if view_weights is not None:
-                # view_weights: [B, Nview-1, H, W] -> 取第 i 个 -> [B, 1, H, W]
-                # 扩展到 K
-                vw = view_weights[:, i:i + 1, :, :].unsqueeze(1).repeat(1, K, 1, 1, 1).view(B * K, 1, H, W)
-                cost_i = cost_i * vw
+                # vw: [B, 1, H, W] -> 扩展到 [B*K, 1, H, W]
+                vw = view_weights[:, i:i + 1, :, :]
+                vw_expand = vw.unsqueeze(1).repeat(1, K, 1, 1, 1).view(B * K, 1, H, W)
+            else:
+                # 如果没有 view_weights，默认为 1
+                vw_expand = torch.ones((B * K, 1, H, W), device=device)
 
-            total_cost = total_cost + cost_i
+            # 累加 Similarity 特征和权重
+            similarity_sum = similarity_sum + (similarity * vw_expand)
+            weight_sum = weight_sum + vw_expand
+
+
+        # =========================================================
+        # 权重归一化 (防止 Softmax 尺度爆炸)
+        # =========================================================
+        # 除以总权重，得到平均相似度特征
+        # 加 1e-6 防止完全被遮挡的像素产生除零错误
+        similarity_fused = similarity_sum / (weight_sum + 1e-6)
+
+        # [B*K, 1, H, W]
+        # todo：暂时不用学习型，先用直接型
+        # score_fused = self.similarity_net(similarity_fused)
+        score_fused = similarity_fused.mean(dim=1, keepdim=True)
+
+        # 转换为 Cost (越小越好)
+        cost_fused = -score_fused
 
         # 还原形状 [B*K, 1, H, W] -> [B, K, H, W] -> [B, H, W, K]
-        total_cost = total_cost.view(B, K, H, W).permute(0, 2, 3, 1)
+        total_cost = cost_fused.view(B, K, H, W).permute(0, 2, 3, 1)
 
         return total_cost
 
@@ -2062,23 +2030,23 @@ class DensePlaneFitter(nn.Module)   :
         # hypo_list.append(hypo_fp)
 
         # ==========[Hypothesis 2+] 随机扰动 (Vectorized Jitter)======
-        # num_random = self.K - 2
-        # if num_random > 0:
-        #     # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
-        #     base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)
-        #     base_d = hypo_0[..., 3:].expand(-1, -1, num_random, -1)
-        #
-        #     # 生成噪声
-        #     rand_n = (torch.rand_like(base_n) - 0.5) * self.noise_scale * 2.0
-        #     # d 的扰动范围需要大一点
-        #     rand_d = (torch.rand_like(base_d) - 0.5) * self.noise_scale
-        #
-        #     # 应用噪声
-        #     new_n = F.normalize(base_n + rand_n, dim=-1)
-        #     new_d = base_d + rand_d
-        #
-        #     hypo_random = torch.cat([new_n, new_d], dim=-1)
-        #     hypo_list.append(hypo_random)
+        num_random = self.K - 1
+        if num_random > 0:
+            # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
+            base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)
+            base_d = hypo_0[..., 3:].expand(-1, -1, num_random, -1)
+
+            # 生成噪声
+            rand_n = (torch.rand_like(base_n) - 0.5) * self.noise_scale * 2.0
+            # d 的扰动范围需要大一点
+            rand_d = (torch.rand_like(base_d) - 0.5) * self.noise_scale
+
+            # 应用噪声
+            new_n = F.normalize(base_n + rand_n, dim=-1)
+            new_d = base_d + rand_d
+
+            hypo_random = torch.cat([new_n, new_d], dim=-1)
+            hypo_list.append(hypo_random)
 
         # 最终拼接 [B, N, K, 4]
         hypotheses = torch.cat(hypo_list, dim=2)
