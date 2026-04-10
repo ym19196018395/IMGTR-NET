@@ -337,7 +337,7 @@ class PatchmatchNet(nn.Module):
 
                 num_hypotheses=4
                 # 平面拟合
-                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=num_hypotheses, perturbation_range=0.05,
+                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=1, perturbation_range=0.05,
                                                            depth_max=depth_max,
                                                            depth_min=depth_min)
 
@@ -345,9 +345,9 @@ class PatchmatchNet(nn.Module):
                 (depth_samples, score, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
                  continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
-                                                                    depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
-                                                                    ref_feature[f'stage_{l}'].detach(),
-                                                                    [f.detach() for f in src_features_l],
+                                                                    depth_stage1_init, tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
+                                                                    ref_feature[f'stage_{l}'],
+                                                                    src_features_l,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
                 lambda_c=lambda_c,lambda_s=lambda_s

@@ -38,8 +38,8 @@ python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 24 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
---trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/newtest.txt \
---logdir ./checkpoints/tensorboard_cp \
-2>&1 | tee txt_logs/${timestamp}_3_在平面传播阶段不开启特征和前面阶段的深度梯度,.log \
+--trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
+--logdir ./checkpoints/tensorboard_train5 \
+2>&1 | tee txt_logs/${timestamp}_5_planepatchmatch是传统方案.log \
  "$@"
 

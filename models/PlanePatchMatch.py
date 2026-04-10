@@ -779,7 +779,7 @@ class PlanePatchMatchModule(nn.Module):
             pixel_counts.append(counts)
 
         area_confidence_raw = torch.stack(pixel_counts, dim=0)  # [B, N_max]
-        # area_confidence = (area_confidence_raw / 5.0).clamp(0.05, 1.0)  # ← 阈值从30改为5
+        area_confidence = (area_confidence_raw / 4.0).clamp(0.05, 1.0)  # ← 阈值从30改为5
 
         centroids_norm = self.fitter.collate_centroids_norm(
             tri_infos[0]['centers_list'], device
@@ -787,7 +787,7 @@ class PlanePatchMatchModule(nn.Module):
 
         # 在进入传播循环前，计算 pixel_costs
         # 将特征从计算图中剥离，保护 FeatureNet 不受 Stage 1 毒害
-        src_features_detached = [f.detach() for f in src_features]
+        # src_features_detached = [f.detach() for f in src_features]
 
         # ==========================================
         # 2. 拟合与生成 (Fitting & Generation)，根据stage2预测深度来拟合生成假设平面
@@ -800,119 +800,34 @@ class PlanePatchMatchModule(nn.Module):
             tri_id_map=tri_id_map,
             intrinsics_s1=ref_intrinsics,
             max_num_triangles=max_tri_num
-        )  # Output: [B, N_tri, K, 4]
+        )  # Output: [B, N_tri, 1, 4]
 
         # [B, N_tri, K, 4] -> [B, N_tri, 4] (取第0个假设,最佳平面的前3通道)
         # 进行一个可视化看看效果，拟合的初始平面
         before_best_guess_planes = hypotheses[:, :, 0, :]  # [B, N_tri, 4]
 
-        # ==========================================
-        # 3. 广播 (Broadcasting: Triangle -> Pixel)
-        # ==========================================
+        # 直接取出唯一的平面作为基底 (不需要 argmin)
+        current_planes = hypotheses.squeeze(2)  # [B, N_tri, 4]
 
-        # 将三角形级的假设映射到像素级 pixel_hypotheses: [B, H, W, K, 4]
+        # ==========================================
+        # 3. 计算 SVD 基底的物理代价 (作为特征)
+        # ==========================================
         pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map, H, W)
 
-        current_hypotheses = pixel_hypotheses
-
-        # ==========================================
-        # 4. 代价计算 (Cost Computation)
-        # ==========================================
-        # 计算所有假设的代价,计算了每个像素点的代价，但是后面会转化成一个个三角形所以不影响
-        # costs: [B, H, W, K]
+        # ✅ 注意这里直接传入 ref_feature，绝不 detach！梯度畅通无阻！
         pixel_costs = self.compute_costs(
-            ref_feature.detach(), src_features_detached,
-            ref_proj, src_projs,
-            current_hypotheses,
-            view_weights=view_weights,
-            ref_intrinsic=ref_intrinsics,
-            is_debug=False
+            ref_feature, src_features, ref_proj, src_projs,
+            pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics
         )
-
-        # 🔥 修改：基于三角形聚合 Cost 并选择 (Triangle-wise Selection)
-        # 不在基于单个像素了，保证一个整体的出现
-
-        # 1. 聚合 Cost: [B, H, W, K] -> [B, N_tri, K]
-        tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
-
-        # 2. 三角形级选择 (Triangle-wise Argmin)
-        # best_tri_idx: [B, N_tri] (每个三角形选择了第几个假设 0~K-1)
-        best_tri_idx = torch.argmin(tri_costs, dim=2)
-
-        # 3. 提取最佳平面参数
-        # hypotheses: [B, N_tri, K, 4]
-        # 我们需要根据 best_tri_idx 从 K 个假设中 Gather 出最好的那个
-
-        # 构造 Gather Index: [B, N_tri, 1, 4]
-        gather_idx = best_tri_idx.view(B, max_tri_num, 1, 1).expand(-1, -1, 1, 4)
-
-        # best_planes: [B, N_tri, 4] (更新后的三角形平面)
-        # ym-debug 为了验证是否是聚合导致测试出问题
-        best_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)
+        # 聚合为三角形代价 [B, N_tri, 1]
+        current_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
 
         # ==========================================
-        # 5.边预测头得到边的断裂概率 和 硬传播
+        # 4. 预测物理断裂边 (EdgeHead)
         # ==========================================
-        # 5.1 硬传播 (Hard Argmin Propagation) - 清洗 SVD 噪声
-        # 带有大量 SVD 噪声的初始平面
-        current_planes = best_planes
-        B, N, _ = current_planes.shape
-        # 构造正确的 Batch 索引张量，用于高级查表
-        batch_idx_tensor = torch.arange(B, device=device)[:, None, None].expand(B, N, 3)
-
-        # 🔥 必须包裹 no_grad！Argmin 不可导，不关梯度会白白建立庞大计算图导致 OOM
-        with torch.no_grad():
-            area_threshold = 4.0
-            for hard_iter in range(1):  # 只需 1 次，就能把狗啃的边界洗掉大半
-                # 1. 收集邻居平面 (加上自己，一共 4 个候选)
-                # current_planes: [B, N, 4] -> neighbor_planes: [B, N, 3, 4]
-                neighbor_planes = current_planes[batch_idx_tensor, neighbor_indices_batched]
-                candidates = torch.cat([current_planes.unsqueeze(2), neighbor_planes], dim=2)  # [B, N, 4, 4]
-
-                # 2. 映射到像素级并计算代价
-                pixel_candidates = self.map_tri_to_pixel(candidates, tri_id_map, H, W)
-
-                # 传入 detach 后的特征即可，这里只为清洗噪声，不需要传导梯度给 CNN
-                pixel_costs = self.compute_costs(
-                    ref_feature.detach(), src_features_detached,
-                    ref_proj, src_projs, pixel_candidates, view_weights=view_weights,
-                    ref_intrinsic=ref_intrinsics, is_debug=False
-                )
-                tri_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)  # [B, N, 4]
-
-                # =======================================================
-                # 🔥 核心手术室：双向面积惩罚 (Cost 阻断法)
-                # =======================================================
-                B, N = area_confidence_raw.shape
-
-                # A. 标记自身是否为碎面 [B, N]
-                is_small_self = area_confidence_raw < area_threshold
-
-                # B. 标记三个邻居是否为碎面 [B, N, 3]
-                neighbor_areas = area_confidence_raw[batch_idx_tensor, neighbor_indices_batched]
-                is_small_neighbor = neighbor_areas < area_threshold
-
-                # C. 拼合 4 个候选者的碎面掩码: [B, N, 4]
-                is_small_candidates = torch.cat([is_small_self.unsqueeze(-1), is_small_neighbor], dim=-1)
-
-                # D. 弹性降维打击：不覆盖原值，而是加上一个严厉的惩罚值！
-                # 惩罚值设为 2.0 到 5.0 之间 (取决于你的 pixel_costs 正常量级)
-                # 假设你的正常 cost 在 0~1 之间，那么 3.0 就是一个非常巨大的阻力了
-                penalty_weight = 10.0
-
-                # 如果是碎面，就在它原本的 tri_costs 上加上 penalty_weight
-                # 既保留了原始梯度的区分度，又逼迫它们在常规区域向大面片低头
-                tri_costs = tri_costs + (is_small_candidates * penalty_weight)
-
-                # 3. 极其暴力的 Hard Argmin (谁好我抄谁)
-                best_idx = torch.argmin(tri_costs, dim=2, keepdim=True).unsqueeze(-1).expand(-1, -1, 1, 4)
-                current_planes = torch.gather(candidates, 2, best_idx).squeeze(2)
-
-
-
         # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
         edge_alphas = self.edge_head(
-            feat=ref_feature.detach(),  # [B, C, H, W]
+            feat=ref_feature,  # [B, C, H, W]
             tri_infos=tri_infos,
             tri_planes=current_planes.detach(),  # [B, N_max, 4] 包含法向和距离
             intrinsics=ref_intrinsics  # [B, 3, 3] 相机内参
@@ -932,24 +847,20 @@ class PlanePatchMatchModule(nn.Module):
         )
 
         # ==========================================
-        # 6. 软传播 (Propagation)
+        # 6. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
 
-        # torch.min(dim=2) 会同时返回最小值(values)和对应索引(indices)
-        current_costs = tri_costs.min(dim=2)[0].unsqueeze(-1) # [B, N, 1]
-
-        planes_anchor = current_planes.detach().clone()
         for iter_idx in range(self.propagator_iter):
-
-            # 6.1 传播 得到新平面
+            # 5.1 传播：MLP 综合平面、代价、特征、边缘，输出平滑后的新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
-                current_costs=current_costs,
+                current_costs=current_costs,  # 👈 物理代价化身为特征引导 MLP
                 neighbor_indices=neighbor_indices_batched,
-                edge_probs=edge_probs_tensor.detach(), # 暂时不让边预测头互相影响
-                ref_feature=ref_feature.detach(),
+                edge_probs=edge_probs_tensor.detach(),  # 阻断边缘头干扰
+                ref_feature=ref_feature,  # 👈 图像特征引导 MLP
                 centroids_norm=centroids_norm,
             )
+
             # 对传播进行一个保护
             new_planes = fitter_module.enforce_depth_hard_constraint(
                 planes=new_planes,
@@ -960,8 +871,7 @@ class PlanePatchMatchModule(nn.Module):
                 H=H, W=W
             )
 
-            # 6.2 重新评估新平面的代价 (极其重要：在此处设立绝对的梯度防火墙！)
-            # 使用 torch.no_grad() 彻底阻断这一整块代码的梯度图构建
+            # 5.2 重新评估新平面的代价 (极其重要：在此处设立绝对的梯度防火墙！)
             # 扩展维度以适配 compute_costs 接口: [B, N, 1, 4] (K=1)
             new_planes_k1 = new_planes.unsqueeze(2)
 
@@ -970,19 +880,19 @@ class PlanePatchMatchModule(nn.Module):
 
             # 计算像素代价
             pixel_costs_new = self.compute_costs(
-                ref_feature.detach(), src_features_detached, ref_proj, src_projs,
-                pixel_hypo,view_weights=view_weights,
+                ref_feature, src_features, ref_proj, src_projs,
+                pixel_hypo,
+                view_weights=view_weights,
                 ref_intrinsic=ref_intrinsics,
                 is_debug=False
             )
 
             # 重新聚合成三角形级代价 -> [B, N, 1]
-            tri_costs_new = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
+            current_costs = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num)
 
-            # 6.3 状态更新，进入下一次迭代
+            # 5.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
             current_planes = new_planes
-            current_costs = tri_costs_new
 
         final_planes = current_planes
 
@@ -1223,8 +1133,8 @@ class PlanePatchMatchModule(nn.Module):
 
         # [B*K, 1, H, W]
         # todo：暂时不用学习型，先用直接型
-        # score_fused = self.similarity_net(similarity_fused)
-        score_fused = similarity_fused.mean(dim=1, keepdim=True)
+        score_fused = self.similarity_net(similarity_fused)
+        # score_fused = similarity_fused.mean(dim=1, keepdim=True)
 
         # 转换为 Cost (越小越好)
         cost_fused = -score_fused
@@ -2011,45 +1921,14 @@ class DensePlaneFitter(nn.Module)   :
         hypo_0 = torch.cat([normals, d_vals], dim=1).view(B, max_num_triangles, 1, 4)
 
         # ==========================================
-        # 4 生成其他假设 (Hypothesis Expansion)
+        # 不需要生成假设
         # ==========================================
         hypo_list = [hypo_0]
 
-        # ==========[Hypothesis 1] 前向平行 (Fronto-Parallel)=====
-        # 利用现成的 centroids[:, 2] (平均深度)
-
-        # mean_depth = centroids[:, 2].view(B, max_num_triangles, 1, 1)
-        #
-        # normal_fp = torch.zeros((B, max_num_triangles, 1, 3), device=device)
-        # normal_fp[..., 2] = -1.0
-        # d_fp = mean_depth  # d = z
-        #
-        # hypo_fp = torch.cat([normal_fp, d_fp], dim=-1)  # [B, N, 1, 4]
-        #
-        # # todo:用了前向平行平面，如果不用需要将这里注释，并且self.K - 2 变为 self.K - 1
-        # hypo_list.append(hypo_fp)
-
-        # ==========[Hypothesis 2+] 随机扰动 (Vectorized Jitter)======
-        num_random = self.K - 1
-        if num_random > 0:
-            # 扩展基础平面 [B, N, 1, 4] -> [B, N, num_rnd, 4]
-            base_n = hypo_0[..., :3].expand(-1, -1, num_random, -1)
-            base_d = hypo_0[..., 3:].expand(-1, -1, num_random, -1)
-
-            # 生成噪声
-            rand_n = (torch.rand_like(base_n) - 0.5) * self.noise_scale * 2.0
-            # d 的扰动范围需要大一点
-            rand_d = (torch.rand_like(base_d) - 0.5) * self.noise_scale
-
-            # 应用噪声
-            new_n = F.normalize(base_n + rand_n, dim=-1)
-            new_d = base_d + rand_d
-
-            hypo_random = torch.cat([new_n, new_d], dim=-1)
-            hypo_list.append(hypo_random)
-
         # 最终拼接 [B, N, K, 4]
-        hypotheses = torch.cat(hypo_list, dim=2)
+        # 直接返回唯一的假设 (K=1)，不再进行任何随机扰动拼凑！
+        # [B, N, 1, 4]
+        hypotheses = torch.cat([normals, d_vals], dim=1).view(B, max_num_triangles, 1, 4)
 
         return hypotheses
 
