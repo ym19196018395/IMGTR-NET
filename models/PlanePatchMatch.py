@@ -1193,10 +1193,17 @@ class PlanePatchMatchModule(nn.Module):
             # --- D. 分组相关性 (Group Correlation) ---
             # [B*K, G, C/G, H, W]
             warped_src_grouped = warped_src.view(B * K, self.G, C // self.G, H, W)
+
+            # 强行将特征向量的长度缩放为 1，将点积转化为余弦相似度 (Cosine Similarity)
+            # 这样 similarity 的物理边界被死死锁在 [-1, 1] 之间，网络绝无作弊可能！
+            warped_src_norm = F.normalize(warped_src_grouped, p=2, dim=2)
+            ref_feat_norm = F.normalize(ref_feat_expanded, p=2, dim=2)
+
             # Similarity: [B*K, G, H, W]
             similarity = (warped_src_grouped * ref_feat_expanded).mean(dim=2)
 
-            del warped_src, warped_src_grouped  # 释放显存
+            del warped_src, warped_src_grouped, warped_src_norm, ref_feat_norm  # 释放显存
+
 
             # =========================================================
             # 获取视图权重，并进行加权累加 (早期融合)
