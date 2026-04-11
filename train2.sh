@@ -40,6 +40,6 @@ python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 24 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/newtest.txt \
 --logdir ./checkpoints/tensorboard_test \
-2>&1 | tee txt_logs/${timestamp}_3_端到端处理.log \
+2>&1 | tee txt_logs/${timestamp}_test_端到端处理,屏蔽一些梯度传播.log \
  "$@"
 

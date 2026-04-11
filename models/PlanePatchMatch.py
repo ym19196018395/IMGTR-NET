@@ -827,9 +827,9 @@ class PlanePatchMatchModule(nn.Module):
         # ==========================================
         # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
         edge_alphas = self.edge_head(
-            feat=ref_feature,  # [B, C, H, W]
+            feat=ref_feature.detach(),  # [B, C, H, W]
             tri_infos=tri_infos,
-            tri_planes=current_planes.detach(),  # [B, N_max, 4] 包含法向和距离
+            tri_planes=current_planes.detach(), # [B, N_max, 4] 包含法向和距离
             intrinsics=ref_intrinsics  # [B, 3, 3] 相机内参
         )
 
@@ -854,10 +854,10 @@ class PlanePatchMatchModule(nn.Module):
             # 5.1 传播：MLP 综合平面、代价、特征、边缘，输出平滑后的新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
-                current_costs=current_costs,  # 👈 物理代价化身为特征引导 MLP
+                current_costs=current_costs.detach(),  # 物理代价化身为特征引导 MLP
                 neighbor_indices=neighbor_indices_batched,
                 edge_probs=edge_probs_tensor.detach(),  # 阻断边缘头干扰
-                ref_feature=ref_feature,  # 👈 图像特征引导 MLP
+                ref_feature=ref_feature.detach(),  # 图像特征引导 MLP
                 centroids_norm=centroids_norm,
             )
 
@@ -1103,10 +1103,16 @@ class PlanePatchMatchModule(nn.Module):
             # --- D. 分组相关性 (Group Correlation) ---
             # [B*K, G, C/G, H, W]
             warped_src_grouped = warped_src.view(B * K, self.G, C // self.G, H, W)
-            # Similarity: [B*K, G, H, W]
-            similarity = (warped_src_grouped * ref_feat_expanded).mean(dim=2)
 
-            del warped_src, warped_src_grouped  # 释放显存
+            # 强行将特征向量的长度缩放为 1，将点积转化为余弦相似度 (Cosine Similarity)
+            # 这样 similarity 的物理边界被死死锁在 [-1, 1] 之间，网络绝无作弊可能！
+            warped_src_norm = F.normalize(warped_src_grouped, p=2, dim=2)
+            ref_feat_norm = F.normalize(ref_feat_expanded, p=2, dim=2)
+
+            # Similarity: [B*K, G, H, W]
+            similarity = (warped_src_norm * ref_feat_norm).mean(dim=2)
+
+            del warped_src, warped_src_grouped, warped_src_norm, ref_feat_norm  # 释放显存
 
             # =========================================================
             # 获取视图权重，并进行加权累加 (早期融合)
@@ -1133,8 +1139,8 @@ class PlanePatchMatchModule(nn.Module):
 
         # [B*K, 1, H, W]
         # todo：暂时不用学习型，先用直接型
-        score_fused = self.similarity_net(similarity_fused)
-        # score_fused = similarity_fused.mean(dim=1, keepdim=True)
+        # score_fused = self.similarity_net(similarity_fused)
+        score_fused = similarity_fused.mean(dim=1, keepdim=True)
 
         # 转换为 Cost (越小越好)
         cost_fused = -score_fused
