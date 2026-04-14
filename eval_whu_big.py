@@ -22,7 +22,6 @@ from datasets.data_io import read_pfm, save_pfm
 import cv2
 from plyfile import PlyData, PlyElement
 from PIL import Image
-
 from datasets.dtu_whu import collate_keep_list
 
 import resource
@@ -234,6 +233,7 @@ def save_depth():
                             vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
                             max_lambda_c, max_lambda_s)
 
+
             image_outputs_pre = generate_edge_alpha_overlays(
                 ref_imgs=sample["imgs"]['stage_0'][:, 0],
                 edge_alphas_list=outputs["edge_alphas"],
@@ -253,7 +253,7 @@ def save_depth():
 
             # 5. 保存图片
             # 构造文件名，例如保存为 edge_overlay.png
-            filename = sample["filename"][0]
+            filename=sample["filename"][0]
             save_path = os.path.join(args.outdir, filename.format('edge_overlay', '.png'))
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -267,7 +267,6 @@ def save_depth():
             # ====================================================================
             # 💡 核心可视化逻辑: 提取 Stage 1 深度图和平面法向量图
             # ====================================================================
-
 
             stage1_depths = outputs["depth_patchmatch"]['stage_1'][-1]
             stage1_normals = outputs["output_plane"]['normal_final']
@@ -906,7 +905,7 @@ def filter_depth_new3( scans ,plyfilename, geo_pixel_thres, geo_depth_thres, pho
 if __name__ == '__main__':
     # step1. save all the depth maps and the masks in outputs directory
     save_depth()
-    img_wh=(768, 384)
+    # img_wh=(768, 384)
     
     # with open(args.testlist) as f:
     #     scans = f.readlines()

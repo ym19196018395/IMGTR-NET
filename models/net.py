@@ -270,7 +270,8 @@ class PatchmatchNet(nn.Module):
             'tri_id_map':[],# 三角形stage1下的id图
             'tri_id_map_stage0': [],  # 三角形stage1下的id图
             'depth_no_pro': [],  # 刚拟合完的深度值
-            'normal_no_pro': []  # 刚拟合完的法向量
+            'normal_no_pro': [],  # 刚拟合完的法向量
+            'pixel_costs':[] # 计算出来的代价
         }
         score = []
         
@@ -342,7 +343,7 @@ class PatchmatchNet(nn.Module):
                                                            depth_min=depth_min)
 
 
-                (depth_samples, score, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
+                (depth_samples, pixel_costs, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
                  continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
@@ -352,6 +353,9 @@ class PatchmatchNet(nn.Module):
                 neighbor_indices_batched = neighbor_indices_batched,
                 lambda_c=lambda_c,lambda_s=lambda_s
                 )
+
+                # Score (Confidence) = -min_cost
+                score = -torch.min(pixel_costs, dim=3)[0].unsqueeze(1)  # [B, 1, H, W]
 
                 # ================================================================
                 # 3. 可视化结果，返回结果
@@ -377,6 +381,8 @@ class PatchmatchNet(nn.Module):
                 # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
                 output_plane['depth_no_pro'] = depth_samples[0]
                 output_plane['normal_no_pro'] = normal_samples[0]
+
+                output_plane['pixel_costs'] = pixel_costs
 
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
@@ -433,16 +439,16 @@ class PatchmatchNet(nn.Module):
                         "smoothness_loss":smoothness_loss # 光滑性损失
                     }
         else:
-            num_depth = self.patchmatch_num_sample[0]
-            score_sum4 = 4 * F.avg_pool3d(F.pad(score.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
-            # [B, 1, H, W]
-            depth_index = depth_regression(score, depth_values=torch.arange(num_depth, device=score.device, dtype=torch.float)).long()
-            depth_index = torch.clamp(depth_index, 0, num_depth-1)
-            photometric_confidence = torch.gather(score_sum4, 1, depth_index)
-            photometric_confidence = F.interpolate(photometric_confidence,
-                                        scale_factor=2, mode='nearest')
-            photometric_confidence = photometric_confidence.squeeze(1)
-
+            # num_depth = self.patchmatch_num_sample[0]
+            # score_sum4 = 4 * F.avg_pool3d(F.pad(score.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
+            # # [B, 1, H, W]
+            # depth_index = depth_regression(score, depth_values=torch.arange(num_depth, device=score.device, dtype=torch.float)).long()
+            # depth_index = torch.clamp(depth_index, 0, num_depth-1)
+            # photometric_confidence = torch.gather(score_sum4, 1, depth_index)
+            # photometric_confidence = F.interpolate(photometric_confidence,
+            #                             scale_factor=2, mode='nearest')
+            # photometric_confidence = photometric_confidence.squeeze(1)
+            photometric_confidence=NULL_TENSOR
             return {"refined_depth": refined_depth, 
                         "depth_patchmatch": depth_patchmatch, 
                         "photometric_confidence": photometric_confidence,

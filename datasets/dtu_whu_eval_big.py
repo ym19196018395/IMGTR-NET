@@ -31,41 +31,20 @@ class MVSDataset(Dataset):
             scans = f.readlines()
             scans = [line.rstrip() for line in scans]
 
-        # todo：ym_add 1.2 因为之前只将1作为参考图，现在将每一个图片都作为一次参考图
-        pair_file = os.path.join(self.datapath, "{}/pair.txt".format(self.mode))
-
-        # read the pair file,这是公共的每一个scan都是一样的
-        pair_lines = []
-        with open(pair_file) as pair:
-            pair_lines = pair.readlines()
-            # 过滤掉空行，防止报错
-            pair_lines = [line.strip() for line in pair_lines if line.strip()]
-
         for scan in scans:
             # 储存着每个照片的id
             list_file = os.path.join(self.datapath, "{}/Images/{}/list.txt".format(self.mode,scan))
 
-            self.num_viewpoint = len(pair_lines)  # 直接用行数作为视图总数
-            # viewpoints (5)
-            for pairline in pair_lines:
-                values = pairline.split()
-                # 1. 解析参考视图 (每行的第一个数)
-                ref_view = int(values[0])
-                # 2. 解析源视图 (每行剩下的数)
-                # 你的文件格式只有ID没有分数，所以直接取 [1:] 即可
-                src_views = [int(x) for x in values[1:]]
-
-                # 读取照片的编号
-                with open(list_file) as f:
-                    for line in f:
-                        # 1. 去除行尾的换行符和空白
-                        clean_line = line.strip()
-                        # 2. 确保行不为空
-                        if clean_line:
-                            # 3. 去除后缀 (例如 .png)
-                            file_id = clean_line.split('.')[0]
-                            # 4. 加入集合,只能传一个参数可以传一个元组数
-                            metas.append((scan, ref_view, src_views, file_id))
+            with open(list_file) as f:
+                for line in f:
+                    # 1. 去除行尾的换行符和空白
+                    clean_line = line.strip()
+                    # 2. 确保行不为空
+                    if clean_line:
+                        # 3. 去除后缀 (例如 .png)
+                        file_id = clean_line.split('.')[0]
+                        # 4. 加入集合,只能传一个参数可以传一个元组数
+                        metas.append((scan,file_id))
 
         print("dataset", self.mode, "metas:", len(metas))
         return metas
@@ -73,7 +52,7 @@ class MVSDataset(Dataset):
     def __len__(self):
         return len(self.metas)
 
-    def read_whu_cam(self, filename):
+    def read_whu_cam_big(self, filename):
         try:
             with open(filename, 'r') as f:
                 lines = [line.strip() for line in f.readlines() if line.strip()]
@@ -225,13 +204,13 @@ class MVSDataset(Dataset):
 
     def __getitem__(self, idx):
         # 这里是对应的一组数据子数据集名称和里面的图片名
+        # 只测试 图1
         meta = self.metas[idx]
-        scan, ref_view, src_views,file_id = meta
+        scan, file_id = meta
         # whu数据集每个参考图和源图已经固定了
-        view_ids=[ref_view] + src_views[:self.nviews - 1]
 
-        img_w = 768
-        img_h = 384
+        view_ids=[1,0,2,3,4]
+
 
         imgs_0 = []
         imgs_1 = []
@@ -266,7 +245,7 @@ class MVSDataset(Dataset):
             img_filename=[]
             triangulation_filename=[]
             # 对于参考图进行不一样的处理
-            if(i==0):
+            if(vid==1):
                 img_filename = os.path.join(self.datapath,"{}/Images/{}/urd/{}.png".format(self.mode,scan,file_id))
                 triangulation_filename = os.path.join(self.datapath,
                                                       '{}/Images/{}/triangulation/CDTinfo/CDT_info_vlf_{}.txt'.format(
@@ -286,13 +265,13 @@ class MVSDataset(Dataset):
             imgs_2.append(imgs['stage_2'])
             imgs_3.append(imgs['stage_3'])
 
-            intrinsics, extrinsics, depth_min_, depth_max_, depth_interval, original_w, original_h = self.read_whu_cam(proj_mat_filename)
+            intrinsics, extrinsics, depth_min_, depth_max_, depth_interval, original_w, original_h = self.read_whu_cam_big(proj_mat_filename)
 
-            if i == 0:  # reference view
+            if vid == 1:  # reference view
                 depth_min = depth_min_
                 depth_max = depth_max_
 
-                depth, mask, depth_max = self.read_depth_hr(depth_filename_hr)
+                depth, mask, _ = self.read_depth_hr(depth_filename_hr)
 
                 for l in range(self.stages):
                     mask[f'stage_{l}'] = np.expand_dims(mask[f'stage_{l}'], 2)
@@ -394,7 +373,7 @@ class MVSDataset(Dataset):
                 "mask": mask,  # 1*H0 * W0
                 "depth_min": depth_min,  # scalar
                 "depth_max": depth_max,  # scalar
-                "filename": scan + '/{}'.format(ref_view)+'/{}/' + '{}'.format(file_id) + "{}",
+                "filename": scan +'/{}/' + '{}'.format(file_id) + "{}",
                 "vertexs": vertexs,  # ndarray (Nv, ..)
                 "lines": lines,  # ndarray (Nl, ..)
                 "triangles": triangles  # list of ndarrays

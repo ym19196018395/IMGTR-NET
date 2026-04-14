@@ -34,12 +34,12 @@
 MVS_TRAINING="/home/ym/Experiment/Datas/WHU_MVS_dataset"
 timestamp=$(date +%Y%m%d_%H%M%S)
 
-python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 24 \
+python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 27 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train5 \
-2>&1 | tee txt_logs/${timestamp}_5_planepatchmatch是传统方案.log \
+--logdir ./checkpoints/tensorboard_train1 \
+2>&1 | tee txt_logs/${timestamp}_1_端到端,修复了传播模块的问题,处理小三角形和加入特征和softmax,以及svd拟合.log \
  "$@"
 
