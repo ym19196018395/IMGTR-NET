@@ -343,7 +343,7 @@ class PatchmatchNet(nn.Module):
                                                            depth_min=depth_min)
 
 
-                (depth_samples, pixel_costs, view_weights,normal_samples,output_plane['final_plane'],edge_alphas,
+                (depth_samples, pixel_costs, view_weights,normal_samples,output_plane['final_plane'],all_edge_alphas,
                  continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
@@ -433,7 +433,7 @@ class PatchmatchNet(nn.Module):
             return {"refined_depth": refined_depth, 
                         "depth_patchmatch": depth_patchmatch,
                         "tri_infos": tri_infos,
-                        "edge_alphas": edge_alphas,
+                        "edge_alphas": all_edge_alphas,
                         "output_plane":output_plane,
                         "continuity_loss":continuity_loss, # 连续性损失
                         "smoothness_loss":smoothness_loss # 光滑性损失
@@ -453,7 +453,7 @@ class PatchmatchNet(nn.Module):
                         "depth_patchmatch": depth_patchmatch, 
                         "photometric_confidence": photometric_confidence,
                         "tri_infos": tri_infos,
-                        "edge_alphas": edge_alphas,
+                        "edge_alphas": all_edge_alphas,
                         "output_plane": output_plane,
                         "continuity_loss": continuity_loss,  # 连续性损失
                         "smoothness_loss": smoothness_loss

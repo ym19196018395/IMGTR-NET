@@ -233,7 +233,7 @@ class LearnedTrianglePropagator(nn.Module):
 
         # 残差网络零初始化
         nn.init.constant_(self.plane_head[2].bias, 0.0)
-        nn.init.normal_(self.plane_head[2].weight, mean=0.0, std=0.001)
+        nn.init.normal_(self.plane_head[2].weight, mean=0.0, std=0.01)
 
         # 定义一个缩放因子，用于压制 d 的巨大数值
         # 如果你的深度大多在几十到几百，100.0 是个好数值
@@ -875,7 +875,7 @@ class PlanePatchMatchModule(nn.Module):
         # 4. 预测物理断裂边 (EdgeHead)
         # ==========================================
         # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
-        edge_alphas = self.edge_head(
+        edge_init = self.edge_head(
             feat=ref_feature.detach(),  # [B, C, H, W]
             tri_infos=tri_infos,
             tri_planes=current_planes.detach(), # [B, N_max, 4] 包含法向和距离
@@ -885,7 +885,7 @@ class PlanePatchMatchModule(nn.Module):
 
         # 转换为三角形级别格式 [B, N_max, 3]
         edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
-            edge_alphas, tri_infos, max_tri_num, device
+            edge_init, tri_infos, max_tri_num, device
         )
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
@@ -895,7 +895,7 @@ class PlanePatchMatchModule(nn.Module):
             ref_intrinsics,
             depth_range=(depth_min, depth_max)
         )
-
+        all_edge_alphas = [edge_init]
         # ==========================================
         # 6. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
@@ -945,6 +945,23 @@ class PlanePatchMatchModule(nn.Module):
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
             current_planes = new_planes
 
+            # 🚀 绝杀操作：在第 0 轮传播后 (此时噪声已除)，重新预测边缘！
+            if iter_idx == 0:
+                edge_alphas_refined = self.edge_head(
+                    feat=ref_feature.detach(),
+                    tri_infos=tri_infos,
+                    tri_planes=current_planes.detach(),  # 👈 使用平滑后极其干净的平面！
+                    intrinsics=ref_intrinsics
+                )
+
+                # 更新指导传播的 Tensor
+                edge_probs_tensor, _ = convert_edge_features_to_tri_format(
+                    edge_alphas_refined, tri_infos, max_tri_num, device
+                )
+
+                # 将精修后的 logits 也存起来
+                all_edge_alphas.append(edge_alphas_refined)
+
         final_planes = current_planes
 
         # ==========================================
@@ -972,8 +989,8 @@ class PlanePatchMatchModule(nn.Module):
                 intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
                 H=H, W=W,
-                sigma_F=0.6,  # 可调：0.5 是 L2 归一化特征推荐值
-                lambda_ang=4.0  # 可调：法向平滑的相对强度
+                sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
+                lambda_ang=5.0  # 可调：法向平滑的相对强度
             )
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)
@@ -1006,7 +1023,7 @@ class PlanePatchMatchModule(nn.Module):
                 view_weights,
                 normal_samples,
                 final_planes,
-                edge_alphas,
+                all_edge_alphas,
                 continuity_loss,smoothness_loss)
 
     # ==========================================
@@ -1951,10 +1968,13 @@ class DensePlaneFitter(nn.Module)   :
                           (depth_est > d_max_val * 2.0) | \
                           (~torch.isfinite(depth_est))  # 几何爆炸 [Total, 1]
 
-            # 如果法向量的 Z 分量绝对值太小 (< 0.1)，说明平面几乎与视线平行，这在城市场景中极度危险
-            is_bad_normal = (normals[:, 2:3].abs() < 0.1)
+            # 如果法向量的 Z 分量绝对值太小 (< 0.3)，说明平面几乎与视线平行，这在城市场景中极度危险
+            is_bad_normal = (normals[:, 2:3].abs() < 0.03)
 
-            is_invalid = invalid_tris | is_bad_geom | is_bad_normal # [Total, 1]
+            # is_invalid = invalid_tris | is_bad_geom | is_bad_normal # [Total, 1]
+
+            is_invalid = invalid_tris | is_bad_geom  # [Total, 1]
+
 
             # (可选) 打印过滤日志
             bad_ratio = is_invalid.float().mean()

@@ -34,12 +34,12 @@
 MVS_TRAINING="/home/ym/Experiment/Datas/WHU_MVS_dataset"
 timestamp=$(date +%Y%m%d_%H%M%S)
 
-python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 27 \
---patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
+python train_whu.py --dataset dtu_whu --batch_size 6 --epochs 26 \
+--patchmatch_iteration 1 3 3 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train3 \
-2>&1 | tee txt_logs/${timestamp}_3_端到端,修复了传播模块的问题,处理小三角形和加入特征和softmax,加入cost损失,修复边预测头.log \
+--logdir ./checkpoints/tensorboard_train6 \
+2>&1 | tee txt_logs/${timestamp}_6_端到端,在stage2,stage3循环多加一次,边预测头放一轮在传播中,调大光滑性约束,.log \
  "$@"
 
