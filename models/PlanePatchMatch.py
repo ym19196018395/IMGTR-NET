@@ -871,22 +871,6 @@ class PlanePatchMatchModule(nn.Module):
         # 聚合为三角形代价 [B, N_tri, 1]
         current_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
 
-        # ==========================================
-        # 4. 预测物理断裂边 (EdgeHead)
-        # ==========================================
-        # 运行 EdgeHead 预测边缘  ym-need-modify 暂时不给其放梯度，
-        edge_init = self.edge_head(
-            feat=ref_feature.detach(),  # [B, C, H, W]
-            tri_infos=tri_infos,
-            tri_planes=current_planes.detach(), # [B, N_max, 4] 包含法向和距离
-            intrinsics=ref_intrinsics,  # [B, 3, 3] 相机内参
-            dense_depth=depth_stage1.detach() # dense深度
-        )
-
-        # 转换为三角形级别格式 [B, N_max, 3]
-        edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
-            edge_init, tri_infos, max_tri_num, device
-        )
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
         no_prop_depth, no_propa_normal = visualizer.render_from_planes(
@@ -895,12 +879,38 @@ class PlanePatchMatchModule(nn.Module):
             ref_intrinsics,
             depth_range=(depth_min, depth_max)
         )
-        all_edge_alphas = [edge_init]
+
         # ==========================================
-        # 6. 端到端神经融合传播 (Neural Soft Propagation)
+        # 4. 预测物理断裂边 (EdgeHead) 在传播中第一轮预测
+        # ==========================================
+
+        # 全 0 的 Tensor 意味着没有任何人工边缘阻断，纯靠特征距离(feat_dist)去平滑
+        edge_probs_tensor = torch.zeros(B, max_tri_num, 3, device=device)
+
+        # 预留存放精修后概率的变量，用于最后算 Loss
+        edge_alpha = None
+
+        # ==========================================
+        # 5. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
 
         for iter_idx in range(self.propagator_iter):
+
+            # 第 0 轮刚结束，此时 current_planes 已经洗掉了 SVD 的白点噪声
+            # 现在让 EdgeHead 睁开眼睛，去刻画真正的物理边缘,运行 EdgeHead 预测边缘
+            if iter_idx == 1:
+                edge_alpha = self.edge_head(
+                    feat=ref_feature.detach(),
+                    tri_infos=tri_infos,
+                    tri_planes=current_planes.detach(),  # 👈 此时是最干净的平面
+                    intrinsics=ref_intrinsics
+                )
+
+                # 转换为三角形级别格式 [B, N_max, 3]
+                edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
+                    edge_alpha, tri_infos, max_tri_num, device
+                )
+
             # 5.1 传播：MLP 综合平面、代价、特征、边缘，输出平滑后的新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
@@ -945,22 +955,6 @@ class PlanePatchMatchModule(nn.Module):
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
             current_planes = new_planes
 
-            # 🚀 绝杀操作：在第 0 轮传播后 (此时噪声已除)，重新预测边缘！
-            if iter_idx == 0:
-                edge_alphas_refined = self.edge_head(
-                    feat=ref_feature.detach(),
-                    tri_infos=tri_infos,
-                    tri_planes=current_planes.detach(),  # 👈 使用平滑后极其干净的平面！
-                    intrinsics=ref_intrinsics
-                )
-
-                # 更新指导传播的 Tensor
-                edge_probs_tensor, _ = convert_edge_features_to_tri_format(
-                    edge_alphas_refined, tri_infos, max_tri_num, device
-                )
-
-                # 将精修后的 logits 也存起来
-                all_edge_alphas.append(edge_alphas_refined)
 
         final_planes = current_planes
 
@@ -1023,7 +1017,7 @@ class PlanePatchMatchModule(nn.Module):
                 view_weights,
                 normal_samples,
                 final_planes,
-                all_edge_alphas,
+                edge_alpha,
                 continuity_loss,smoothness_loss)
 
     # ==========================================

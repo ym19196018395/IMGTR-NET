@@ -7,7 +7,7 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.net import compute_normal_cosine_loss
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -166,7 +166,7 @@ def  train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             # 不是每一张都保存，是过一段时间才保存
             do_summary = global_step % args.summary_freq == 0
-            do_summary_image = global_step % (5 * args.summary_freq) == 0
+            do_summary_image = global_step % (30 * args.summary_freq) == 0
             # 处理单个样本，计算损失并反向传播
             total_loss, scalar_outputs, image_outputs = train_sample(sample, do_summary_image=do_summary_image,
                                                                      total_steps=total_steps,global_step=global_step)
@@ -203,7 +203,7 @@ def  train():
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             do_summary = global_step % args.summary_freq == 0
             # do_summary_test = global_step % (10*args.summary_freq) == 0
-            do_summary_image = global_step % (50 * args.summary_freq) == 0
+            do_summary_image = global_step % (10 * args.summary_freq) == 0
             loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image)
             loss_depth = scalar_outputs['loss_depth']
             loss_alpha_sup=scalar_outputs['loss_alpha_sup']
@@ -313,71 +313,55 @@ def compute_edge_supervision_loss(
 
 
 def compute_edge_supervision_loss_new(
-        alphas_init_list,  # [B] 第一次 (Iter 0) 预测的边断裂概率 (0~1)
-        alphas_refined_list,  # [B] 第二次 (Iter 1) 预测的边断裂概率 (0~1)
+        alphas_list,     # [B] 方案A中唯一一次预测的边断裂概率 (0~1)
         gt_stage0_list,  # [B] 绝对真值 (纯净的 0 或 1)
-        valid_mask_list,  # [B] 有效掩码
-        weight_init=0.3,  # 初猜权重
-        weight_refined=0.7  # 精修权重
+        valid_mask_list  # [B] 有效掩码
 ):
     """
-    纯粹的深层监督 (Deep Supervision) 边预测头 Loss 计算。
-    输入必须是已经激活的概率 (0~1)！
+    方案 A 专属：单次精准深层监督 Loss 计算。
+    只接收 Iter 1 在干净平面上预测出的高质量边缘概率。
     """
+    B = len(alphas_list)
+    device = alphas_list[0].device if B > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    B = len(alphas_init_list)
-    device = alphas_init_list[0].device if B > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    loss_alpha_init = 0.0
-    loss_alpha_refined = 0.0
-
-    sparsity_init = 0.0
-    sparsity_refined = 0.0
+    total_loss_alpha = 0.0
+    total_sparsity = 0.0
 
     valid_count = 0
 
     for b in range(B):
-        alphas_init = alphas_init_list[b]
-        alphas_refined = alphas_refined_list[b]
+        alphas = alphas_list[b]
         gt_target = gt_stage0_list[b]
         valid_mask = valid_mask_list[b]
 
         # 异常跳过
-        if alphas_init.numel() == 0 or valid_mask.sum() == 0:
+        if alphas.numel() == 0 or valid_mask.sum() == 0:
             continue
 
         # 1. 稀疏性惩罚 (直接对概率求平均)
-        sparsity_init += alphas_init.mean()
-        sparsity_refined += alphas_refined.mean()
+        total_sparsity += alphas.mean()
 
         # 2. 提取有效区域的概率和真值
-        valid_preds_init = alphas_init[valid_mask]
-        valid_preds_refined = alphas_refined[valid_mask]
+        valid_preds = alphas[valid_mask]
         valid_target = gt_target[valid_mask]
 
         # 3. 直接调用你的防爆 BCE 核心 (绝不再做 Sigmoid！)
-        loss_alpha_init += compute_weighted_bce_core(valid_preds_init, valid_target)
-        loss_alpha_refined += compute_weighted_bce_core(valid_preds_refined, valid_target)
+        total_loss_alpha += compute_weighted_bce_core(valid_preds, valid_target)
 
         valid_count += 1
 
     # ==========================================
-    # 4. 聚合与加权
+    # 4. 聚合计算
     # ==========================================
     if valid_count > 0:
-        loss_alpha_init = loss_alpha_init / valid_count
-        loss_alpha_refined = loss_alpha_refined / valid_count
-
-        sparsity_init = sparsity_init / valid_count
-        sparsity_refined = sparsity_refined / valid_count
-
-        total_loss_alpha_sup = weight_init * loss_alpha_init + weight_refined * loss_alpha_refined
-        total_loss_sparsity = weight_init * sparsity_init + weight_refined * sparsity_refined
+        total_loss_alpha = total_loss_alpha / valid_count
+        total_sparsity = total_sparsity / valid_count
     else:
-        total_loss_alpha_sup = torch.tensor(0.0, device=device, requires_grad=True)
-        total_loss_sparsity = torch.tensor(0.0, device=device, requires_grad=True)
+        # 防崩溃保底机制
+        total_loss_alpha = torch.tensor(0.0, device=device, requires_grad=True)
+        total_sparsity = torch.tensor(0.0, device=device, requires_grad=True)
 
-    return total_loss_alpha_sup, total_loss_sparsity
+    return total_loss_alpha, total_sparsity
 
 def get_dynamic_loss_weights(global_step, total_steps):
     """
@@ -612,7 +596,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_c = 100.0
     max_lambda_s = 3.0
     max_lambda_n = 3.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
-    max_lambda_cost=0.3
+    max_lambda_cost=0.2
     weight_alpha = 1
 
     # 1. 连通性约束 (Continuity, C0):
@@ -675,7 +659,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # ym-add 用原分辨率的图像来计算真值，使得真值更加的准确
     # ----------------------------------------------------
     edge_alphas_gt, valid_mask_list = edge_label_generator(
-        pred_alphas_list=outputs["edge_alphas"][0],
+        pred_alphas_list=outputs["edge_alphas"],
         gt_depth_map=depth_gt['stage_0'],  # Stage 0 的高清深度图
         tri_infos=outputs["tri_infos"],
         intrinsics=ref_intrinsics_s0,
@@ -696,8 +680,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 边预测头 Loss 计算
     loss_alpha_raw, loss_sparsity_raw = compute_edge_supervision_loss_new(
-        alphas_init_list=outputs["edge_alphas"][0],
-        alphas_refined_list=outputs["edge_alphas"][1],
+        alphas_list=outputs["edge_alphas"],
         gt_stage0_list=edge_alphas_gt,
         valid_mask_list=valid_mask_list
     )
@@ -766,7 +749,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         # ================ 生成断裂图 ===============================================
         image_outputs_pre = generate_edge_alpha_overlays(
             ref_imgs=sample["imgs"]['stage_0'][:, 0],  # 注意取 ref 图
-            edge_alphas_list=outputs["edge_alphas"][1],
+            edge_alphas_list=outputs["edge_alphas"],
             edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
             device=device,
             overlay_alpha=0.6,  # 线条显示的透明度
@@ -903,7 +886,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     max_lambda_c = 100.0
     max_lambda_s = 3.0
     max_lambda_n = 0.3
-    max_lambda_cost = 0.3
+    max_lambda_cost = 0.2
 
 
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
@@ -936,7 +919,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
     # 阶段 A：预生成标签
     edge_alphas_gt, valid_mask_list = edge_label_generator(
-        pred_alphas_list=outputs["edge_alphas"][0],
+        pred_alphas_list=outputs["edge_alphas"],
         gt_depth_map=depth_gt['stage_0'],
         tri_infos=outputs["tri_infos"],
         intrinsics=ref_intrinsics_s0,
@@ -947,8 +930,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
     # 阶段 B：两段式边预测头损失
     loss_alpha_raw, loss_sparsity_raw = compute_edge_supervision_loss_new(
-        alphas_init_list=outputs["edge_alphas"][0],
-        alphas_refined_list=outputs["edge_alphas"][1],
+        alphas_list=outputs["edge_alphas"],
         gt_stage0_list=edge_alphas_gt,
         valid_mask_list=valid_mask_list
     )
@@ -993,7 +975,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     if detailed_summary:
         image_outputs_pre = generate_edge_alpha_overlays(
             ref_imgs=sample["imgs"]['stage_0'][:, 0],
-            edge_alphas_list=outputs["edge_alphas"][1],
+            edge_alphas_list=outputs["edge_alphas"],
             edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
             device=device, overlay_alpha=0.6, line_thickness=1
         )
