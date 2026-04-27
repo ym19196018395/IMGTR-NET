@@ -10,27 +10,6 @@ from utils import _sample_map, check_tensor
 class EdgeHead(nn.Module):
     """
     EdgeHead —— 终极版边级断裂预测器 (Analytical Plane-based)
-    升级特性：
-      - 彻底抛弃 3x3 离散像素采样，免疫狭长三角形的特征崩溃
-      - 基于平面方程 (n, d) 直接求解边中点的解析深度差，无限分辨率
-      - 单点采样 Backbone 图像特征，保留 CNN 原生感受野
-    输入:
-      - feat: [B, C, Hf, Wf]  （backbone / FPN 特征）
-      - img: [B, C_img, H, W] （原图，可为 None）
-      - depth_map: [B,1,H,W] 或 [B,H,W] （当前网络的深度预测）
-      - tri_infos: list length B, 每项为 dict:
-                {
-                    'batch_num_tri': int,三角形的数量
-                    'centroids': [B,n_tri,2] 每个三角形的质点，已经归一化处理
-                    'vertices': [B,n_tri,3,2] 每个三角形的顶点，已进行归一化处理
-                    'edges_list' :每个边的邻接面，
-                     boundary_local_idxs_per_batch: 存储着断裂边，也就是只有一个面的边
-                    'tri_edge_ids_list':每个三角形的边ID列表
-                    'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
-                }
-    输出:
-      - per_image_edges_alpha: list len=B，每个 tensor [E]，E = edges 数（按 edges 列表顺序）
-      - per_image_edge_mat: list len=B，每个 tensor [num_tri, num_tri] 对称矩阵（不邻接处为0）
     """
     def __init__(self, feat_channels, tri_feat_dim=128, edge_mlp_hidden=128):
         """

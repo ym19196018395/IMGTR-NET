@@ -540,20 +540,46 @@ def generate_geometric_edge_gt(final_planes, current_edges, midpoints_norm, intr
     return geom_targets
 
 
-def get_smooth_weight(progress, start_prog, end_prog, max_weight):
+def get_smooth_weight_with_decay(progress, start_prog, end_prog, decay_prog, max_weight, end_ratio=0.1):
     """
-    计算平滑过渡的权重 (Cosine Annealing)
-    在 start_prog 之前为 0，在 end_prog 之后为 max_weight。
-    中间区间呈 S 型平滑上升。
+    终极版：带退坡松绑的平滑过渡权重 (Cosine Warmup + Plateau + Cosine Decay)
+
+    Args:
+        progress:   当前训练进度 [0.0 ~ 1.0]
+        start_prog: 开始介入的节点 (例如 0.3)
+        end_prog:   达到满载的节点 (例如 0.6)
+        decay_prog: 开始松绑退坡的节点 (例如 0.8)
+        max_weight: 满载时的最高权重
+        end_ratio:  训练结束时保留的权重比例 (默认 0.1，即保留 10% 的保底约束)
     """
+    # 1. 潜伏期 (尚未启动)
     if progress <= start_prog:
         return 0.0
-    if progress >= end_prog:
+
+    # 2. 爬坡期 (Cosine Warmup)
+    elif progress < end_prog:
+        linear_ratio = (progress - start_prog) / (end_prog - start_prog)
+        # 从 0.0 平滑上升到 1.0
+        smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
+        return max_weight * smooth_ratio
+
+    # 3. 满载期 (Plateau - 强力塑形)
+    elif progress <= decay_prog:
         return max_weight
 
-    linear_ratio = (progress - start_prog) / (end_prog - start_prog)
-    smooth_ratio = (1.0 - math.cos(linear_ratio * math.pi)) / 2.0
-    return max_weight * smooth_ratio
+    # 4. 🚀 退坡松绑期 (Cosine Decay - 极限抠细节)
+    else:
+        # 进度从 decay_prog 到 1.0 映射为 0.0 到 1.0
+        linear_ratio = (progress - decay_prog) / (1.0 - decay_prog)
+
+        # smooth_ratio_down 会从 1.0 平滑下降到 0.0
+        smooth_ratio_down = (1.0 + math.cos(linear_ratio * math.pi)) / 2.0
+
+        # 计算衰减的下限 (保底权重)
+        min_weight = max_weight * end_ratio
+
+        # 在 min_weight 和 max_weight 之间进行余弦插值
+        return min_weight + (max_weight - min_weight) * smooth_ratio_down
 
 def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
@@ -593,20 +619,25 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 一开始不启动连续性约束和光滑性约束，后面再打开，目前是直接打开
     progress = global_step / total_steps
     # 连续性约束和光滑性约束权重
-    max_lambda_c = 100.0
-    max_lambda_s = 3.0
-    max_lambda_n = 3.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
+    max_lambda_c = 50.0
+    max_lambda_s = 1.0
+    max_lambda_n = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
     max_lambda_cost=0.2
-    weight_alpha = 1
+    weight_alpha = 1.0
 
-    # 1. 连通性约束 (Continuity, C0):
-    lambda_c = get_smooth_weight(progress, start_prog=0.2, end_prog=0.4, max_weight=max_lambda_c)
+    # 1. 连通性约束 (早启动，早满载，晚退坡)：
+    # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
+    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.4, 0.6, max_lambda_c, end_ratio=0.01)
 
-    # 2. 光滑性约束 (Smoothness, C1):
-    lambda_s = get_smooth_weight(progress, start_prog=0.3, end_prog=0.6, max_weight=max_lambda_s)
+    # 2. 光滑性约束 (中启动，中满载，早退坡)：
+    # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
+    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.01)
 
-    # 3. 法向约束 (Normal Loss, Absolute Orientation):
-    lambda_n = get_smooth_weight(progress, start_prog=0.5, end_prog=0.7, max_weight=max_lambda_n)
+    # 3. 法向约束 (晚启动，晚满载，早退坡)：
+    # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
+    lambda_n = get_smooth_weight_with_decay(progress, 0.3, 0.5, 0.55, max_lambda_n, end_ratio=0.05)
+
+    # lambda_c,lambda_s,lambda_n=0.0,0.0,0.0
 
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],

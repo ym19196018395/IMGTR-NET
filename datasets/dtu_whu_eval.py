@@ -404,7 +404,7 @@ class MVSDataset(Dataset):
         intrinsics_mats['stage_1'] = intrinsics_matrices_1
         intrinsics_mats['stage_0'] = intrinsics_matrices_0
 
-        vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
+        vertexs = np.asarray(cdt_data.vertexs, dtype=np.float32)
         lines = np.asarray(cdt_data.lines, dtype=np.int64)
         # 每个 triangle 分开处理，保留 list，
         triangles = []

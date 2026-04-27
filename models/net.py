@@ -332,6 +332,7 @@ class PatchmatchNet(nn.Module):
                 # 每个三角形的邻居面，如果只有两个面，另外一个面是自己 # [B, N_max, 3]
                 neighbor_indices_batched = build_neighbor_indices(tri_infos, max_tri_num,device)
 
+
                 # ================================================================
                 # 2. 传入PlanePatchmatch模型,根据stage2的深度信息拟合stage1的平面
                 # ================================================================
@@ -363,7 +364,7 @@ class PatchmatchNet(nn.Module):
 
                 # 转化为tensor形式(B,H,W)
                 # 步骤1：去掉每个Tensor中长度为1的维度（把[1, H, W]转成[H, W]）
-                processed_list = [tensor.squeeze(0) for tensor in tri_infos[0]['tri_id_map']]
+                processed_list = [tensor.squeeze(0)for tensor in tri_infos[0]['tri_id_map']]
                 processed_list_stage0 = [tensor.squeeze(0) for tensor in tri_infos[0]['tri_id_map_stage0']]
                 # 步骤2：在第0维（batch维）堆叠，得到[B, H, W]
                 tri_id_map_tensor = torch.stack(processed_list, dim=0)

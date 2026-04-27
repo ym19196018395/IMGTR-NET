@@ -1,9 +1,10 @@
 import argparse
 import os
 
+from matplotlib import pyplot as plt
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -224,6 +225,7 @@ def save_depth():
             # 获取可能存在的 Stage 1 真值深度（测试集如果没有则传 None）
             depth_gt = sample_cuda.get("depth", None)
             depth_stage_1 = depth_gt['stage_1'] if depth_gt is not None else None
+
             # max_lambda_c = 100.0
             # max_lambda_s = 3.0
             max_lambda_c = 0.0
@@ -267,27 +269,34 @@ def save_depth():
             # ====================================================================
             # 💡 核心可视化逻辑: 提取 Stage 1 深度图和平面法向量图
             # ====================================================================
-
+            #
             stage1_depths = outputs["depth_patchmatch"]['stage_1'][-1]
             stage1_normals = outputs["output_plane"]['normal_final']
+            tri_id_maps_np = outputs["output_plane"]['tri_id_map']
 
-            # stage1_depths = outputs["output_plane"]['depth_no_pro']
+            if depth_stage_1 is not None:
+                depth_gt_np = depth_stage_1.detach().cpu().numpy()
+            else:
+                depth_gt_np = None
+
+            # stage1_depths = outputs["output_plane"]['depth_stage1_pixels']
             # stage1_normals = outputs["output_plane"]['normal_no_pro']
 
-
-            for filename, depth_est, normal_est in zip(filenames, stage1_depths, stage1_normals):
-                # 1. 设定输出路径 (加了 s1 标记避免覆盖)
+            for b_idx, (filename, depth_est, normal_est) in enumerate(zip(filenames, stage1_depths, stage1_normals)):
+                # 1. 设定输出路径
                 depth_filename = os.path.join(args.outdir, filename.format('depth_est_s1', '.pfm'))
                 normal_filename = os.path.join(args.outdir, filename.format('normal_est_s1', '.png'))
+                diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', 'dif.png'))  # 差异图路径
 
                 os.makedirs(depth_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(normal_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(diff_filename.rsplit('/', 1)[0], exist_ok=True)
 
                 # 去除多余的维度
                 depth_est = np.squeeze(depth_est)
 
                 # ==========================================
-                # 【深度图可视化】使用你要求的 JET 与 黑底反转逻辑
+                # 【深度图可视化】
                 # ==========================================
                 valid_mask = depth_est > 0
 
@@ -309,37 +318,83 @@ def save_depth():
                     vis_color_filename = depth_filename.replace('.pfm', '_vis.png')
                     cv2.imwrite(vis_color_filename, depth_color)
 
-                    # 样式 2: 类似 Tensorboard 的灰度图 (白底黑字效果)
+                    # 样式 2: 类似 Tensorboard 的灰度图
                     depth_gray = depth_vis_uint8.copy()
                     depth_gray[~valid_mask] = 255
                     vis_gray_filename = depth_filename.replace('.pfm', '_black_vis.png')
                     cv2.imwrite(vis_gray_filename, depth_gray)
 
                 # ==========================================
-                # 【法向量图可视化】纯净版物理映射 (PIL 终极版)
+                # 【法向量图可视化】
                 # ==========================================
-
-                # 1. 安全处理维度：确保是 [3, H, W]
                 normal_est_sq = np.squeeze(normal_est)
                 if normal_est_sq.ndim == 3 and normal_est_sq.shape[-1] == 3:
                     normal_est_sq = np.transpose(normal_est_sq, (2, 0, 1))
 
-                # 2. 既然已经归一化过，直接放大到 255 即可
-                # （加个保险判断：如果你的归一化是 0~1，就乘 255；如果是 0~255 就直接用）
                 if normal_est_sq.max() <= 2.0:
                     normal_vis_uint8 = (np.clip(normal_est_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
                 else:
                     normal_vis_uint8 = np.clip(normal_est_sq, 0, 255).astype(np.uint8)
 
-                # 3. 转回图片标准的 [H, W, 3] RGB 顺序
                 normal_vis_rgb = np.transpose(normal_vis_uint8, (1, 2, 0))
-
-                # 4. 背景变黑
                 if valid_mask is not None:
                     normal_vis_rgb[~valid_mask] = 0
-
-                # 5. 直接用 PIL 保存，所见即所得
                 Image.fromarray(normal_vis_rgb).save(normal_filename)
+
+                # ====================================================================
+                # 🚨 3. 生成预测与GT的差异热力图 (带 MAE 显示 - 你的版本)
+                # ====================================================================
+                if depth_gt_np is not None:
+                    depth_est_sq = np.squeeze(depth_est)
+                    gt_curr = np.squeeze(depth_gt_np[b_idx])
+                    tri_id_curr = np.squeeze(tri_id_maps_np[b_idx])  # 获取当前的三角掩码
+
+                    # 尺寸保护
+                    if gt_curr.shape != depth_est_sq.shape:
+                        gt_curr = cv2.resize(gt_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
+                                             interpolation=cv2.INTER_NEAREST)
+                    if tri_id_curr.shape != depth_est_sq.shape:
+                        tri_id_curr = cv2.resize(tri_id_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
+                                                 interpolation=cv2.INTER_NEAREST)
+
+                    # 🔥 核心：联合有效区域掩码 (深度>0 且 属于有效三角形)
+                    mask_diff = (depth_est_sq > 0) & (gt_curr > 0) & (tri_id_curr >= 0)
+
+                    if mask_diff.any():
+                        # 1. 计算绝对误差
+                        diff_map = np.zeros_like(depth_est_sq)
+                        abs_error_array = np.abs(depth_est_sq[mask_diff] - gt_curr[mask_diff])
+                        diff_map[mask_diff] = abs_error_array
+
+                        # 🌟 2. 计算平均绝对误差 (MAE)
+                        mean_abs_error = np.mean(abs_error_array)
+
+                        # 3. 智能截断误差范围
+                        diff_max_plot = np.percentile(abs_error_array, 95)
+                        diff_max_plot = max(diff_max_plot, 0.5)
+
+                        # 4. 画图
+                        plt.figure(figsize=(10, 8))
+                        diff_map_masked = np.ma.masked_where(~mask_diff, diff_map)
+                        cmap = plt.get_cmap('jet')
+                        cmap.set_bad(color='black')
+
+                        im = plt.imshow(diff_map_masked, cmap=cmap, vmin=0, vmax=diff_max_plot)
+
+                        # 5. 添加 Colorbar
+                        cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+                        cbar.set_label('Absolute Error (Meters)', size=14)
+
+                        # 🌟 6. 在标题中极其醒目地打上 MAE
+                        plt.title(f'MAE: {mean_abs_error:.4f}m | Max Cutoff: {diff_max_plot:.2f}m',
+                                  fontsize=14, fontweight='bold')
+                        plt.axis('off')
+
+                        diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', '_dif.png'))
+                        os.makedirs(diff_filename.rsplit('/', 1)[0], exist_ok=True)
+                        plt.savefig(diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                        plt.close()
+                        print(f"Saved error heatmap with MAE ({mean_abs_error:.4f}): {diff_filename}")
                 
 
 

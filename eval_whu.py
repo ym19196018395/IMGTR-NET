@@ -3,7 +3,7 @@ import os
 
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ["CUDA_VISIBLE_DEVICES"] = "4" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
 import torch
 import torch.nn as nn
 import torch.nn.parallel

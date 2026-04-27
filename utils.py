@@ -227,15 +227,27 @@ def tocuda(sample, device, skip_keys=None, non_blocking=True):
 #====================ym-add==================================
 
 def bresenham_line(p1, p2):
-    """Bresenham算法计算两点间所有像素坐标（(x, y)格式，x=列，y=行）"""
-    x0, y0 = p1  # p1=(x1, y1)，x对应图像列，y对应图像行
-    x1, y1 = p2  # p2=(x2, y2)
+    """
+    Bresenham算法计算两点间所有像素坐标（(x, y)格式，x=列，y=行）
+    👑 修复：加入亚像素到离散像素的安全映射，彻底杜绝浮点数导致的死循环
+    """
+    # 强制四舍五入并转为整数，将亚像素点投射到最近的真实物理像素格上
+    x0 = int(round(float(p1[0])))
+    y0 = int(round(float(p1[1])))
+    x1 = int(round(float(p2[0])))
+    y1 = int(round(float(p2[1])))
+
     pixels = []
     dx = abs(x1 - x0)
     dy = abs(y1 - y0)
+
     x, y = x0, y0
     sx = 1 if x1 > x0 else -1  # x方向步进
     sy = 1 if y1 > y0 else -1  # y方向步进
+
+    # 如果起点和终点在同一个像素内，直接返回
+    if dx == 0 and dy == 0:
+        return [(x, y)]
 
     if dx > dy:
         # x为主方向
@@ -259,8 +271,8 @@ def bresenham_line(p1, p2):
                 err += dy
             y += sy
         pixels.append((x, y))  # 加入终点像素
-    return pixels
 
+    return pixels
 def scale_pixel_coords(pixels, old_W, old_H, new_W, new_H):
     """
     缩放像素坐标（从(old_W, old_H)到(new_W, new_H)）
@@ -1324,7 +1336,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         'tri_edge_ids_list': tri_edge_ids_list,
         'edges_midpoints': edges_midpoints_list, # List[B] of [E, 2]
         'edges_endpoints': edges_endpoints_list,  # List[B] of [E, 2, 2]
-        'tri_pixel_counts': tri_pixel_counts_list  # List[B] of [N_tri]
+        'tri_pixel_counts': tri_pixel_counts_list # List[B] of [N_tri]
     })
 
     return new_tri_infos

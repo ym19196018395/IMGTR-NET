@@ -358,7 +358,7 @@ class MVSDataset(Dataset):
         intrinsics_mats['stage_0'] = intrinsics_matrices_0
 
         # todo：将数据转化为list or ndarray，为的是后续可以使用，如果之后要进行并行运算还需要修改
-        vertexs = np.asarray(cdt_data.vertexs, dtype=np.int64)
+        vertexs = np.asarray(cdt_data.vertexs, dtype=np.float32)
         lines = np.asarray(cdt_data.lines, dtype=np.int64)
         # 每个 triangle 分开处理，保留 list，
         triangles = []

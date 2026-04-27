@@ -185,7 +185,7 @@ class LearnedTrianglePropagator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # 🌟 2. 精修编码器: 纯净感知聚合后的几何平面 (不要脏 Cost!)
+        # 2. 精修编码器: 纯净感知聚合后的几何平面 (不要脏 Cost!)
         # 输入: Plane(4) = 4
         self.refine_encoder = nn.Sequential(
             nn.Linear(4, hidden_dim),
@@ -201,6 +201,7 @@ class LearnedTrianglePropagator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
+
         # 初始化：bias=2.0，让自身初始权重偏高（保守起步，不要一开始就乱传播）
         nn.init.constant_(self.self_gate_net[2].bias, 2.0)
         nn.init.zeros_(self.self_gate_net[2].weight)
@@ -225,7 +226,8 @@ class LearnedTrianglePropagator(nn.Module):
         self.plane_head = nn.Sequential(
             nn.Linear(head_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 4)
+            # 🔥 极其冷酷的手术：只允许输出 1 维 (delta_Z)，彻底没收法向量的修改权！
+            nn.Linear(hidden_dim, 4) # 输出: [delta_Z(1)]
         )
 
         # 你的神来之笔：极低概率 Dropout，防视觉依赖
@@ -235,19 +237,10 @@ class LearnedTrianglePropagator(nn.Module):
         nn.init.constant_(self.plane_head[2].bias, 0.0)
         nn.init.normal_(self.plane_head[2].weight, mean=0.0, std=0.01)
 
-        # 定义一个缩放因子，用于压制 d 的巨大数值
-        # 如果你的深度大多在几十到几百，100.0 是个好数值
-        # todo：如果后续训练数据集有变化要进行更改
-        self.d_scale_factor = 200
-
-        # 🔥 新增：敞门初始化
-        # 将 Bias 设为 2.0，Sigmoid(2.0) ≈ 0.88。
-        # 让网络默认给予邻居极高的注意力权重，除非 EdgeHead 强行出示红牌！
-        # nn.init.constant_(self.gate_net[2].bias, 2.0)
-        # nn.init.normal_(self.gate_net[2].weight, mean=0.0, std=0.01)
 
     def forward(self, current_planes, current_costs, neighbor_indices,
-                edge_probs, pixel_counts=None, ref_feature=None, centroids_norm=None):
+                edge_probs, rays_centroids, depth_max,
+                pixel_counts=None, ref_feature=None, centroids_norm=None):
         """
         Args:
             current_planes: [B, N, 4] 当前平面的 (nx, ny, nz, d)
@@ -257,20 +250,28 @@ class LearnedTrianglePropagator(nn.Module):
             pixel_counts: [B, N] 三角形的像素个数
             ref_feature: [B, C, H, W] Stage 1 的高频图像特征图 (用于特征感知)
             centroids_norm: [B, N, 2] 三角形的归一化质心坐标 [-1, 1] (用于采样特征)
+            rays_centroids：质心射线, depth_max：深度最大值
         Returns:
             final_planes: 传播精修后的最终平面 [B, N, 4]
         """
         B, N, _ = current_planes.shape
         device = current_planes.device
+        F_curr = None
 
         # ==========================================
-        # 1. 提取基础隐特征 & 分离缩放 d
+        # 1. 提取基础隐特征 & 动态自适应缩放 d
         # ==========================================
+        # 统一处理 depth_max，兼容标量和 Tensor
+        if isinstance(depth_max, torch.Tensor):
+            d_max_val = depth_max.view(-1, 1, 1)
+        else:
+            d_max_val = float(depth_max)
+
         n_curr = current_planes[..., :3]
-        d_curr_scaled = current_planes[..., 3:] / self.d_scale_factor
+        # 使用场景最大深度进行自适应归一化，彻底抛弃死板的 200！
+        d_curr_scaled = current_planes[..., 3:] / d_max_val
         scaled_planes = torch.cat([n_curr, d_curr_scaled], dim=-1)  # [B, N, 4]
 
-        # 构造输入特征: [B, N, 5] -> 编码 -> [B, N, H]
         plane_feat = torch.cat([scaled_planes, current_costs], dim=-1)
         init_hidden = self.init_encoder(plane_feat)
 
@@ -373,53 +374,50 @@ class LearnedTrianglePropagator(nn.Module):
 
         agg_n = agg_n_raw / norm_scale
         agg_d = agg_d_raw / norm_scale
-        aggregated_planes_norm = torch.cat([agg_n, agg_d], dim=-1)
 
         # ==========================================
-        # 6. 上下文感知残差精修 (Context-Aware Refinement) ym-modify-4.12
+        # 6. 🚀 质心锚定与解耦残差预测 (The Magic Happens Here)
         # ==========================================
-        agg_d_scaled = agg_d / self.d_scale_factor
-        scaled_agg_planes = torch.cat([agg_n, agg_d_scaled], dim=-1)
+        # A. 计算安全质心深度 Z_agg
+        denom = (agg_n * rays_centroids).sum(dim=-1, keepdim=True)
+        denom_safe = torch.where(denom.abs() < 1e-4, torch.full_like(denom, 1e-4), denom)
+        Z_agg = (-agg_d / denom_safe).abs()  # [B, N, 1] 此时是绝对物理深度 (米)
 
-        # A. 纯净编码融合后的几何平面 (剔除了已经失效的旧 Cost)
-        refine_hidden = self.refine_encoder(scaled_agg_planes)  # [B, N, H]
+        # B. 组装精修输入：使用 (n, Z_scaled) 而不是 (n, d_scaled)
+        Z_agg_scaled = Z_agg / d_max_val
+        refine_input_planes = torch.cat([agg_n, Z_agg_scaled], dim=-1)  # [B, N, 4]
+        refine_hidden = self.refine_encoder(refine_input_planes)
 
-        # B. 视觉特征 Dropout 处理
+        # C. 视觉特征 Dropout
         if F_curr is not None:
-            F_curr_processed = self.feat_dropout(F_curr)  # 你的核心思路落地
+            F_curr_processed = self.feat_dropout(F_curr)
         else:
             F_curr_processed = torch.zeros((B, N, self.feature_dim), device=device)
 
-        # C. 组装最强上下文记忆
-        # 顺序必须严格对应 __init__ 里的 head_in_dim:
-        # refine_hidden(融合几何) + init_hidden(历史记忆) + current_costs(初始评分) + F_curr(视觉特征)
-        refine_input = torch.cat([
-            refine_hidden,
-            init_hidden,
-            current_costs,
-            F_curr_processed
-        ], dim=-1)
+        # D. 预测解耦残差 只预测深度残差
+        refine_input = torch.cat([refine_hidden, init_hidden, current_costs, F_curr_processed], dim=-1)
+        delta_plane_raw = self.plane_head(refine_input)
 
-        # 预测残差 $\Delta n$ 和 $\Delta d$
-        delta_plane_scaled = self.plane_head(refine_input)
+        delta_n_raw = delta_plane_raw[..., :3]
+        delta_Z_raw = delta_plane_raw[..., 3:]
 
-        delta_n = delta_plane_scaled[..., :3]
-        delta_d = delta_plane_scaled[..., 3:] * self.d_scale_factor
-        delta_plane = torch.cat([delta_n, delta_d], dim=-1)
+        # E. 物理限幅 (绝对尺度限幅)
+        delta_n = torch.tanh(delta_n_raw) * 0.2  # 法向微调
+        max_shift_Z = d_max_val * 0.05  # 深度微调：最大允许移动场景深度的 5% (极其稳定!)
+        delta_Z = torch.tanh(delta_Z_raw) * max_shift_Z
 
-        new_planes = aggregated_planes_norm + delta_plane
+        # F. 执行物理更新
+        n_new_raw = agg_n + delta_n
+        n_new = F.normalize(n_new_raw, p=2, dim=-1)
+        Z_new = (Z_agg + delta_Z).abs()  # 深度永远大于 0
 
         # ==========================================
-        # 7. 终极安全约束
+        # 7. 🚀 出口反推打包 (Adapter Out)
         # ==========================================
-        new_n_raw = new_planes[..., :3]
-        new_d_raw = new_planes[..., 3:]
-        final_norm_scale = torch.norm(new_n_raw, p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+        X_new = rays_centroids * Z_new  # [B, N, 3] 质心新 3D 坐标
+        d_new = -(n_new * X_new).sum(dim=-1, keepdim=True)  # 精确反推 d
 
-        new_n_final = new_n_raw / final_norm_scale
-        new_d_final = new_d_raw / final_norm_scale
-
-        final_planes = torch.cat([new_n_final, new_d_final], dim=-1)
+        final_planes = torch.cat([n_new, d_new], dim=-1)  # [B, N, 4]
 
         return final_planes
 
@@ -547,7 +545,7 @@ class LearnedTrianglePropagator(nn.Module):
         return continuity_loss, 0.0
 
     def compute_smoothness_loss(self, planes, neighbor_indices, edge_probs,
-                                centroids_norm, intrinsics, ref_feature,
+                                centroids_norm, intrinsics, ref_feature,rays_centroids,
                                 H, W, sigma_F=0.5, lambda_ang=1.0):
         """
         V1.0 极简版光滑性约束 (特征双边驱动 + 纯 3D 物理几何能量)
@@ -572,14 +570,7 @@ class LearnedTrianglePropagator(nn.Module):
         # ============================================================
         # Step 1: 反投影计算 3D 物理质心 X_i
         # ============================================================
-        # 1.1 质心转像素坐标
-        u_px = (centroids_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B, N]
-        v_px = (centroids_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B, N]
-        uv_homo = torch.stack([u_px, v_px, torch.ones_like(u_px)], dim=-1)  # [B, N, 3]
-
-        # 1.2 相机内参逆投影为射线方向
-        K_inv = torch.inverse(intrinsics)  # [B, 3, 3]
-        rays = torch.einsum('bij,bnj->bni', K_inv, uv_homo)  # [B, N, 3]
+        rays = rays_centroids  # [B, N, 3]
 
         # 1.3 射线与平面求交，得到 3D 坐标 X_i (深度 Z = -d / (n·ray))
         n_i = planes[..., :3]  # [B, N, 3]
@@ -670,6 +661,162 @@ class LearnedTrianglePropagator(nn.Module):
                   f"E_ang={E_ang.mean().item():.4f} | "
                   f"W_feat={W_feat.mean().item():.3f} | "
                   f"W_hard={W_hard.mean().item():.3f}")
+
+        return L_smooth
+
+    def compute_smoothness_loss_v2(self, planes, neighbor_indices, edge_probs,
+                                   vertices_norm, pixel_counts, intrinsics, ref_feature,
+                                   H, W, sigma_F=0.5, lambda_ang=6.0):
+        """
+        V2.0 终极版光滑性约束 (多点面片 Point-to-Plane + 面积感知正则化)
+
+        Args:
+            planes:             [B, N, 4] 当前预测的物理平面参数 (n_x, n_y, n_z, d)
+            neighbor_indices:   [B, N, 3] 每个三角形的邻居面 ID
+            edge_probs:         [B, N, 3] EdgeHead 预测的断裂概率 (外部需 detach)
+            vertices_norm:      [B, N, 3, 2] 每个三角形 3 个顶点的归一化坐标 [-1, 1]
+            pixel_counts:       [B, N] 每个三角形在原图的像素个数 (面积)
+            intrinsics:         [B, 3, 3] 相机内参
+            ref_feature:        [B, C, H, W] 图像特征图
+            H, W:               图像高宽
+            sigma_F:            特征高斯核的标准差
+            lambda_ang:         法向量夹角的惩罚权重
+
+        Returns:
+            L_smooth (scalar)
+        """
+        B, N, _, _ = vertices_norm.shape
+        device = planes.device
+
+        # ============================================================
+        # Step 1: 面积感知权重 (Asymmetric Clipping 算法)
+        # 目标：小面片保底(0.5)，大面片压制上限(3.0)，无需二次归一化破坏语义
+        # ============================================================
+        pixel_counts_f = pixel_counts.float()
+        mean_counts = pixel_counts_f.mean(dim=1, keepdim=True).clamp(min=1.0)
+        area_weights = (pixel_counts_f / mean_counts).clamp(min=0.5, max=3.0)  # [B, N]
+
+        # ============================================================
+        # Step 2: 提取三顶点的 3D 射线 (Rays for 3 Vertices)
+        # ============================================================
+        # [B, N, 3(个顶点), 2(u,v)] -> 像素坐标
+        px = (vertices_norm[..., 0] + 1.0) / 2.0 * (W - 1)
+        py = (vertices_norm[..., 1] + 1.0) / 2.0 * (H - 1)
+        uv_homo = torch.stack([px, py, torch.ones_like(px)], dim=-1)  # [B, N, 3, 3]
+
+        K_inv = torch.inverse(intrinsics)  # [B, 3, 3]
+        # einsum 魔法：批量将 3 个顶点的齐次坐标转化为 3D 射线方向
+        rays_v = torch.einsum('bij,bnvj->bnvi', K_inv, uv_homo)  # [B, N, 3(顶点), 3(xyz)]
+
+        # ============================================================
+        # Step 3: 将射线与平面求交，得到 3D 物理顶点 X_v
+        # ============================================================
+        n_i = planes[..., :3]  # [B, N, 3]
+        d_i = planes[..., 3:]  # [B, N, 1]
+
+        # 计算分母: n · ray 得到一个单位向量的
+        denom_v = torch.einsum('bni,bnvi->bnv', n_i, rays_v)  # [B, N, 3(顶点)]
+        denom_v_safe = torch.where(denom_v.abs() < 1e-4, torch.full_like(denom_v, 1e-4), denom_v)
+
+        # 强行给 d_i 增加一维，使其变为 [B, N, 1, 1]
+        d_i_exp = d_i.unsqueeze(2)
+
+        # 深度 Z_v 和 3D 坐标 X_v
+        Z_v = (-d_i_exp / denom_v_safe.unsqueeze(-1)).abs()  # [B, N, 3(顶点), 1]
+        X_v = rays_v * Z_v  # [B, N, 3(顶点), 3(xyz)] 当前平面上真实的 3 个三维顶点
+
+        # ============================================================
+        # Step 4: 收集邻居的几何信息
+        # ============================================================
+        batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, 3)
+
+        # 邻居的法向和截距
+        n_j = n_i[batch_idx, neighbor_indices]  # [B, N, 3(邻居), 3]
+        d_j = d_i[batch_idx, neighbor_indices]  # [B, N, 3(邻居), 1]
+
+        # 邻居的 3 个物理顶点
+        X_v_neigh = X_v[batch_idx, neighbor_indices]  # [B, N, 3(邻居), 3(顶点), 3(xyz)]
+
+        # ============================================================
+        # Step 5: 计算极其严苛的 Point-to-Plane 对称距离 (单向目标切断防爆版)
+        # ============================================================
+
+        # 5.1 邻居的 3 个顶点到当前平面(i) 的距离: |n_i · X_neigh + d_i|
+        n_i_exp = n_i.unsqueeze(2).unsqueeze(2)  # [B, N, 1, 1, 3]
+        d_i_exp = d_i.unsqueeze(2).unsqueeze(2)  # [B, N, 1, 1, 1]
+
+        # 🚨 终极防爆：强行切断邻居顶点的梯度！
+        # 让 n_i 和 d_i 去主动拟合固定的空间点，绝不让梯度穿透邻居的透视除法！
+        X_v_neigh_detached = X_v_neigh.detach()  # [B, N, 3(邻居), 3(顶点), 3(xyz)]
+
+        dist_neigh_to_self = (n_i_exp * X_v_neigh_detached).sum(dim=-1, keepdim=True) + d_i_exp
+        E_dist_n2s = dist_neigh_to_self.abs().mean(dim=3).squeeze(-1)  # [B, N, 3(邻居)]
+
+        # 5.2 当前的 3 个顶点到邻居平面(j) 的距离: |n_j · X_self + d_j|
+        n_j_exp = n_j.unsqueeze(3)  # [B, N, 3(邻居), 1, 3]
+        d_j_exp = d_j.unsqueeze(3)  # [B, N, 3(邻居), 1, 1]
+
+        # 🚨 同理防爆：切断当前顶点的梯度！
+        # X_v: [B, N, 3(顶点), 3(xyz)] -> 扩展后: [B, N, 1, 3(顶点), 3(xyz)]
+        X_v_self_detached = X_v.unsqueeze(2).detach()
+
+        dist_self_to_neigh = (n_j_exp * X_v_self_detached).sum(dim=-1, keepdim=True) + d_j_exp
+        E_dist_s2n = dist_self_to_neigh.abs().mean(dim=3).squeeze(-1)  # [B, N, 3(邻居)]
+
+        # 对称物理距离 (此时梯度绝对干净平稳，只允许微调法向和截距)
+        E_dist = 0.5 * (E_dist_n2s + E_dist_s2n)  # [B, N, 3]
+
+        # ============================================================
+        # Step 6: 角度惩罚 & 最终能量
+        # ============================================================
+        cos_theta = (n_i.unsqueeze(2) * n_j).sum(dim=-1)  # [B, N, 3]
+        E_ang = 1.0 - cos_theta  # [B, N, 3]
+
+        E_geom = E_dist + lambda_ang * E_ang  # [B, N, 3]
+
+        # ============================================================
+        # Step 7: 计算双门控权重 W_ij (EdgeHead + Feature Affinity)
+        # ============================================================
+        # 这里提取质心特征 (代码简化，你需要传入质心 centroids_norm)
+        # 取平均顶点坐标作为近似质心用于采样特征
+        centroids_approx = vertices_norm.mean(dim=2)  # [B, N, 2]
+        grid = centroids_approx.view(B, N, 1, 2)
+
+        F_i = F.grid_sample(
+            ref_feature,
+            grid,
+            mode='bilinear',
+            align_corners=True,
+            padding_mode='border'  # <-- 加上这里！
+        ).squeeze(-1).permute(0, 2, 1)
+
+        F_i = F.normalize(F_i, p=2, dim=-1)
+
+        F_j = F_i[batch_idx, neighbor_indices]
+        feat_dist_sq = ((F_i.unsqueeze(2) - F_j) ** 2).sum(dim=-1)
+        W_feat = torch.exp(-feat_dist_sq / (2.0 * sigma_F ** 2))
+
+        W_hard = (1.0 - edge_probs).clamp(min=0.0, max=1.0)
+        W_ij = W_hard * W_feat
+
+        # 边界屏蔽
+        is_boundary = (neighbor_indices == torch.arange(N, device=device)[None, :, None])
+        W_ij = W_ij.masked_fill(is_boundary, 0.0)
+
+        # ============================================================
+        # Step 8: 融入面积特权，计算加权 Loss
+        # ============================================================
+        # 将每个三角形的归一化面积权重乘上去！大面片将产生极高的 Loss 压迫感！
+        weighted_energy = W_ij * E_geom * area_weights.unsqueeze(2)
+
+        weight_sum = (W_ij * area_weights.unsqueeze(2)).sum().clamp(min=1e-6)
+        L_smooth = weighted_energy.sum() / weight_sum
+
+        # --- 诊断打印 ---
+        with torch.no_grad():
+            print(f"[SMOOTH V2.0] L_smooth={L_smooth.item():.5f} | "
+                  f"E_dist(m)={E_dist.mean().item():.4f} | "
+                  f"Area_W_Max={area_weights.max().item():.2f}")
 
         return L_smooth
 
@@ -830,9 +977,23 @@ class PlanePatchMatchModule(nn.Module):
         # 把原始的像素数 Tensor
         pixel_counts_tensor = torch.stack(pixel_counts, dim=0)  # [B, N_max]
 
+        # 三角形质心坐标[B, N_max, 2]
         centroids_norm = self.fitter.collate_centroids_norm(
             tri_infos[0]['centers_list'], device
         )
+
+        # 三角形顶点归一化坐标 Tensor
+        vertices_norm = self.fitter.collate_vertices_norm(
+            tri_infos[0]['vertices_list'], device
+        )
+
+        # 三角形质心射线 rays_centroids (质心射线)
+        u_px = (centroids_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B, N]
+        v_px = (centroids_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B, N]
+        uv_homo = torch.stack([u_px, v_px, torch.ones_like(u_px)], dim=-1)  # [B, N, 3]
+
+        K_inv = torch.inverse(ref_intrinsics)  # [B, 3, 3]
+        rays_centroids = torch.einsum('bij,bnj->bni', K_inv, uv_homo)  # [B, N, 3]
 
         # 在进入传播循环前，计算 pixel_costs
         # 将特征从计算图中剥离，保护 FeatureNet 不受 Stage 1 毒害
@@ -887,7 +1048,7 @@ class PlanePatchMatchModule(nn.Module):
         # 全 0 的 Tensor 意味着没有任何人工边缘阻断，纯靠特征距离(feat_dist)去平滑
         edge_probs_tensor = torch.zeros(B, max_tri_num, 3, device=device)
 
-        # 预留存放精修后概率的变量，用于最后算 Loss
+        # 边断裂概率输出后续算loss
         edge_alpha = None
 
         # ==========================================
@@ -896,9 +1057,9 @@ class PlanePatchMatchModule(nn.Module):
 
         for iter_idx in range(self.propagator_iter):
 
-            # 第 0 轮刚结束，此时 current_planes 已经洗掉了 SVD 的白点噪声
-            # 现在让 EdgeHead 睁开眼睛，去刻画真正的物理边缘,运行 EdgeHead 预测边缘
-            if iter_idx == 1:
+            # 目前还是在一开始就算edge_prob
+            # todo：之前尝试传播一轮算效果反而还不好收敛也慢，精度也差
+            if iter_idx == 0:
                 edge_alpha = self.edge_head(
                     feat=ref_feature.detach(),
                     tri_infos=tri_infos,
@@ -911,6 +1072,7 @@ class PlanePatchMatchModule(nn.Module):
                     edge_alpha, tri_infos, max_tri_num, device
                 )
 
+
             # 5.1 传播：MLP 综合平面、代价、特征、边缘，输出平滑后的新平面
             new_planes = self.propagator(
                 current_planes=current_planes,
@@ -918,6 +1080,8 @@ class PlanePatchMatchModule(nn.Module):
                 neighbor_indices=neighbor_indices_batched,
                 edge_probs=edge_probs_tensor.detach(),  # 阻断边缘头干扰
                 ref_feature=ref_feature.detach(),  # 图像特征引导 MLP
+                rays_centroids=rays_centroids, # 三角形质心射线
+                depth_max=depth_max,  # 确保传入标量或一维Tensor
                 centroids_norm=centroids_norm,
                 pixel_counts=pixel_counts_tensor # 每个三角形的个数
             )
@@ -974,17 +1138,32 @@ class PlanePatchMatchModule(nn.Module):
 
         # 计算光滑性损失
         smoothness_loss = 0.0
+
         if lambda_s > 0.0:
-            smoothness_loss = self.propagator.compute_smoothness_loss(
+            # smoothness_loss = self.propagator.compute_smoothness_loss(
+            #     planes=final_planes,
+            #     neighbor_indices=neighbor_indices_batched,
+            #     edge_probs=edge_probs_tensor.detach(),  # 必须 detach
+            #     centroids_norm=centroids_norm,  # 传入归一化质心 [B, N, 2]
+            #     intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
+            #     ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
+            #     rays_centroids=rays_centroids,
+            #     H=H, W=W,
+            #     sigma_F=0.5,  # 可调：0.5 是 L2 归一化特征推荐值
+            #     lambda_ang=3.0  # 可调：法向平滑的相对强度
+            # )
+
+            smoothness_loss = self.propagator.compute_smoothness_loss_v2(
                 planes=final_planes,
                 neighbor_indices=neighbor_indices_batched,
                 edge_probs=edge_probs_tensor.detach(),  # 必须 detach
-                centroids_norm=centroids_norm,  # 传入归一化质心 [B, N, 2]
+                vertices_norm=vertices_norm,  # 传入三角形三个顶点
+                pixel_counts=pixel_counts_tensor,  # 每个三角形的大小
                 intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
                 H=H, W=W,
-                sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
-                lambda_ang=5.0  # 可调：法向平滑的相对强度
+                sigma_F=0.5,  # 可调：0.5 是 L2 归一化特征推荐值
+                lambda_ang=10.0  # 可调：法向平滑的相对强度
             )
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)
@@ -1160,7 +1339,7 @@ class PlanePatchMatchModule(nn.Module):
 
             del src_feat_expand, H_mats # 释放显存
 
-            # --- D. 分组相关性 (Group Correlation) ---
+            # --- D. todo:分组相关性 (Group Correlation) ---
             # [B*K, G, C/G, H, W]
             warped_src_grouped = warped_src.view(B * K, self.G, C // self.G, H, W)
 
@@ -2364,6 +2543,15 @@ class DensePlaneFitter(nn.Module)   :
             out[b, :N_b, :] = c.to(device)
 
         return out  # [B, N_max, 2]
+
+    def collate_vertices_norm(self, vertices_norm_list, device):
+        B = len(vertices_norm_list)
+        N_max = max(v.shape[0] for v in vertices_norm_list)
+        out = torch.zeros(B, N_max, 3, 2, device=device)
+        for b, v in enumerate(vertices_norm_list):
+            N_b = v.shape[0]
+            out[b, :N_b, :, :] = v.to(device)
+        return out
 
     def enforce_depth_hard_constraint(self,planes, centroids_norm, intrinsics, depth_min, depth_max, H, W):
         """
