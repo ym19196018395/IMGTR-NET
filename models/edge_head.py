@@ -46,15 +46,6 @@ class EdgeHead(nn.Module):
         # 可学习缩放，用来调节 sigmoid 输入尺度（训练稳定）
         self.register_parameter("edge_scale", nn.Parameter(torch.tensor(10.0)))
 
-        # ==========================================
-        # 🔥 新增：闭门初始化 (Closed-gate Initialization)
-        # ==========================================
-        # 因为后面有 logits = mlp_out * self.edge_scale (10.0)
-        # 我们把 bias 设为 0.2，那么初始 logits 就是 0.2 * 10 = 2.0
-        # sigmoid(2.0) ≈ 0.88，这意味着一开始 88% 的概率被认为是边缘（阻断传播）
-        # nn.init.constant_(self.edge_mlp[4].bias, 0.2)
-        # nn.init.normal_(self.edge_mlp[4].weight, mean=0.0, std=0.01)
-
 
     def _compute_analytical_depth_diff(self, midpoints_norm, planes_t1, planes_t2, intrinsics, H, W):
         """
@@ -102,103 +93,108 @@ class EdgeHead(nn.Module):
 
         return depth_diff
 
-    def forward(self, feat, tri_infos, tri_planes, intrinsics,dense_depth=None):
+    def extract_static_features(self, feat, tri_infos, dense_depth=None):
         """
-        EdgeHead.forward（兼容原始 tri_infos 格式）
-
-        Args:
-            - feat: [B, C, H, W]   (torch.Tensor)
-            - tri_infos: list length B, 每项为 dict:
-                {
-                    'batch_num_tri': int,三角形的数量
-                    'centers_list': [B,n_tri,2] 每个三角形的质点，已经归一化处理
-                    'vertices_list': [B,n_tri,3,2] 每个三角形的顶点，已进行归一化处理
-                    'edges_list' :每个边的邻接面，
-                    'edges_pixels': 每个边的像素（归一化）集合，后续需要引入作为一个特征传入mlp中
-                    'boundary_local_idxs_per_batch': 存储着断裂边，也就是只有一个面的边
-                }
-            - tri_planes: [B, N_max, 4] (当前拟合出的平面参数, n 和 d)
-            - intrinsics: [B, 3, 3] (相机内参矩阵)
-        Returns:
-            output_alphas_list: list length B, 每项是 torch.Tensor shape [E_b]，类型 float，位于 feat.device 上
-            tri_infos：已经处理完毕的数据
+        【循环外调用】
+        只在 iter_idx == 0 之前执行一次，提取不变的图像特征和初始稠密深度差。
+        返回: List[Tuple(feat_mid, dense_depth_diff)]，长度为 B
         """
         device = feat.device
         B, C, H, W = feat.shape
-
         feat_proj = self.proj(feat)
-        output_alphas_list = []
 
-        # 探测步长仅用于采样稠密深度
+        static_feats_list = []
+
+        # 定义采样步长
         pixel_step = 1.25
-        step_u = pixel_step * (2.0 / W)
-        step_v = pixel_step * (2.0 / H)
-        step_tensor = torch.tensor([step_u, step_v], device=device).view(1, 2)
+        step_tensor = torch.tensor([pixel_step * (2.0 / W), pixel_step * (2.0 / H)], device=device).view(1, 2)
 
         for b in range(B):
             current_edges = tri_infos[0]['edges_list'][b].to(device)
-            current_planes = tri_planes[b].to(device)
-            curr_intrinsics = intrinsics[b].to(device) if intrinsics.dim() == 3 else intrinsics.to(device)
-            curr_feat_map = feat_proj[b].unsqueeze(0)
-
-            if dense_depth is not None:
-                curr_dense_depth = dense_depth[b].unsqueeze(0).detach()
-            else:
-                curr_dense_depth = None
-
+            midpoints_norm = tri_infos[0]['edges_midpoints'][b].to(device)
             E = current_edges.shape[0]
+
             if E == 0:
-                output_alphas_list.append(torch.zeros(0, device=device))
+                static_feats_list.append((None, None))
                 continue
 
-            idx1 = current_edges[:, 0].long()
-            idx2 = current_edges[:, 1].long()
-            midpoints_norm = tri_infos[0]['edges_midpoints'][b].to(device)
-
-            # --- Step A: 解析面深度差 (证人 C) ---
-            planes_t1 = current_planes[idx1]
-            planes_t2 = current_planes[idx2]
-            plane_depth_diff = self._compute_analytical_depth_diff(
-                midpoints_norm, planes_t1, planes_t2, curr_intrinsics, H, W
-            )
-            plane_depth_diff = torch.clamp(plane_depth_diff, max=500.0)
-
-            # --- Step B: 提取中点图像特征 (上下文环境) ---
+            # 1. 提取中点图像特征 (RGB Context)
+            curr_feat_map = feat_proj[b].unsqueeze(0)
             mid_grid = midpoints_norm.unsqueeze(0).unsqueeze(2)
             feat_mid = F.grid_sample(curr_feat_map, mid_grid, align_corners=True).view(feat_proj.shape[1], E).permute(1,
                                                                                                                       0)
 
-            # --- Step C: 提取稠密深度差 (证人 B) ---
-            if curr_dense_depth is not None:
-                # 依然需要计算左右探测点，因为深度图是标量，必须有 diff 才有意义
+            # 2. 提取 CNN 稠密深度差 (Dense Depth Context)
+            if dense_depth is not None:
+                curr_dense_depth = dense_depth[b].unsqueeze(0).detach()
                 endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
+
+                # 计算边缘正交探测方向
                 edge_vec = endpoints[:, 1, :] - endpoints[:, 0, :]
                 ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
                 ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)
                 scaled_ortho = ortho_vec * step_tensor
 
+                # 探测点采样
                 probe_left_grid = (midpoints_norm + scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
                 probe_right_grid = (midpoints_norm - scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
 
-                depth_left = F.grid_sample(curr_dense_depth, probe_left_grid, align_corners=True).view(1, E).permute(1,
-                                                                                                                     0)
-                depth_right = F.grid_sample(curr_dense_depth, probe_right_grid, align_corners=True).view(1, E).permute(
-                    1, 0)
-                dense_depth_diff = torch.abs(depth_left - depth_right)
-                dense_depth_diff = torch.clamp(dense_depth_diff, max=500.0)
+                d_left = F.grid_sample(curr_dense_depth, probe_left_grid, align_corners=True).view(1, E).permute(1, 0)
+                d_right = F.grid_sample(curr_dense_depth, probe_right_grid, align_corners=True).view(1, E).permute(1, 0)
+                dense_depth_diff = torch.abs(d_left - d_right).clamp(max=500.0)
             else:
-                dense_depth_diff = torch.zeros_like(plane_depth_diff)
+                dense_depth_diff = torch.zeros(E, 1, device=device)
 
-            # --- Step D: 拼接并预测 ---
+            static_feats_list.append((feat_mid, dense_depth_diff))
+
+        return static_feats_list
+
+    def dynamic_forward(self, static_feats_list, tri_infos, tri_planes, intrinsics, H, W):
+        """
+        【循环内调用】
+        每一轮迭代都用最新的平面参数计算解析面深度差，并结合静态特征输出最新概率。
+        由于不包含 grid_sample，本函数执行极快。
+        """
+        device = tri_planes.device
+        B = len(static_feats_list)
+        output_alphas_list = []
+
+        for b in range(B):
+            feat_mid, dense_depth_diff = static_feats_list[b]
+            if feat_mid is None:
+                output_alphas_list.append(torch.zeros(0, device=device))
+                continue
+
+            current_edges = tri_infos[0]['edges_list'][b].to(device)
+            current_planes = tri_planes[b]  # [N, 4]
+            curr_intrinsics = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
+            midpoints_norm = tri_infos[0]['edges_midpoints'][b].to(device)
+            E = current_edges.shape[0]
+
+            idx1, idx2 = current_edges[:, 0].long(), current_edges[:, 1].long()
+
+            # --- 3. 动态特征: 重新计算解析面深度差 ---
+            # 直接使用最新的平面参数
+            planes_t1 = current_planes[idx1]
+            planes_t2 = current_planes[idx2]
+            plane_depth_diff = self._compute_analytical_depth_diff(
+                midpoints_norm, planes_t1, planes_t2, curr_intrinsics, H, W
+            ).clamp(max=500.0)
+
+            # --- 4. 特征重组与 MLP 推理 ---
             mlp_input = torch.cat([
-                feat_mid,  # [E, D]
-                dense_depth_diff,  # [E, 1]
-                plane_depth_diff  # [E, 1]
+                feat_mid,  # Static [E, D]
+                dense_depth_diff,  # Static [E, 1]
+                plane_depth_diff  # Dynamic [E, 1]
             ], dim=1)
 
             logits = self.edge_mlp(mlp_input).squeeze(1) * self.edge_scale
+
+            # --- 5. 软门控输出 (移除 STE) ---
+            # 使用普通的 Sigmoid，允许梯度平滑回传，减少误判锁死风险
             alphas = torch.sigmoid(logits)
 
+            # 边界物理强制
             is_boundary = (idx1 == idx2)
             if is_boundary.any():
                 alphas = alphas.clone()
@@ -207,6 +203,14 @@ class EdgeHead(nn.Module):
             output_alphas_list.append(alphas)
 
         return output_alphas_list
+
+    def forward(self, feat, tri_infos, tri_planes, intrinsics, dense_depth=None):
+        """
+        兼容性接口：保留原始 forward 调用习惯，但底层由动静分离逻辑支撑。
+        """
+        static_feats = self.extract_static_features(feat, tri_infos, dense_depth)
+        H, W = feat.shape[2], feat.shape[3]
+        return self.dynamic_forward(static_feats, tri_infos, tri_planes, intrinsics, H, W)
 
 
 class EdgeLabelGenerator:

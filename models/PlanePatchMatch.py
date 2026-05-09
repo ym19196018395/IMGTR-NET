@@ -227,7 +227,7 @@ class LearnedTrianglePropagator(nn.Module):
             nn.Linear(head_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             # 🔥 极其冷酷的手术：只允许输出 1 维 (delta_Z)，彻底没收法向量的修改权！
-            nn.Linear(hidden_dim, 4) # 输出: [delta_Z(1)]
+            nn.Linear(hidden_dim, 1) # 输出: [delta_Z(1)]
         )
 
         # 你的神来之笔：极低概率 Dropout，防视觉依赖
@@ -394,21 +394,16 @@ class LearnedTrianglePropagator(nn.Module):
         else:
             F_curr_processed = torch.zeros((B, N, self.feature_dim), device=device)
 
-        # D. 预测解耦残差 只预测深度残差
+        # D. 预测解耦残差
         refine_input = torch.cat([refine_hidden, init_hidden, current_costs, F_curr_processed], dim=-1)
-        delta_plane_raw = self.plane_head(refine_input)
-
-        delta_n_raw = delta_plane_raw[..., :3]
-        delta_Z_raw = delta_plane_raw[..., 3:]
+        delta_Z_raw = self.plane_head(refine_input)  # [B, N, 1]
 
         # E. 物理限幅 (绝对尺度限幅)
-        delta_n = torch.tanh(delta_n_raw) * 0.2  # 法向微调
         max_shift_Z = d_max_val * 0.05  # 深度微调：最大允许移动场景深度的 5% (极其稳定!)
         delta_Z = torch.tanh(delta_Z_raw) * max_shift_Z
 
         # F. 执行物理更新
-        n_new_raw = agg_n + delta_n
-        n_new = F.normalize(n_new_raw, p=2, dim=-1)
+        n_new = agg_n
         Z_new = (Z_agg + delta_Z).abs()  # 深度永远大于 0
 
         # ==========================================
@@ -694,7 +689,7 @@ class LearnedTrianglePropagator(nn.Module):
         # ============================================================
         pixel_counts_f = pixel_counts.float()
         mean_counts = pixel_counts_f.mean(dim=1, keepdim=True).clamp(min=1.0)
-        area_weights = (pixel_counts_f / mean_counts).clamp(min=0.5, max=3.0)  # [B, N]
+        area_weights = (pixel_counts_f / mean_counts).clamp(min=0.5, max=1.0)  # [B, N]
 
         # ============================================================
         # Step 2: 提取三顶点的 3D 射线 (Rays for 3 Vertices)
@@ -1048,6 +1043,14 @@ class PlanePatchMatchModule(nn.Module):
         # 全 0 的 Tensor 意味着没有任何人工边缘阻断，纯靠特征距离(feat_dist)去平滑
         edge_probs_tensor = torch.zeros(B, max_tri_num, 3, device=device)
 
+        # 循环外：提取 O(1) 的不变图像与稠密深度特征
+
+        static_edge_feats = self.edge_head.extract_static_features(
+            feat=ref_feature.detach(),
+            tri_infos=tri_infos,
+            dense_depth=depth_stage1.detach()
+        )
+
         # 边断裂概率输出后续算loss
         edge_alpha = None
 
@@ -1057,20 +1060,18 @@ class PlanePatchMatchModule(nn.Module):
 
         for iter_idx in range(self.propagator_iter):
 
-            # 目前还是在一开始就算edge_prob
-            # todo：之前尝试传播一轮算效果反而还不好收敛也慢，精度也差
-            if iter_idx == 0:
-                edge_alpha = self.edge_head(
-                    feat=ref_feature.detach(),
+            # 极速动态边缘更新 (O(N) 仅计算几何与 MLP)
+            edge_alpha = self.edge_head.dynamic_forward(
+                    static_feats_list=static_edge_feats,
                     tri_infos=tri_infos,
-                    tri_planes=current_planes.detach(),  # 👈 此时是最干净的平面
-                    intrinsics=ref_intrinsics
-                )
+                    tri_planes=current_planes.detach(),  # 👈 永远使用最新修正的平面
+                    intrinsics=ref_intrinsics,
+                    H=H, W=W
+            )
 
-                # 转换为三角形级别格式 [B, N_max, 3]
-                edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
-                    edge_alpha, tri_infos, max_tri_num, device
-                )
+            # 转换为三角形级别格式 [B, N_max, 3]
+            edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
+                    edge_alpha, tri_infos, max_tri_num, device)
 
 
             # 5.1 传播：MLP 综合平面、代价、特征、边缘，输出平滑后的新平面
@@ -1086,7 +1087,7 @@ class PlanePatchMatchModule(nn.Module):
                 pixel_counts=pixel_counts_tensor # 每个三角形的个数
             )
 
-            # 对传播进行一个保护
+            # # 对传播进行一个保护
             new_planes = fitter_module.enforce_depth_hard_constraint(
                 planes=new_planes,
                 centroids_norm=centroids_norm,
@@ -1149,8 +1150,8 @@ class PlanePatchMatchModule(nn.Module):
             #     ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
             #     rays_centroids=rays_centroids,
             #     H=H, W=W,
-            #     sigma_F=0.5,  # 可调：0.5 是 L2 归一化特征推荐值
-            #     lambda_ang=3.0  # 可调：法向平滑的相对强度
+            #     sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
+            #     lambda_ang=8.0  # 可调：法向平滑的相对强度
             # )
 
             smoothness_loss = self.propagator.compute_smoothness_loss_v2(
@@ -1162,8 +1163,8 @@ class PlanePatchMatchModule(nn.Module):
                 intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
                 H=H, W=W,
-                sigma_F=0.5,  # 可调：0.5 是 L2 归一化特征推荐值
-                lambda_ang=10.0  # 可调：法向平滑的相对强度
+                sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
+                lambda_ang=8.0  # 可调：法向平滑的相对强度
             )
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)

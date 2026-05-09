@@ -7,7 +7,7 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.net import compute_normal_cosine_loss
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -621,6 +621,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 连续性约束和光滑性约束权重
     max_lambda_c = 50.0
     max_lambda_s = 1.0
+    # max_lambda_c = 0.0
+    # max_lambda_s = 0.0
     max_lambda_n = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
     max_lambda_cost=0.2
     weight_alpha = 1.0
@@ -631,7 +633,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 2. 光滑性约束 (中启动，中满载，早退坡)：
     # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
-    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.01)
+    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.03)
 
     # 3. 法向约束 (晚启动，晚满载，早退坡)：
     # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
