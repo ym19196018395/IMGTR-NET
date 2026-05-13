@@ -359,29 +359,41 @@ class LearnedTrianglePropagator(nn.Module):
         self_weight = exp_self / total_weight_safe  # [B, N, 1]
         neighbor_weights = exp_neighbor / total_weight_safe.unsqueeze(2)  # [B, N, 3, 1]
 
-        # 融合平面
+        # ----------------------------------------------------
+        # ym-modify 5.9 从全局 d 聚合，改为局部 Z 投影聚合
+        # ----------------------------------------------------
+        n_curr = current_planes[..., :3]  # [B, N, 3]
+        d_curr = current_planes[..., 3:]  # [B, N, 1]
+
         neighbor_planes = current_planes[batch_idx, neighbor_indices]  # [B, N, 3, 4]
-        aggregated_planes = (neighbor_weights * neighbor_planes).sum(dim=2) + (self_weight * current_planes)
+        n_neigh = neighbor_planes[..., :3]  # [B, N, 3, 3]
+        d_neigh = neighbor_planes[..., 3:]  # [B, N, 3, 1]
 
-        # 团灭替换 (拒绝变 [0,0,0,0])
-        # 如果陷入绝境，强行保持原样 (Fitter 里已经做过安全的 Fallback，保留它是最稳妥的)
-        aggregated_planes = torch.where(is_dead_end, current_planes, aggregated_planes)
+        # 1. 法向量直接代数加权 (平滑姿态角度)
+        agg_n_raw = (neighbor_weights * n_neigh).sum(dim=2) + (self_weight * n_curr)
+        agg_n = F.normalize(agg_n_raw, p=2, dim=-1)  # [B, N, 3] 获得绝对平滑的法向量
 
-        # 对融合后的法向量重新归一化，防止向量长度坍塌
-        agg_n_raw = aggregated_planes[..., :3]
-        agg_d_raw = aggregated_planes[..., 3:]
-        norm_scale = torch.norm(agg_n_raw, p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+        # 2. 计算当前平面的绝对深度 Z_curr
+        denom_curr = (n_curr * rays_centroids).sum(dim=-1, keepdim=True)
+        denom_curr_safe = torch.where(denom_curr.abs() < 1e-4, torch.full_like(denom_curr, 1e-4), denom_curr)
+        Z_curr = (-d_curr / denom_curr_safe).abs()  # [B, N, 1]
 
-        agg_n = agg_n_raw / norm_scale
-        agg_d = agg_d_raw / norm_scale
+        # 3. 计算邻居法向量在【当前质心射线】上投射的深度 Z_neigh_to_me
+        rays_exp = rays_centroids.unsqueeze(2)  # [B, N, 1, 3]
+        denom_neigh = (n_neigh * rays_exp).sum(dim=-1, keepdim=True)
+        denom_neigh_safe = torch.where(denom_neigh.abs() < 1e-4, torch.full_like(denom_neigh, 1e-4), denom_neigh)
+        Z_neigh_to_me = (-d_neigh / denom_neigh_safe).abs()  # [B, N, 3, 1]
+
+        # 4. 加权平均局部深度 Z (绝对禁止直接聚合 d，保障空间位置不瞬移！)
+        Z_agg = (neighbor_weights * Z_neigh_to_me).sum(dim=2) + (self_weight * Z_curr)  # [B, N, 1]
+
+        # 5. 团灭替换防护 (Fallback：如果四面都被 Mask 死，保持原样)
+        agg_n = torch.where(is_dead_end, n_curr, agg_n)
+        Z_agg = torch.where(is_dead_end, Z_curr, Z_agg)
 
         # ==========================================
         # 6. 🚀 质心锚定与解耦残差预测 (The Magic Happens Here)
         # ==========================================
-        # A. 计算安全质心深度 Z_agg
-        denom = (agg_n * rays_centroids).sum(dim=-1, keepdim=True)
-        denom_safe = torch.where(denom.abs() < 1e-4, torch.full_like(denom, 1e-4), denom)
-        Z_agg = (-agg_d / denom_safe).abs()  # [B, N, 1] 此时是绝对物理深度 (米)
 
         # B. 组装精修输入：使用 (n, Z_scaled) 而不是 (n, d_scaled)
         Z_agg_scaled = Z_agg / d_max_val
@@ -1001,7 +1013,7 @@ class PlanePatchMatchModule(nn.Module):
         # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
         # todo:暂时不需要假设了，直接用拟合的结果,用了假设之后导致平面传播的一塌糊涂，很失败
         hypotheses = self.fitter.get_plane_hypotheses(
-            depth_stage2=depth_stage1,
+            depth_stage2=depth_stage1.detach(),
             tri_id_map=tri_id_map,
             intrinsics_s1=ref_intrinsics,
             max_num_triangles=max_tri_num
@@ -1164,7 +1176,7 @@ class PlanePatchMatchModule(nn.Module):
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
                 H=H, W=W,
                 sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
-                lambda_ang=8.0  # 可调：法向平滑的相对强度
+                lambda_ang=5.0  # 可调：法向平滑的相对强度
             )
 
         # 准备 Mask (如果有 tri_id_map，可以生成 invalid_mask，没有则传 None)

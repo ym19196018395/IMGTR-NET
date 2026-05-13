@@ -7,7 +7,7 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.net import compute_normal_cosine_loss
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -50,7 +50,7 @@ parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 parser.add_argument('--batch_size', type=int, default=12, help='train batch size')
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
 parser.add_argument('--logdir', default='./checkpoints/debug', help='the directory to save checkpoints/logs')
-parser.add_argument('--resume', default=False, action='store_true', help='continue to train the model')
+parser.add_argument('--resume', default=True, action='store_true', help='continue to train the model')
 
 parser.add_argument('--summary_freq', type=int, default=2, help='print and summary frequency')
 parser.add_argument('--save_freq', type=int, default=1, help='save checkpoint frequency')
@@ -125,7 +125,7 @@ optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weigh
 
 
 # load 模型 parameters
-start_epoch = 0
+start_epoch = 23
 if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.loadckpt):
     saved_models = [fn for fn in os.listdir(args.logdir) if fn.endswith(".ckpt")]
     saved_models = sorted(saved_models, key=lambda x: int(x.split('_')[-1].split('.')[0]))
@@ -622,7 +622,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_c = 50.0
     max_lambda_s = 1.0
     # max_lambda_c = 0.0
-    # max_lambda_s = 0.0
+    max_lambda_s = 0.0
     max_lambda_n = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
     max_lambda_cost=0.2
     weight_alpha = 1.0
@@ -633,7 +633,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 2. 光滑性约束 (中启动，中满载，早退坡)：
     # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
-    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.03)
+    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.01)
 
     # 3. 法向约束 (晚启动，晚满载，早退坡)：
     # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
@@ -737,7 +737,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         tri_id_map=outputs["output_plane"]['tri_id_map']
     )
 
-    cost_margin_loss = cost_margin_loss * max_lambda_cost
+    cost_margin_loss = 0.0 * max_lambda_cost
 
     # 边缘监督 Loss
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
