@@ -35,8 +35,14 @@ class FeatureNet(nn.Module):
         self.output1 = nn.Conv2d(64, 64, 1, bias=False)
         self.inner1 = nn.Conv2d(32, 64, 1, bias=True)
         self.inner2 = nn.Conv2d(16, 64, 1, bias=True)
+
         self.output2 = nn.Conv2d(64, 32, 1, bias=False)
         self.output3 = nn.Conv2d(64, 16, 1, bias=False)
+
+        # 新增：将 FPN 主干的 64 通道压缩回 8 通道，供 Stage 0 抛光使用
+        self.output0 = nn.Conv2d(64, 8, 1, bias=False)
+        # 新增：将 conv1 的 8 通道映射到 FPN 主干的 64 通道
+        self.inner3 = nn.Conv2d(8, 64, 1, bias=True)
         
      
     def forward(self, x):
@@ -60,7 +66,14 @@ class FeatureNet(nn.Module):
         del conv4
         # 细尺度
         output_feature['stage_1'] = self.output3(intra_feat)
-        
+
+        # 🔥 新增：FPN 最终融合至全分辨率 (Stage 0)
+        intra_feat = F.interpolate(intra_feat, scale_factor=2, mode="bilinear", align_corners=False) + self.inner3(
+            conv1)
+        del conv1
+        # 极细尺度特征 (Stage 0)
+        output_feature['stage_0'] = self.output0(intra_feat)
+
         del intra_feat
             
         return output_feature
@@ -153,7 +166,228 @@ class Refinement(nn.Module):
         depth = depth * (depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1)) + depth_min.view(batch_size,1,1,1)
 
         return depth
-    
+
+
+class Stage0RefinementNet_V2(nn.Module):
+    def __init__(self, in_channels=13):
+        """
+        全分辨率几何抛光机 (14通道极限内聚版)
+        输入通道编队 (总计 14):
+        8 (Stage0语义特征) + 1 (无损安全视差) + 3 (物理级Base法向) + 1 (无泄漏网格门控) + 1 (合法晶格掩码)
+        """
+        super().__init__()
+
+        # 针对全分辨率小批次 (B=1~2) 训练，全面废除 BatchNorm，采用 InstanceNorm2d 稳固量纲
+        self.refine = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 膨胀卷积（空洞系数=2），在不增加参数的前提下，跨越网格边缘捕获大尺度曲率
+            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.InstanceNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 输出层：1通道深度位移残差，2通道切空间偏转微扰 (留作后用)
+            nn.Conv2d(16, 3, kernel_size=3, padding=1, bias=True)
+        )
+
+        # 终极物理断流：强制零初始化。确保训练初始状态输出绝对为 0，誓死捍卫 Stage 1 刚性大面成果
+        nn.init.zeros_(self.refine[-1].weight)
+        nn.init.zeros_(self.refine[-1].bias)
+
+    def forward(self, feat_s0, final_planes, tri_id_map_stage0, W_plane_tri, intrinsics_s0, depth_range, depth_stage1_pixels):
+        """
+        在前向传播内部全自动流转几何计算图
+        Args:
+            feat_s0:           Stage 0 原图分辨率特征 [B, 8, H0, W0]
+            final_planes:      Stage 1 优化的稀疏平面参数 [B, N_tri, 4]
+            tri_id_map_stage0: Stage 0 的密集三角形 ID 索引图 [B, H0, W0] (无效区为-1)
+            W_plane_tri:      平面置信度 [B, N_tri, 1] 或 [B, N_tri]
+            intrinsics_s0:     Stage 0 的相机内参矩阵 [B, 3, 3]
+            depth_range:       当前场景的深度裁剪边界 (min_d, max_d)
+        """
+        B, H0, W0 = tri_id_map_stage0.shape
+        device = final_planes.device
+
+        # =====================================================================
+        # 1. 密集网格索引安全离散映射 (Advanced Indexing)
+        # =====================================================================
+        valid_mask_s0 = (tri_id_map_stage0 >= 0).unsqueeze(1)  # [B, 1, H0, W0]
+        safe_id_map = torch.where(tri_id_map_stage0 >= 0, tri_id_map_stage0, torch.zeros_like(tri_id_map_stage0)).long()
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, H0, W0)
+
+        # 1.a 提取并广播基础平面的 N 和 d
+        pixel_planes_raw = final_planes[batch_idx, safe_id_map].permute(0, 3, 1, 2)
+        N_base = pixel_planes_raw[:, 0:3, :, :]
+        d_base = pixel_planes_raw[:, 3:4, :, :]
+
+        # 对无效区域赋默认法向防爆
+        N_base = torch.where(valid_mask_s0, N_base, torch.tensor([0.0, 0.0, -1.0], device=device).view(1, 3, 1, 1))
+
+        # 1.b 🚀 【物理语义反转】：置信度 (1=平) -> 残差门控 (0=平, 关死残差)
+        W_plane_s0 = W_plane_tri[batch_idx, safe_id_map].unsqueeze(1)  # [B, 1, H0, W0]
+        M_gating_s0 = 1.0 - W_plane_s0  # 核心反转操作！
+
+        # 无效区域不需要任何修改，门控死死关掉
+        M_gating_s0 = torch.where(valid_mask_s0, M_gating_s0, torch.zeros_like(M_gating_s0)).detach()
+
+        # =====================================================================
+        # 2. 解析刚性射线求交深度场 (Z_base) 并无损双线性对齐像素级自由深度场 (Z_pixel)
+        # =====================================================================
+        # 2.a 计算刚性面片解析深度场
+        Z_base = self._analytical_ray_intersection(N_base, d_base, intrinsics_s0, depth_range, valid_mask_s0)
+
+        # 2.b 强力对齐原版自由像素深度：将较低分辨率的自由深度双线性插值扩展到 Stage 0 全分辨率
+        Z_pixel_s0 = F.interpolate(depth_stage1_pixels, size=(H0, W0), mode='bilinear', align_corners=False)
+
+        # 强制断开所有先验深度底图的因果链，Stage 0 只能作为抛光机，不能反向教 Stage 1 做人！
+        Z_base_safe = Z_base.detach()
+        Z_pixel_s0_safe = Z_pixel_s0.detach()
+
+        Z_hybrid = Z_base_safe * (1.0 - M_gating_s0) + Z_pixel_s0_safe * M_gating_s0
+
+        # =====================================================================
+        # 3. 构建视差空间护城河 (无量纲化相对视差)
+        # =====================================================================
+        disparity_base = torch.where(
+            valid_mask_s0,
+            1.0 / (Z_hybrid.detach() + 1e-6),
+            torch.zeros_like(Z_hybrid)
+        )
+
+        # =====================================================================
+        # 4. 极致压缩的 13 通道异构数据总线拼装
+        # =====================================================================
+        cnn_input = torch.cat([
+            feat_s0,  # [8 通道]
+            disparity_base,  # [1 通道]
+            N_base.detach(),  # [3 通道]
+            M_gating_s0,  # [1 通道]
+        ], dim=1)  # 严格 13 通道
+
+        # =====================================================================
+        # 5. 轰出残差！
+        # =====================================================================
+        res = self.refine(cnn_input)
+
+        # [通道 0]: 深度残差; [通道 1, 2]: UV 切空间残差 (利用 tanh 软着陆)
+        delta_z_raw = res[:, 0:1, :, :]
+        delta_uv = torch.tanh(res[:, 1:3, :, :])
+        # todo:深度比例看看是否要改，并且要好好理解一些数学公式
+        # 7. 相对深度比例钳制 (Relative Depth Percentage Clamping)
+        gamma_pct = 0.12
+        delta_z_clamped = Z_hybrid.detach() * gamma_pct * torch.tanh(delta_z_raw)
+
+        # 8. 逆向门控应用：深度场合成
+        Z_final = Z_hybrid + (M_gating_s0 * valid_mask_s0.float() * delta_z_clamped)
+
+        # 9. 切空间法向合成 (内置了 M_gating 和 安全步长 0.1)
+        N_final = self.apply_safe_tangent_refinement(N_base.detach(), delta_uv, M_gating_s0)
+
+        return res, Z_final, N_final, M_gating_s0, valid_mask_s0
+
+    def apply_safe_tangent_refinement(self,N_base: torch.Tensor, delta_uv: torch.Tensor,
+                                      M_gating: torch.Tensor) -> torch.Tensor:
+        """
+        【工业级】基于免奇点切空间投射的法向残差安全合成算子
+        采用 Duff et al. 2017 分支无感正交基构建，彻底免疫 Gimbal Lock 与 Normalize 梯度核弹。
+
+        参数:
+            N_base:   [B, 3, H, W] 基础法向量 (Stage 1 提供，假定已归一化，务必是 detach 过的)
+            delta_uv: [B, 2, H, W] CNN输出的切向微扰 (推荐外部已用 tanh 限幅)
+            M_gating: [B, 1, H, W] 残差释放阀门 (1=允许修正的曲面，0=绝对平滑的刚性墙面)
+        """
+        # 1. 物理分量剥离
+        x = N_base[:, 0:1, :, :]
+        y = N_base[:, 1:2, :, :]
+        z = N_base[:, 2:3, :, :]
+
+        # 2. 符号流形提取与无分支正交基构建 (Duff et al. 2017)
+        # torch.where 维持 SIMT 计算并行，无分支损耗
+        sign_z = torch.where(z >= 0.0, torch.ones_like(z), -torch.ones_like(z))
+
+        # 架构师注：sign_z + z 的绝对值恒 >= 1，数学上绝对不可能为 0，摒弃多余的 eps！
+        a = -1.0 / (sign_z + z)
+        b = x * y * a
+
+        # 构造绝对正交的切线向量 T1 与副法线向量 T2
+        t1_x = 1.0 + sign_z * (x ** 2) * a
+        t1_y = sign_z * b
+        t1_z = -sign_z * x
+        T1 = torch.cat([t1_x, t1_y, t1_z], dim=1)
+
+        t2_x = b
+        t2_y = sign_z + (y ** 2) * a
+        t2_z = -y
+        T2 = torch.cat([t2_x, t2_y, t2_z], dim=1)
+
+        # 3. 门控钳制与步长封锁 (Gated Clamping)
+        # 乘以 0.1 作为最大偏转弧度约束，再乘以门控矩阵
+        # 白墙区 (M_gating=0): delta_u/v 彻底归零，T1/T2 被抛弃，强力维持 N_base
+        ratio=0.1
+        delta_u = delta_uv[:, 0:1, :, :] * ratio * M_gating
+        delta_v = delta_uv[:, 1:2, :, :] * ratio * M_gating
+
+        # 4. 几何解析归一化 (Analytic Normalization)
+        # 由于 T1, T2 垂直于 N_base，合成向量长度平方恒为 1 + u^2 + v^2。
+        # 绝不使用 F.normalize()，从根本上消灭由于向量可能为 0 带来的除零梯度爆炸！
+        len_sq = 1.0 + (delta_u ** 2) + (delta_v ** 2)
+        N_final = (N_base + delta_u * T1 + delta_v * T2) / torch.sqrt(len_sq)
+
+        return N_final
+
+    def _analytical_ray_intersection(self, N_base, d_base, intrinsics, depth_range, valid_mask):
+        """
+        【内部轻量级算子】纯数学解析射线求交，无任何可视化脏操作干扰
+        """
+        B, _, H, W = N_base.shape
+        device = N_base.device
+
+        fx = intrinsics[:, 0, 0].view(B, 1, 1, 1)
+        fy = intrinsics[:, 1, 1].view(B, 1, 1, 1)
+        cx = intrinsics[:, 0, 2].view(B, 1, 1, 1)
+        cy = intrinsics[:, 1, 2].view(B, 1, 1, 1)
+
+        # 构造网格
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+        x_grid = x_grid.view(1, 1, H, W).expand(B, 1, -1, -1)
+        y_grid = y_grid.view(1, 1, H, W).expand(B, 1, -1, -1)
+
+        # 射线方向
+        ray_x = (x_grid - cx) / fx
+        ray_y = (y_grid - cy) / fy
+        # ray_z = 1.0 (隐式存在)
+
+        # 解析点积： N_x * ray_x + N_y * ray_y + N_z * 1.0
+        dot_product = N_base[:, 0:1] * ray_x + N_base[:, 1:2] * ray_y + N_base[:, 2:3]
+
+        # 安全除法保护
+        valid_dot = torch.abs(dot_product) > 1e-4
+        dot_safe = torch.where(valid_dot, dot_product, torch.sign(dot_product + 1e-10) * 1e-4)
+
+        # Z = -d / (N dot Ray)
+        depth = (-d_base / dot_safe).abs()
+
+        # 数值截断 (Clamp)
+        if depth_range is not None:
+            min_d, max_d = depth_range
+            if isinstance(min_d, torch.Tensor): min_d = min_d.view(-1, 1, 1, 1).to(device)
+            if isinstance(max_d, torch.Tensor): max_d = max_d.view(-1, 1, 1, 1).to(device)
+            depth = torch.clamp(depth, min=min_d, max=max_d)
+            # fill_val = min_d.expand_as(depth) if isinstance(min_d, torch.Tensor) else min_d
+        else:
+            depth = torch.clamp(depth, max=600.0)
+            # fill_val = depth.mean()
+
+        # 未命中区域填充保底值
+        fallback_depth = torch.zeros_like(depth)
+        depth = torch.where(valid_mask, depth, fallback_depth)
+        return depth
 
 class PatchmatchNet(nn.Module):
     """ 主体网络，执行 coarse→fine 的可学习 PatchMatch 深度估计"""
@@ -215,6 +449,8 @@ class PatchmatchNet(nn.Module):
 
         self.stage1_refine = GeometricRefinement(in_channels=16)
 
+        # 注入高度工程集成的 Stage 0 抛光引擎
+        self.stage0_refiner = Stage0RefinementNet_V2(in_channels=13)
 
     def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1,lambda_c, lambda_s):
         
@@ -266,12 +502,14 @@ class PatchmatchNet(nn.Module):
         output_plane={
             'final_plane':[], # 最终结果平面 B,N,4
            'depth_stage1_pixels':[],# stage2放大后产生的深度图
-            'normal_final':[], # 传播后stage1最终平面
+            'normal_final':[], # 传播后法向量可视化
             'tri_id_map':[],# 三角形stage1下的id图
             'tri_id_map_stage0': [],  # 三角形stage1下的id图
             'depth_no_pro': [],  # 刚拟合完的深度值
-            'normal_no_pro': [],  # 刚拟合完的法向量
-            'pixel_costs':[] # 计算出来的代价
+            'normal_no_pro': [],  # 刚拟合完的法向量可视化
+            'pixel_costs':[], # 计算出来的代价
+            'W_plane_pixel':[], # 平面置信度
+            'final_normal':[] # 最终法向量
         }
         score = []
         
@@ -345,7 +583,7 @@ class PatchmatchNet(nn.Module):
 
 
                 (depth_samples, pixel_costs, view_weights,normal_samples,output_plane['final_plane'],edge_alpha,
-                 continuity_loss,smoothness_loss) = self.plane_patchmatch_agent.forward(
+                 continuity_loss,smoothness_loss,W_plane_pixel,W_plane_tri) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
                                                                     ref_feature[f'stage_{l}'],
@@ -385,6 +623,8 @@ class PatchmatchNet(nn.Module):
 
                 output_plane['pixel_costs'] = pixel_costs
 
+                output_plane['W_plane_pixel'] = W_plane_pixel
+
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
 
@@ -403,7 +643,7 @@ class PatchmatchNet(nn.Module):
                 # output_plane['depth_gt'] = depth_gt_plane_stage_1
                 # output_plane['normal_gt'] = normal_gt_plane_stage_1
 
-                # planepatchmatch最终预测结果，里面也有两份一份用来上采样一份用来输出
+                # planepatchmatch最终预测结果，里面也有两份一份是像素级深度 另一份是平面级深度
                 depth_samples[0]=depth_stage1_init
                 depth = depth_samples
 
@@ -424,10 +664,26 @@ class PatchmatchNet(nn.Module):
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
 
-        # step 3. Refinement  
-        depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
-        refined_depth['stage_0'] = depth
+        # step 3. Refinement
 
+        # depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
+
+        # 传入你已经在信心模块里用多项式算好的稀疏 output_plane['M_gating_tri']
+        res, Z_final, N_final, M_gating_s0, valid_mask_s0 = self.stage0_refiner(
+            feat_s0=ref_feature['stage_0'],
+            final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
+            tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
+            W_plane_tri=W_plane_tri,  # [B, N_tri] 稀疏平面门控
+            intrinsics_s0=intrinsics_mats['stage_0'][:, 0],  # [B, 3, 3]
+            depth_range=(depth_min, depth_max),  # 场景深度裁剪范围
+            depth_stage1_pixels=output_plane['depth_stage1_pixels']
+        )
+
+        # ====== 🛡️ [在此无情拦截：切空间合成网络后续再做] ======
+        # 目前你已经拿到了绝对纯净、无任何插值模糊的残差源张量 res [B, 3, H0, W0]
+        # 以及完好无损的 Z_base, N_base 和像素级无泄漏死区遮罩 M_gating_s0
+        refined_depth['stage_0'] = Z_final
+        output_plane['final_normal'] = N_final
         del depth, ref_feature, src_features
 
         if self.training:
@@ -494,73 +750,7 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     return loss
 
 
-def compute_normal_cosine_loss(final_planes, tri_id_map, gt_normals_math_s0, depth_stage_1):
-    """
-    计算 Stage 1 预测平面与 Stage 0 GT 法向量之间的余弦相似度损失。
 
-    Args:
-        final_planes: [B, N, 4] Stage 1 的平面参数
-        tri_id_map: [B, H, W] Stage 1 的三角形 ID 图
-        gt_normals_math_s0: [B, 3, H0, W0] Stage 0 的数学真值法向量 [-1, 1]
-        depth_stage_1: [B, 1, H, W] Stage 1 的预测/GT 深度，用于过滤无效背景
-
-    Returns:
-        normal_loss: 标量 Loss
-    """
-    B, N, _ = final_planes.shape
-    _, H, W = tri_id_map.shape
-    device = final_planes.device
-
-    # =======================================================
-    # 步骤 A: 对 Stage 0 的 GT 法向量进行正确的下采样
-    # =======================================================
-    # 必须使用 bilinear 插值，防止法向量出现最近邻的“马赛克锯齿”
-    gt_normals_s1 = F.interpolate(
-        gt_normals_math_s0,
-        size=(H, W),  # 直接对齐目标尺寸，比 scale_factor 更安全
-        mode='bilinear',
-        align_corners=False
-    )
-    # 🌟 极其关键：插值后向量长度缩水，必须重新 L2 归一化
-    gt_normals_s1 = F.normalize(gt_normals_s1, p=2, dim=1)
-
-    # =======================================================
-    # 步骤 B: 高效提取 Stage 1 预测的“纯数学”法向量
-    # =======================================================
-    # 1. 取出预测的法向量 n [B, N, 3]，并归一化
-    pred_tri_normals = final_planes[..., :3]
-    pred_tri_normals = F.normalize(pred_tri_normals, p=2, dim=-1)
-
-    # 2. 处理无效区域 ID (将 -1 暂时替换为 0 以防查表越界)
-    safe_id_map = tri_id_map.clone()
-    invalid_mask = (safe_id_map < 0)
-    safe_id_map[invalid_mask] = 0
-
-    # 3. 极其高效的查表渲染 (替代复杂的 for 循环)
-    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
-    pred_pixel_normals = pred_tri_normals[batch_idx, safe_id_map]  # [B, H, W, 3]
-    pred_pixel_normals = pred_pixel_normals.permute(0, 3, 1, 2)  # [B, 3, H, W]
-
-    # =======================================================
-    # 步骤 C: 计算余弦相似度损失
-    # =======================================================
-    # 1. 计算点积 sum(N_pred * N_gt)
-    cos_sim = torch.sum(pred_pixel_normals * gt_normals_s1, dim=1, keepdim=True)  # [B, 1, H, W]
-
-    # 2. 转换为 Loss (1.0 - cos_sim)，完全同向时 Loss 为 0
-    loss_map = 1.0 - cos_sim
-
-    # 3. 构建有效 mask (去除原来 tri_id_map < 0 的区域，以及深度为 0 的背景)
-    valid_mask = (~invalid_mask.unsqueeze(1)) & (depth_stage_1 > 1e-4)
-
-    # 4. 最终法向损失
-    normal_loss = loss_map[valid_mask].mean()
-
-    # 容错：如果整张图全部无效（极少见），返回 0 梯度
-    if torch.isnan(normal_loss):
-        normal_loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-    return normal_loss
 
 def adjust_image_dims(
         images: List[torch.Tensor], intrinsics: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor, int, int]:

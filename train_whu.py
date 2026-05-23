@@ -5,7 +5,7 @@ import math
 
 from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
-from models.net import compute_normal_cosine_loss
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import torch
@@ -50,7 +50,7 @@ parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 parser.add_argument('--batch_size', type=int, default=12, help='train batch size')
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
 parser.add_argument('--logdir', default='./checkpoints/debug', help='the directory to save checkpoints/logs')
-parser.add_argument('--resume', default=True, action='store_true', help='continue to train the model')
+parser.add_argument('--resume', default=False, action='store_true', help='continue to train the model')
 
 parser.add_argument('--summary_freq', type=int, default=2, help='print and summary frequency')
 parser.add_argument('--save_freq', type=int, default=1, help='save checkpoint frequency')
@@ -125,7 +125,7 @@ optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weigh
 
 
 # load 模型 parameters
-start_epoch = 23
+start_epoch = 0
 if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.loadckpt):
     saved_models = [fn for fn in os.listdir(args.logdir) if fn.endswith(".ckpt")]
     saved_models = sorted(saved_models, key=lambda x: int(x.split('_')[-1].split('.')[0]))
@@ -495,6 +495,125 @@ def compute_pixel_cost_margin_loss(no_prop_depth, gt_depth, pixel_costs, tri_id_
 
     return total_loss
 
+def compute_normal_cosine_loss(final_planes, tri_id_map, gt_normals_math_s0, depth_stage_1):
+    """
+    计算 Stage 1 预测平面与 Stage 0 GT 法向量之间的余弦相似度损失。
+
+    Args:
+        final_planes: [B, N, 4] Stage 1 的平面参数
+        tri_id_map: [B, H, W] Stage 1 的三角形 ID 图
+        gt_normals_math_s0: [B, 3, H0, W0] Stage 0 的数学真值法向量 [-1, 1]
+        depth_stage_1: [B, 1, H, W] Stage 1 的预测/GT 深度，用于过滤无效背景
+
+    Returns:
+        normal_loss: 标量 Loss
+    """
+    B, N, _ = final_planes.shape
+    _, H, W = tri_id_map.shape
+    device = final_planes.device
+
+    # =======================================================
+    # 步骤 A: 对 Stage 0 的 GT 法向量进行正确的下采样
+    # =======================================================
+    # 必须使用 bilinear 插值，防止法向量出现最近邻的“马赛克锯齿”
+    gt_normals_s1 = F.interpolate(
+        gt_normals_math_s0,
+        size=(H, W),  # 直接对齐目标尺寸，比 scale_factor 更安全
+        mode='bilinear',
+        align_corners=False
+    )
+    # 🌟 极其关键：插值后向量长度缩水，必须重新 L2 归一化
+    gt_normals_s1 = F.normalize(gt_normals_s1, p=2, dim=1)
+
+    # =======================================================
+    # 步骤 B: 高效提取 Stage 1 预测的“纯数学”法向量
+    # =======================================================
+    # 1. 取出预测的法向量 n [B, N, 3]，并归一化
+    pred_tri_normals = final_planes[..., :3]
+    pred_tri_normals = F.normalize(pred_tri_normals, p=2, dim=-1)
+
+    # 2. 处理无效区域 ID (将 -1 暂时替换为 0 以防查表越界)
+    safe_id_map = tri_id_map.clone()
+    invalid_mask = (safe_id_map < 0)
+    safe_id_map[invalid_mask] = 0
+
+    # 3. 极其高效的查表渲染 (替代复杂的 for 循环)
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
+    pred_pixel_normals = pred_tri_normals[batch_idx, safe_id_map]  # [B, H, W, 3]
+    pred_pixel_normals = pred_pixel_normals.permute(0, 3, 1, 2)  # [B, 3, H, W]
+
+    # =======================================================
+    # 步骤 C: 计算余弦相似度损失
+    # =======================================================
+    # 1. 计算点积 sum(N_pred * N_gt)
+    cos_sim = torch.sum(pred_pixel_normals * gt_normals_s1, dim=1, keepdim=True)  # [B, 1, H, W]
+
+    # 2. 转换为 Loss (1.0 - cos_sim)，完全同向时 Loss 为 0
+    loss_map = 1.0 - cos_sim
+
+    # 3. 构建有效 mask (去除原来 tri_id_map < 0 的区域，以及深度为 0 的背景)
+    valid_mask = (~invalid_mask.unsqueeze(1)) & (depth_stage_1 > 1e-4)
+
+    # 4. 最终法向损失
+    normal_loss = loss_map[valid_mask].mean()
+
+    # 容错：如果整张图全部无效（极少见），返回 0 梯度
+    if torch.isnan(normal_loss):
+        normal_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return normal_loss
+
+def compute_normal_cosine_loss_s0(N_pred, N_gt, valid_mask):
+    """
+    【架构师特供】Stage 0 全分辨率法向量纯净余弦损失
+    在全分辨率空间直接进行像素级张量对撞，剥离了一切查表与插值的架构负担。
+
+    Args:
+        N_pred:     [B, 3, H, W] Stage 0 抛光网络预测出的最终法向量 (例如 outputs['refined_normal'])
+        N_gt:       [B, 3, H, W] Stage 0 原分辨率数学真值法向量 [-1, 1]
+        valid_mask: [B, 1, H, W] 有效像素掩码 (通常使用数据集自带的 mask['stage_0'] > 0.5)
+
+    Returns:
+        normal_loss_s0: 标量 Loss
+    """
+    # =======================================================
+    # 1. 架构级防御：强制 L2 归一化 (防爆锁死)
+    # 虽然 N_pred 在内部做过归一化，但为了防止外部梯度扰动，
+    # Loss 算子必须在入口处自己再上一次保险！
+    # =======================================================
+    N_pred_norm = F.normalize(N_pred, p=2, dim=1)
+    N_gt_norm = F.normalize(N_gt, p=2, dim=1)
+
+    # =======================================================
+    # 2. 纯粹的代数点积 (Cosine Similarity)
+    # 向量完全同向时 dot = 1.0，完全反向时 dot = -1.0
+    # =======================================================
+    cos_sim = torch.sum(N_pred_norm * N_gt_norm, dim=1, keepdim=True)  # [B, 1, H, W]
+
+    # =======================================================
+    # 3. 极化并计算 Loss 均值
+    # 1.0 - cos_sim 使得完全同向时 Loss = 0.0
+    # =======================================================
+    loss_map = 1.0 - cos_sim
+
+    # 4. 掩码物理拦截：只对真实的建筑/物体计算梯度，背景虚空不提供监督
+    if valid_mask.dtype != torch.bool:
+        mask_bool = valid_mask > 0.5
+    else:
+        mask_bool = valid_mask
+
+        # 确保掩码维度与 loss_map [B, 1, H, W] 能够广播对齐
+    if mask_bool.dim() == 3:  # 如果是 [B, H, W]
+        mask_bool = mask_bool.unsqueeze(1)
+
+    relevant_loss = loss_map[mask_bool]
+
+    # 6. 极端情况兜底机制：如果整张图都被掩码遮蔽，返回安全的 0 梯度
+    if relevant_loss.numel() == 0:
+        return torch.tensor(0.0, device=N_pred.device, requires_grad=True)
+
+    return relevant_loss.mean()
+
 def generate_geometric_edge_gt(final_planes, current_edges, midpoints_norm, intrinsics, H, W, threshold=10.0):
     """
     动态生成几何真值 (免受斜面干扰的绝对真值)
@@ -539,6 +658,46 @@ def generate_geometric_edge_gt(final_planes, current_edges, midpoints_norm, intr
 
     return geom_targets
 
+
+def tensor_to_pseudocolor(tensor_map, mask=None, colormap=cv2.COLORMAP_JET, invert=True):
+    """
+    将单通道特征图转换为 RGB 伪彩色 Tensor，专用于 TensorBoard 优雅展示。
+
+    Args:
+        tensor_map: [H, W] 或 [1, H, W] 的单通道 Tensor，值域 [0, 1]
+        mask: [H, W] 或 [1, H, W] 的布尔/0-1 Tensor，可选。无效区域将被涂成纯黑。
+        colormap: OpenCV 伪彩色映射表
+        invert: 是否反转数值。反转后 1.0(平面)映射为蓝，0.0(曲面)映射为红。
+
+    Returns:
+        [3, H, W] 的 RGB Tensor，值域 [0, 1]
+    """
+    # 1. 维度降维保证是 2D
+    if tensor_map.dim() == 3:
+        tensor_map = tensor_map.squeeze(0)
+
+    # 2. 转为 numpy uint8
+    map_np = (tensor_map.detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+
+    # 3. 色彩反转 (满足红危险/蓝安全的工程直觉)
+    if invert:
+        map_np = 255 - map_np
+
+    # 4. 应用 OpenCV 伪彩色映射 (输出为 BGR)
+    color_map_bgr = cv2.applyColorMap(map_np, colormap)
+
+    # 5. 绝对纯黑背景截断 (解决 JET 的 0 是深蓝的问题)
+    if mask is not None:
+        if mask.dim() == 3:
+            mask = mask.squeeze(0)
+        mask_np = mask.detach().cpu().numpy()
+        color_map_bgr[mask_np == 0] = [0, 0, 0]  # BGR 纯黑
+
+    # 6. BGR 转 RGB，再转回 Tensor
+    color_map_rgb = cv2.cvtColor(color_map_bgr, cv2.COLOR_BGR2RGB)
+    color_tensor = torch.from_numpy(color_map_rgb).permute(2, 0, 1).float() / 255.0
+
+    return color_tensor.unsqueeze(0)  # 输出变为 [1, 3, H, W]
 
 def get_smooth_weight_with_decay(progress, start_prog, end_prog, decay_prog, max_weight, end_ratio=0.1):
     """
@@ -619,25 +778,29 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 一开始不启动连续性约束和光滑性约束，后面再打开，目前是直接打开
     progress = global_step / total_steps
     # 连续性约束和光滑性约束权重
-    max_lambda_c = 50.0
-    max_lambda_s = 1.0
+    max_lambda_c = 25.0
+    max_lambda_s = 0.5
     # max_lambda_c = 0.0
-    max_lambda_s = 0.0
-    max_lambda_n = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
+    # max_lambda_s = 0.0
+    max_lambda_n_1 = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
+    max_lambda_n_0 = 0.0
     max_lambda_cost=0.2
     weight_alpha = 1.0
 
     # 1. 连通性约束 (早启动，早满载，晚退坡)：
     # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
-    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.4, 0.6, max_lambda_c, end_ratio=0.01)
+    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.4, 0.6, max_lambda_c, end_ratio=0.05)
 
     # 2. 光滑性约束 (中启动，中满载，早退坡)：
     # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
-    lambda_s = get_smooth_weight_with_decay(progress, 0.2, 0.4, 0.6, max_lambda_s, end_ratio=0.01)
+    lambda_s = get_smooth_weight_with_decay(progress, 0.15, 0.4, 0.6, max_lambda_s, end_ratio=0.05)
 
     # 3. 法向约束 (晚启动，晚满载，早退坡)：
     # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
-    lambda_n = get_smooth_weight_with_decay(progress, 0.3, 0.5, 0.55, max_lambda_n, end_ratio=0.05)
+    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.3, 0.5, 0.55, max_lambda_n_1, end_ratio=0.05)
+
+    # 4. cost约束
+    lambda_cost = get_smooth_weight_with_decay(progress, 0.0, 0.1, 0.6, max_lambda_cost, end_ratio=0.5)
 
     # lambda_c,lambda_s,lambda_n=0.0,0.0,0.0
 
@@ -657,7 +820,9 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # ====================================================
     # 0-1掩码 用来损失函数的
     valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
+    valid_mask_s0 = (outputs["output_plane"]['tri_id_map_stage0'] >= 0).float().unsqueeze(dim=1)
     mask['stage_1']=valid_mask_s1
+    mask['stage_0'] = valid_mask_s0
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
 
     # ====================================================
@@ -699,18 +864,6 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         gt_normal_map=gt_normals_math,
     )
 
-    # ----------------------------------------------------
-    # 阶段 B：送入 Loss 函数进行动态混合和计算
-    # ----------------------------------------------------
-
-    # loss_alpha_raw, loss_sparsity_raw,edge_alphas_gt = compute_edge_supervision_loss(
-    #     edge_label_generator=edge_label_generator,
-    #     pred_alphas_list=outputs["edge_alphas"],
-    #     gt_depth_map=depth_gt[f'stage_1'],
-    #     tri_infos=outputs["tri_infos"],
-    #     tri_id_map=outputs["output_plane"]['tri_id_map'],
-    # )
-
     # 边预测头 Loss 计算
     loss_alpha_raw, loss_sparsity_raw = compute_edge_supervision_loss_new(
         alphas_list=outputs["edge_alphas"],
@@ -722,12 +875,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 3. 损失函数的混合
     # ====================================================
 
-    # 计算法向量损失
-    normal_loss = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
-                                             tri_id_map=outputs["output_plane"]['tri_id_map'],
-                                             gt_normals_math_s0=gt_normals_math,
-                                             depth_stage_1=depth_gt['stage_1'],
-                                             )
+    # 计算法向量损失 stage1
+    # normal_loss_s1 = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
+    #                                          tri_id_map=outputs["output_plane"]['tri_id_map'],
+    #                                          gt_normals_math_s0=gt_normals_math,
+    #                                          depth_stage_1=depth_gt['stage_1'],
+    #                                          )
+    normal_loss_s0 = 0.0
+    # stage0
+    # normal_loss_s0 = compute_normal_cosine_loss_s0(N_pred=outputs["output_plane"]["final_normal"],
+    #                                                N_gt=gt_normals_math,
+    #                                                valid_mask=valid_mask_s0)
 
     # 计算 Cost Margin Loss
     cost_margin_loss = compute_pixel_cost_margin_loss(
@@ -737,7 +895,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         tri_id_map=outputs["output_plane"]['tri_id_map']
     )
 
-    cost_margin_loss = 0.0 * max_lambda_cost
+    cost_margin_loss = cost_margin_loss * lambda_cost
 
     # 边缘监督 Loss
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
@@ -750,7 +908,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     continuity_loss = outputs["continuity_loss"] * lambda_c
     smoothness_loss = outputs["smoothness_loss"] * lambda_s
-    normal_loss = normal_loss * lambda_n
+    normal_loss = normal_loss_s0 * max_lambda_n_0
 
     # 总损失：深度损失+边断裂损失+连续性损失+光滑性约束
     loss = loss_depth + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss
@@ -802,7 +960,19 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
         ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
 
+        # 给平面置信度转换颜色
+        if 'W_plane_pixel' in outputs["output_plane"]:
+            w_plane_tb_tensor = tensor_to_pseudocolor(
+                tensor_map=outputs["output_plane"]['W_plane_pixel'][0, 0],
+                mask=mask['stage_1'][0, 0] if 'stage_1' in mask else None,
+                invert=True  # 开启红蓝反转
+            )
+        else:
+            w_plane_tb_tensor = None
 
+        vis_nomal_final=get_visual_normal(outputs["output_plane"]['final_normal'], valid_mask_s0)
+
+        vis_depth_final = get_visual_depth(depth_est['stage_0'], valid_mask_s0)
         # normal_gt_s1 = compute_normal_map_perspective(
         #     gt_depth_s1,
         #     intrinsics_s1[0],
@@ -828,14 +998,16 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         # ===== tensorboard显示图片和曲线 ======================================
 
         image_outputs = {  # 暂时注释一些图片，输出的图片太多了
-            "最终预测结果": depth_est['stage_0'] * mask['stage_0'],
+            "最终预测结果": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'] ,
             "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
-            "patchmatch预测的stage2深度值": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
+            # "patchmatch预测的stage2深度值": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
             # "depth_patchmatch_stage_3": depth_patchmatch['stage_3'][-1] * mask['stage_3'],
             "ref_img": sample["imgs"]['stage_0'][:, 0],
-            # 新增：基于像素点的法向量图
-            "根据深度真值生成的法向量": gt_normals_vis,
+            # todo:暂时不要真值法向量可视化
+            # "根据深度真值生成的法向量": gt_normals_vis,
+            "物理平面置信度_W_plane": w_plane_tb_tensor,
+            "最终预测的法向量":vis_nomal_final,
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图传播完
             "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_final'],
@@ -934,7 +1106,9 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # 3. 损失计算 (同步使用新的 Edge Loss 和 Normal Loss)
     # ====================================================
     valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
-    mask['stage_1'] = valid_mask_s1
+    valid_mask_s0 = (outputs["output_plane"]['tri_id_map_stage0'] >= 0).float().unsqueeze(dim=1)
+    mask['stage_1']=valid_mask_s1
+    mask['stage_0'] = valid_mask_s0
 
     loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
 
@@ -1019,10 +1193,25 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             device=device, overlay_alpha=0.6, line_thickness=1
         )
 
+        # 给平面置信度转换颜色
+        if 'W_plane_pixel' in outputs["output_plane"]:
+            w_plane_tb_tensor = tensor_to_pseudocolor(
+                tensor_map=outputs["output_plane"]['W_plane_pixel'][0, 0],
+                mask=mask['stage_1'][0, 0] if 'stage_1' in mask else None,
+                invert=True  # 开启红蓝反转
+            )
+        else:
+            w_plane_tb_tensor = None
+
+        vis_nomal_final = get_visual_normal(outputs["output_plane"]['final_normal'], valid_mask_s0)
+
+        vis_depth_final = get_visual_depth(depth_est['stage_0'], valid_mask_s0)
+
         image_outputs = {
-            "最终预测结果": depth_est['stage_0'] * mask['stage_0'],
+            "最终预测结果": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'],
-            "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
+            # "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
+            "最终预测的法向量": vis_nomal_final,
             "ref_img": sample["imgs"]['stage_0'][:, 0],
             "根据深度真值生成的法向量": gt_normals_vis,
             "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_final'],
@@ -1030,7 +1219,8 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             "没有经过平面传播，刚拟合完初始平面深度值": outputs["output_plane"]['depth_no_pro'],
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'],
             "ref_img_edge_alpha_pre": image_outputs_pre["ref_img_edge_alpha"],
-            "ref_img_edge_alpha_gt": image_outputs_gt["ref_img_edge_alpha"]
+            "ref_img_edge_alpha_gt": image_outputs_gt["ref_img_edge_alpha"],
+            "物理平面置信度_W_plane": w_plane_tb_tensor
         }
 
     # if detailed_summary:

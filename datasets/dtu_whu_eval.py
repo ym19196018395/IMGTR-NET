@@ -418,6 +418,7 @@ class MVSDataset(Dataset):
         return {"imgs": imgs,  # N*3*H0*W0
                 "proj_matrices": proj,  # N*4*4
                 "intrinsics_mats": intrinsics_mats,  # N*3*3
+                "depth": depth,  # 1*H0 * W0
                 "depth_min": depth_min,  # scalar
                 "depth_max": depth_max,  # scalar
                 "filename": scan +'/{}/' + '{}'.format(file_id) + "{}",

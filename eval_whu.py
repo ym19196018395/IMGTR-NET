@@ -1,6 +1,7 @@
 import argparse
 import os
 
+from matplotlib import pyplot as plt
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "4" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
@@ -267,28 +268,44 @@ def save_depth():
             # ====================================================================
             # 💡 核心可视化逻辑: 提取 Stage 1 深度图和平面法向量图
             # ====================================================================
-
-
+            #
             stage1_depths = outputs["depth_patchmatch"]['stage_1'][-1]
             stage1_normals = outputs["output_plane"]['normal_final']
+            tri_id_maps_np = outputs["output_plane"]['tri_id_map']
 
-            # stage1_depths = outputs["output_plane"]['depth_no_pro']
+            # 🎯 架构师新增：提取像素级原生深度和 Stage 0 网格掩码
+            stage1_depths_pixels = outputs["output_plane"]['depth_stage1_pixels']
+            tri_id_maps_s0_np = outputs["output_plane"]['tri_id_map_stage0']
+
+            # 统一转 numpy
+            if isinstance(tri_id_maps_np, torch.Tensor):
+                tri_id_maps_np = tri_id_maps_np.detach().cpu().numpy()
+            if isinstance(tri_id_maps_s0_np, torch.Tensor):
+                tri_id_maps_s0_np = tri_id_maps_s0_np.detach().cpu().numpy()
+
+            if depth_stage_1 is not None:
+                depth_gt_np = depth_stage_1.detach().cpu().numpy()
+            else:
+                depth_gt_np = None
+
+            # stage1_depths = outputs["output_plane"]['depth_stage1_pixels']
             # stage1_normals = outputs["output_plane"]['normal_no_pro']
 
-
-            for filename, depth_est, normal_est in zip(filenames, stage1_depths, stage1_normals):
-                # 1. 设定输出路径 (加了 s1 标记避免覆盖)
+            for b_idx, (filename, depth_est, normal_est) in enumerate(zip(filenames, stage1_depths, stage1_normals)):
+                # 1. 设定输出路径
                 depth_filename = os.path.join(args.outdir, filename.format('depth_est_s1', '.pfm'))
                 normal_filename = os.path.join(args.outdir, filename.format('normal_est_s1', '.png'))
+                diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', 'dif.png'))  # 差异图路径
 
                 os.makedirs(depth_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(normal_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(diff_filename.rsplit('/', 1)[0], exist_ok=True)
 
                 # 去除多余的维度
                 depth_est = np.squeeze(depth_est)
 
                 # ==========================================
-                # 【深度图可视化】使用你要求的 JET 与 黑底反转逻辑
+                # 【深度图可视化】
                 # ==========================================
                 valid_mask = depth_est > 0
 
@@ -310,37 +327,226 @@ def save_depth():
                     vis_color_filename = depth_filename.replace('.pfm', '_vis.png')
                     cv2.imwrite(vis_color_filename, depth_color)
 
-                    # 样式 2: 类似 Tensorboard 的灰度图 (白底黑字效果)
+                    # 样式 2: 类似 Tensorboard 的灰度图
                     depth_gray = depth_vis_uint8.copy()
                     depth_gray[~valid_mask] = 255
                     vis_gray_filename = depth_filename.replace('.pfm', '_black_vis.png')
                     cv2.imwrite(vis_gray_filename, depth_gray)
 
                 # ==========================================
-                # 【法向量图可视化】纯净版物理映射 (PIL 终极版)
+                # 【法向量图可视化】
                 # ==========================================
-
-                # 1. 安全处理维度：确保是 [3, H, W]
                 normal_est_sq = np.squeeze(normal_est)
                 if normal_est_sq.ndim == 3 and normal_est_sq.shape[-1] == 3:
                     normal_est_sq = np.transpose(normal_est_sq, (2, 0, 1))
 
-                # 2. 既然已经归一化过，直接放大到 255 即可
-                # （加个保险判断：如果你的归一化是 0~1，就乘 255；如果是 0~255 就直接用）
                 if normal_est_sq.max() <= 2.0:
                     normal_vis_uint8 = (np.clip(normal_est_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
                 else:
                     normal_vis_uint8 = np.clip(normal_est_sq, 0, 255).astype(np.uint8)
 
-                # 3. 转回图片标准的 [H, W, 3] RGB 顺序
                 normal_vis_rgb = np.transpose(normal_vis_uint8, (1, 2, 0))
-
-                # 4. 背景变黑
                 if valid_mask is not None:
                     normal_vis_rgb[~valid_mask] = 0
-
-                # 5. 直接用 PIL 保存，所见即所得
                 Image.fromarray(normal_vis_rgb).save(normal_filename)
+
+                # ====================================================================
+                # 提前提取平面置信度 (W_plane)，供平面 MAE 切分和最终保存使用
+                # ====================================================================
+                depth_est_sq = np.squeeze(depth_est)  # [H, W]
+
+                if 'W_plane_pixel' in outputs["output_plane"]:
+                    w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
+                    w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data,
+                                                                                   torch.Tensor) else w_plane_data
+                    w_plane_sq = np.squeeze(w_plane_np)
+                    if w_plane_sq.shape != depth_est_sq.shape:
+                        w_plane_sq = cv2.resize(w_plane_sq, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
+                                                interpolation=cv2.INTER_LINEAR)
+                else:
+                    w_plane_sq = np.zeros_like(depth_est_sq)
+
+                # ====================================================================
+                # 🚨 3. 生成 Stage 1 预测与 GT 的差异热力图 (带全局与平面专属 MAE)
+                # ====================================================================
+                if depth_gt_np is not None:
+                    gt_curr = np.squeeze(depth_gt_np[b_idx])
+                    tri_id_curr = np.squeeze(tri_id_maps_np[b_idx])
+
+                    # 尺寸保护
+                    if gt_curr.shape != depth_est_sq.shape:
+                        gt_curr = cv2.resize(gt_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
+                                             interpolation=cv2.INTER_NEAREST)
+                    if tri_id_curr.shape != depth_est_sq.shape:
+                        tri_id_curr = cv2.resize(tri_id_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
+                                                 interpolation=cv2.INTER_NEAREST)
+
+                    # 有效区域掩码
+                    mask_diff = (depth_est_sq > 0) & (gt_curr > 0) & (tri_id_curr >= 0)
+
+                    if mask_diff.any():
+                        diff_map = np.zeros_like(depth_est_sq)
+                        abs_error_array = np.abs(depth_est_sq[mask_diff] - gt_curr[mask_diff])
+                        diff_map[mask_diff] = abs_error_array
+
+                        # 🌟 计算全局 MAE
+                        mean_abs_error = np.mean(abs_error_array)
+
+                        # 🌟 新增功能 1：分离并计算绝对平面区域的 MAE (W_plane > 0.9)
+                        mask_planar = mask_diff & (w_plane_sq > 0.99)
+                        if mask_planar.any():
+                            planar_mae = np.mean(np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar]))
+                            planar_text = f"\nFlat Region MAE (W>0.9): {planar_mae:.4f}m"
+                        else:
+                            planar_text = ""
+
+                        diff_max_plot = max(np.percentile(abs_error_array, 95), 0.5)
+
+                        plt.figure(figsize=(10, 8))
+                        diff_map_masked = np.ma.masked_where(~mask_diff, diff_map)
+                        cmap = plt.get_cmap('jet')
+                        cmap.set_bad(color='black')
+
+                        im = plt.imshow(diff_map_masked, cmap=cmap, vmin=0, vmax=diff_max_plot)
+                        cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+                        cbar.set_label('Absolute Error (Meters)', size=14)
+
+                        plt.title(f'Stage 1 MAE: {mean_abs_error:.4f}m {planar_text}\nMax Cutoff: {diff_max_plot:.2f}m',
+                                  fontsize=14, fontweight='bold')
+                        plt.axis('off')
+
+                        diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', '_dif.png'))
+                        plt.savefig(diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                        plt.close()
+
+                # ====================================================================
+                # 🚨 4. 生成平面置信度 (W_plane) 大图 (用于论文展示)
+                # ====================================================================
+                if 'W_plane_pixel' in outputs["output_plane"]:
+                    conf_jet_filename = os.path.join(args.outdir, filename.format('confidence_s1', '_jet.png'))
+
+                    w_plane_uint8 = (np.clip(w_plane_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    w_plane_uint8_inv = 255 - w_plane_uint8  # 反转：平面(蓝) 曲面(红)
+
+                    if 'valid_mask' in locals():
+                        w_plane_uint8_inv[~valid_mask] = 0
+
+                    w_plane_color = cv2.applyColorMap(w_plane_uint8_inv, cv2.COLORMAP_JET)
+                    if 'valid_mask' in locals():
+                        w_plane_color[~valid_mask] = 0
+
+                    cv2.imwrite(conf_jet_filename, w_plane_color)
+
+                # ====================================================================
+                # 🚨 新增功能 3：生成 Stage 1 纯自由像素级 (Pixel-wise) 深度的差异热力图
+                # 这是最原汁原味的 Baseline，用于和网格约束后的结果做对比
+                # ====================================================================
+                if depth_gt_np is not None:
+                    depth_pixel_curr = stage1_depths_pixels[b_idx]
+                    if isinstance(depth_pixel_curr, torch.Tensor):
+                        depth_pixel_curr = np.squeeze(depth_pixel_curr.detach().cpu().numpy())
+                    else:
+                        depth_pixel_curr = np.squeeze(depth_pixel_curr)
+
+                    # 尺寸对齐
+                    if gt_curr.shape != depth_pixel_curr.shape:
+                        gt_curr_pixel = cv2.resize(gt_curr, (depth_pixel_curr.shape[1], depth_pixel_curr.shape[0]),
+                                                   interpolation=cv2.INTER_NEAREST)
+                    else:
+                        gt_curr_pixel = gt_curr
+
+                    # 对于原生深度，只需要保证自身和GT都>0即可
+                    mask_diff_pixel = (depth_pixel_curr > 0) & (gt_curr_pixel > 0)
+
+                    if mask_diff_pixel.any():
+                        diff_map_pixel = np.zeros_like(depth_pixel_curr)
+                        abs_error_pixel = np.abs(depth_pixel_curr[mask_diff_pixel] - gt_curr_pixel[mask_diff_pixel])
+                        diff_map_pixel[mask_diff_pixel] = abs_error_pixel
+
+                        mean_error_pixel = np.mean(abs_error_pixel)
+                        max_plot_pixel = max(np.percentile(abs_error_pixel, 95), 0.5)
+
+                        plt.figure(figsize=(10, 8))
+                        im_pixel = plt.imshow(np.ma.masked_where(~mask_diff_pixel, diff_map_pixel), cmap=cmap, vmin=0,
+                                              vmax=max_plot_pixel)
+                        cbar_pixel = plt.colorbar(im_pixel, fraction=0.046, pad=0.04)
+                        cbar_pixel.set_label('Absolute Error (Meters)', size=14)
+
+                        plt.title(
+                            f'Baseline (Pixel-wise) MAE: {mean_error_pixel:.4f}m\nMax Cutoff: {max_plot_pixel:.2f}m',
+                            fontsize=14, fontweight='bold')
+                        plt.axis('off')
+
+                        diff_filename_pixel = os.path.join(args.outdir,
+                                                           filename.format('depth_diff_s1_pixel', '_dif.png'))
+                        os.makedirs(os.path.dirname(diff_filename_pixel), exist_ok=True)
+                        plt.savefig(diff_filename_pixel, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                        plt.close()
+
+                # ====================================================================
+                # 🚨 5. 终极更新版：生成 Stage 0 (Refined) 深度图与 GT 的热力图
+                # 🎯 修复了你指出的漏洞：强制引入 tri_id_map_stage0 掩码，隔绝虚空噪点！
+                # ====================================================================
+                if "refined_depth" in outputs and "stage_0" in sample["depth"]:
+                    depth_est_s0 = outputs["refined_depth"]["stage_0"]
+                    if isinstance(depth_est_s0, torch.Tensor):
+                        depth_est_s0_sq = np.squeeze(depth_est_s0.detach().cpu().numpy())
+                    else:
+                        depth_est_s0_sq = np.squeeze(depth_est_s0)
+
+                    gt_curr_s0 = np.squeeze(sample["depth"]["stage_0"][b_idx].detach().cpu().numpy())
+                    tri_id_curr_s0 = np.squeeze(tri_id_maps_s0_np[b_idx])  # 🎯 提取 Stage 0 专属网格掩码
+
+                    # 尺寸保护
+                    if gt_curr_s0.shape != depth_est_s0_sq.shape:
+                        gt_curr_s0 = cv2.resize(gt_curr_s0, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
+                                                interpolation=cv2.INTER_NEAREST)
+                    if tri_id_curr_s0.shape != depth_est_s0_sq.shape:
+                        tri_id_curr_s0 = cv2.resize(tri_id_curr_s0,
+                                                    (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
+                                                    interpolation=cv2.INTER_NEAREST)
+
+                    # 🔥🔥🔥 你的神级指正：加入 (tri_id_curr_s0 >= 0) 的安全锁！
+                    mask_diff_s0 = (depth_est_s0_sq > 0) & (gt_curr_s0 > 0) & (tri_id_curr_s0 >= 0)
+
+                    if mask_diff_s0.any():
+                        diff_map_s0 = np.zeros_like(depth_est_s0_sq)
+                        abs_error_array_s0 = np.abs(depth_est_s0_sq[mask_diff_s0] - gt_curr_s0[mask_diff_s0])
+                        diff_map_s0[mask_diff_s0] = abs_error_array_s0
+
+                        mean_abs_error_s0 = np.mean(abs_error_array_s0)
+
+                        # 计算 Stage 0 阶段的纯平面区域 MAE
+                        w_plane_sq_s0 = cv2.resize(w_plane_sq, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
+                                                   interpolation=cv2.INTER_LINEAR)
+                        mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.9)
+                        if mask_planar_s0.any():
+                            planar_mae_s0 = np.mean(
+                                np.abs(depth_est_s0_sq[mask_planar_s0] - gt_curr_s0[mask_planar_s0]))
+                            planar_text_s0 = f"\nFlat Region MAE (W>0.9): {planar_mae_s0:.4f}m"
+                        else:
+                            planar_text_s0 = ""
+
+                        diff_max_plot_s0 = max(np.percentile(abs_error_array_s0, 95), 0.5)
+
+                        plt.figure(figsize=(10, 8))
+                        diff_map_masked_s0 = np.ma.masked_where(~mask_diff_s0, diff_map_s0)
+                        cmap_s0 = plt.get_cmap('jet')
+                        cmap_s0.set_bad(color='black')
+
+                        im_s0 = plt.imshow(diff_map_masked_s0, cmap=cmap_s0, vmin=0, vmax=diff_max_plot_s0)
+                        cbar_s0 = plt.colorbar(im_s0, fraction=0.046, pad=0.04)
+                        cbar_s0.set_label('Absolute Error (Meters)', size=14)
+
+                        plt.title(
+                            f'Stage 0 Refined MAE: {mean_abs_error_s0:.4f}m {planar_text_s0}\nMax Cutoff: {diff_max_plot_s0:.2f}m',
+                            fontsize=14, fontweight='bold')
+                        plt.axis('off')
+
+                        diff_filename_s0 = os.path.join(args.outdir, filename.format('depth_diff_s0', '_dif.png'))
+                        os.makedirs(os.path.dirname(diff_filename_s0), exist_ok=True)
+                        plt.savefig(diff_filename_s0, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                        plt.close()
                 
 
 

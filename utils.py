@@ -1932,3 +1932,67 @@ def normalize_depth_for_display(depth, valid_mask=None):
     vis_depth[~valid_mask] = 0.0
 
     return vis_depth
+
+
+def get_visual_normal(N_map, valid_mask=None):
+    """
+    将物理法向量 [B, 3, H, W] 映射为 Tensorboard 友好的可视化 RGB 图 [B, 3, H, W]
+    映射逻辑：
+    1. 坐标轴翻转：同步 SVD 拟合与坐标系定义的轴偏置。
+    2. 线性映射：将 [-1, 1] 映射至 [0, 1] 像素空间。
+    """
+    # 1. 克隆以防修改原始计算图张量
+    vis_n = N_map.clone()
+
+    # 2. 坐标轴翻转（维持你之前讨论的“视觉友好”偏蓝色调）
+    # 翻转 Y 轴：对齐图像坐标系与物理坐标系的上下定义
+    vis_n[:, 1, :, :] = -vis_n[:, 1, :, :]
+    # 翻转 Z 轴：将朝向相机的负方向映射为正值，使画面呈现标志性的“蓝色”
+    vis_n[:, 2, :, :] = -vis_n[:, 2, :, :]
+
+    # 3. 线性缩放 [-1, 1] -> [0, 1]
+    vis_n = (vis_n + 1.0) / 2.0
+
+    # 4. 掩码物理拦截
+    if valid_mask is not None:
+        # 确保 mask 形状对齐 [B, 1, H, W] -> [B, 3, H, W]
+        mask = valid_mask.expand_as(vis_n)
+        vis_n = torch.where(mask > 0.5, vis_n, torch.zeros_like(vis_n))
+
+    return vis_n
+
+
+def get_visual_depth(depth_map, valid_mask):
+    """
+    【架构师特供】专为 TensorBoard 设计的工业级深度可视化函数。
+    彻底解决“0.0 保底值拉伸色谱，导致画面全白/细节丢失”的灾难。
+    """
+    B, _, H, W = depth_map.shape
+    # 创建一个 3 通道的 RGB 画布，默认底色为纯黑 [0, 0, 0]
+    vis_rgb = torch.zeros((B, 3, H, W), device=depth_map.device)
+
+    for i in range(B):
+        d_img = depth_map[i:i + 1]  # [1, 1, H, W]
+        mask = valid_mask[i:i + 1] > 0  # [1, 1, H, W] 布尔型
+
+        if mask.any():
+            # 1. 🚀 极其关键：只在【有效像素】中提取极值！彻底排除了 0.0 的干扰
+            valid_pixels = d_img[mask]
+            d_min = valid_pixels.min()
+            d_max = valid_pixels.max()
+
+            # 2. 局部线性归一化到 [0, 1] 范围
+            # 这样建筑物哪怕只有 10 米的景深差，也会被完美拉伸到整个灰阶色谱
+            d_norm = (d_img - d_min) / (d_max - d_min + 1e-8)
+            d_norm = torch.clamp(d_norm, 0.0, 1.0)
+
+            # 3. 将单通道灰度扩展为 3 通道 RGB
+            # （扩展为 RGB 后，TensorBoard 就绝对不会再去自作主张做 min-max 拉伸了）
+            d_rgb = d_norm.repeat(1, 3, 1, 1)
+
+            # 4. 掩码熔断：把天空/无效区域强行刷成纯黑
+            d_rgb = torch.where(mask.expand_as(d_rgb), d_rgb, torch.zeros_like(d_rgb))
+
+            vis_rgb[i:i + 1] = d_rgb
+
+    return vis_rgb
