@@ -230,10 +230,11 @@ def save_depth():
             # max_lambda_s = 3.0
             max_lambda_c = 0.0
             max_lambda_s = 0.0
+            current_temp =0.15
             outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                             sample_cuda["depth_min"], sample_cuda["depth_max"],
                             vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
-                            max_lambda_c, max_lambda_s)
+                            max_lambda_c, max_lambda_s,current_temp)
 
 
             image_outputs_pre = generate_edge_alpha_overlays(
@@ -271,7 +272,7 @@ def save_depth():
             # ====================================================================
             #
             stage1_depths = outputs["depth_patchmatch"]['stage_1'][-1]
-            stage1_normals = outputs["output_plane"]['normal_final']
+            stage1_normals = outputs["output_plane"]['normal_pro']
             tri_id_maps_np = outputs["output_plane"]['tri_id_map']
 
             # 🎯 架构师新增：提取像素级原生深度和 Stage 0 网格掩码
@@ -334,6 +335,7 @@ def save_depth():
                     vis_gray_filename = depth_filename.replace('.pfm', '_black_vis.png')
                     cv2.imwrite(vis_gray_filename, depth_gray)
 
+
                 # ==========================================
                 # 【法向量图可视化】
                 # ==========================================
@@ -394,7 +396,7 @@ def save_depth():
                         mean_abs_error = np.mean(abs_error_array)
 
                         # 🌟 新增功能 1：分离并计算绝对平面区域的 MAE (W_plane > 0.9)
-                        mask_planar = mask_diff & (w_plane_sq > 0.99)
+                        mask_planar = mask_diff & (w_plane_sq > 0.8)
                         if mask_planar.any():
                             planar_mae = np.mean(np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar]))
                             planar_text = f"\nFlat Region MAE (W>0.9): {planar_mae:.4f}m"
@@ -548,7 +550,33 @@ def save_depth():
                         os.makedirs(os.path.dirname(diff_filename_s0), exist_ok=True)
                         plt.savefig(diff_filename_s0, dpi=150, bbox_inches='tight', pad_inches=0.1)
                         plt.close()
-                
+
+                        # ====================================================================
+                        # 🎯 【新增功能】Stage 0 (Refined) 密集深度图黑白灰度图可视化
+                        # ====================================================================
+                        # 提取 Stage 0 合法几何区域掩码
+                        valid_mask_s0_vis = (depth_est_s0_sq > 0) & (tri_id_curr_s0 >= 0)
+
+                        if valid_mask_s0_vis.any():
+                            # 1% ~ 99% 百分位数动态截断，消除虚空飞点的噪声拉伸
+                            d_min_s0 = np.percentile(depth_est_s0_sq[valid_mask_s0_vis], 1)
+                            d_max_s0 = np.percentile(depth_est_s0_sq[valid_mask_s0_vis], 99)
+
+                            # 线性映射至 0.0 ~ 1.0 晶格空间
+                            depth_vis_s0 = (depth_est_s0_sq - d_min_s0) / (d_max_s0 - d_min_s0 + 1e-8)
+                            depth_vis_s0 = np.clip(depth_vis_s0, 0, 1)
+                            depth_vis_uint8_s0 = (depth_vis_s0 * 255).astype(np.uint8)
+
+                            # 复制并建立 Tensorboard 风格灰度图（有效区变暗，背景区刷白）
+                            depth_gray_s0 = depth_vis_uint8_s0.copy()
+                            depth_gray_s0[~valid_mask_s0_vis] = 255
+
+                            # 3. 动态构建输出路径并写入磁盘
+                            vis_gray_filename_s0 = os.path.join(args.outdir,
+                                                                filename.format('depth_est_s0', '_black_vis.png'))
+                            os.makedirs(os.path.dirname(vis_gray_filename_s0), exist_ok=True)
+                            cv2.imwrite(vis_gray_filename_s0, depth_gray_s0)
+
 
 
 # project the reference point cloud into the source view, then project back

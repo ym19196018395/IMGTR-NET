@@ -34,12 +34,12 @@
 MVS_TRAINING="/home/ym/Experiment/Datas/WHU_MVS_dataset"
 timestamp=$(date +%Y%m%d_%H%M%S)
 
-python train_whu.py --dataset dtu_whu --batch_size 5 --epochs 22 \
+python train_whu.py --dataset dtu_whu --batch_size 5 --epochs 24 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train23\
-2>&1 | tee txt_logs/${timestamp}_23_端到端,修改了一下约束超参,去除法向量约束.log \
+--logdir ./checkpoints/tensorboard_train31 \
+2>&1 | tee txt_logs/${timestamp}_31_调整temp,调整梯度,修正平面置信度逻辑,调高轮数.log \
  "$@"
 

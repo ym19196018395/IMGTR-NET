@@ -2,7 +2,7 @@ from typing import List, Tuple, Dict
 
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 from .PlanePatchMatch import *
-from utils import batch_convert_to_tri_infos_new,build_neighbor_indices
+from utils import batch_convert_to_tri_infos_new,build_neighbor_indices,map_tri_to_pixel_single
 from .feature_map import *
 import torch
 import torch.nn as nn
@@ -226,7 +226,8 @@ class Stage0RefinementNet_V2(nn.Module):
         N_base = torch.where(valid_mask_s0, N_base, torch.tensor([0.0, 0.0, -1.0], device=device).view(1, 3, 1, 1))
 
         # 1.b 🚀 【物理语义反转】：置信度 (1=平) -> 残差门控 (0=平, 关死残差)
-        W_plane_s0 = W_plane_tri[batch_idx, safe_id_map].unsqueeze(1)  # [B, 1, H0, W0]
+        W_plane_s0 = W_plane_tri[batch_idx, safe_id_map]  # 得到 [B, H0, W0, 1]
+        W_plane_s0 = W_plane_s0.permute(0, 3, 1, 2)  # 转换为 [B, 1, H0, W0]
         M_gating_s0 = 1.0 - W_plane_s0  # 核心反转操作！
 
         # 无效区域不需要任何修改，门控死死关掉
@@ -452,7 +453,7 @@ class PatchmatchNet(nn.Module):
         # 注入高度工程集成的 Stage 0 抛光引擎
         self.stage0_refiner = Stage0RefinementNet_V2(in_channels=13)
 
-    def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1,lambda_c, lambda_s):
+    def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1,lambda_c, lambda_s,current_temp):
         
 
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
@@ -502,13 +503,15 @@ class PatchmatchNet(nn.Module):
         output_plane={
             'final_plane':[], # 最终结果平面 B,N,4
            'depth_stage1_pixels':[],# stage2放大后产生的深度图
-            'normal_final':[], # 传播后法向量可视化
+            'normal_pro':[], # 传播后法向量--可视化
+            'normal_pro_pure': [],  # 传播后法向量像素级
             'tri_id_map':[],# 三角形stage1下的id图
             'tri_id_map_stage0': [],  # 三角形stage1下的id图
             'depth_no_pro': [],  # 刚拟合完的深度值
             'normal_no_pro': [],  # 刚拟合完的法向量可视化
             'pixel_costs':[], # 计算出来的代价
-            'W_plane_pixel':[], # 平面置信度
+            'W_plane_pixel':[], # 平面置信度 像素级
+            'W_plane_tri':[], # 平面置信度 三角级别
             'final_normal':[] # 最终法向量
         }
         score = []
@@ -590,7 +593,7 @@ class PatchmatchNet(nn.Module):
                                                                     src_features_l,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
-                lambda_c=lambda_c,lambda_s=lambda_s
+                lambda_c=lambda_c,lambda_s=lambda_s,current_temp=current_temp
                 )
 
                 # Score (Confidence) = -min_cost
@@ -608,13 +611,18 @@ class PatchmatchNet(nn.Module):
                 tri_id_map_tensor = torch.stack(processed_list, dim=0)
                 tri_id_map_stage0_tensor = torch.stack(processed_list_stage0, dim=0)
 
+                pixel_planes_s1 = map_tri_to_pixel_single(output_plane['final_plane'], tri_id_map_tensor, height,
+                                                               width)
+                pixel_normal_s1_pure = pixel_planes_s1[:, :3, :, :]  # 获得绝对纯净的 [B, 3, H, W] 物理法向量！
+
+                output_plane['normal_pro_pure'] = pixel_normal_s1_pure
                 output_plane['tri_id_map'] = tri_id_map_tensor
                 output_plane['tri_id_map_stage0'] = tri_id_map_stage0_tensor
 
                 # stage2 产生的深度图放大后，patchmatch产生的深度图
                 output_plane['depth_stage1_pixels']=depth_stage1_init
                 # 经过传播得到的平面
-                output_plane['normal_final']=normal_samples[1]
+                output_plane['normal_pro']=normal_samples[1]
 
                 # 没有进行传播得到的平面，刚拟合完的初始平面
                 # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
@@ -624,6 +632,7 @@ class PatchmatchNet(nn.Module):
                 output_plane['pixel_costs'] = pixel_costs
 
                 output_plane['W_plane_pixel'] = W_plane_pixel
+                output_plane['W_plane_tri'] = W_plane_tri
 
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
@@ -673,7 +682,7 @@ class PatchmatchNet(nn.Module):
             feat_s0=ref_feature['stage_0'],
             final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
             tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
-            W_plane_tri=W_plane_tri,  # [B, N_tri] 稀疏平面门控
+            W_plane_tri=W_plane_tri.detach(),  # [B, N_tri] 稀疏平面门控
             intrinsics_s0=intrinsics_mats['stage_0'][:, 0],  # [B, 3, 3]
             depth_range=(depth_min, depth_max),  # 场景深度裁剪范围
             depth_stage1_pixels=output_plane['depth_stage1_pixels']

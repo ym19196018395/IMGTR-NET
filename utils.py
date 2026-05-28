@@ -1996,3 +1996,43 @@ def get_visual_depth(depth_map, valid_mask):
             vis_rgb[i:i + 1] = d_rgb
 
     return vis_rgb
+
+
+def map_tri_to_pixel_single(planes, tri_id_map, H, W):
+    """
+    【架构师特供】单平面无假设维度高内聚广播算子 (Sparse to Dense Plane Equation)
+
+    Args:
+        planes:     [B, N_tri, 4] 经过图网络优化后的最终平面参数 (nx, ny, nz, d)
+        tri_id_map: [B, H, W] 三角形密集索引地图 (-1 表示无效)
+        H, W:       目标广播分辨率的高宽 (Stage 1 尺度)
+
+    Returns:
+        pixel_planes: [B, 4, H, W] 🎯 强制转为标准的 Channel-First 密集平面方程场！
+    """
+    B, N_tri, C = planes.shape
+    device = planes.device
+
+    # 1. 物理拦截与无效 ID 缓冲
+    invalid_mask = (tri_id_map < 0)
+    safe_id_map = tri_id_map.clone()
+    safe_id_map[invalid_mask] = 0
+    safe_id_map = safe_id_map.long().view(B, -1)  # [B, H*W]
+
+    # 2. 计算全局扁平化索引，规避 Batch 维广播碰撞
+    batch_offset = torch.arange(B, device=device).view(B, 1) * N_tri
+    global_ids = (safe_id_map + batch_offset).view(-1)  # [B*H*W]
+
+    # 3. 查表对撞 (Advanced Indexing)
+    flat_planes = planes.view(-1, C)  # [B * N_tri, 4]
+    pixel_planes_flat = flat_planes[global_ids]  # [B*H*W, 4]
+
+    # 4. 恢复并转换维度为标准的 Channel-First [B, 4, H, W]
+    pixel_planes = pixel_planes_flat.view(B, H, W, C).permute(0, 3, 1, 2)
+
+    # 5. 无效区域熔断物理清洗 (刷成全0，防止背景虚空产生脏梯度)
+    if invalid_mask.any():
+        mask_expand = invalid_mask.unsqueeze(1).expand(-1, 4, -1, -1)
+        pixel_planes = pixel_planes.masked_fill(mask_expand, 0.0)
+
+    return pixel_planes
