@@ -510,9 +510,12 @@ class PatchmatchNet(nn.Module):
             'depth_no_pro': [],  # 刚拟合完的深度值
             'normal_no_pro': [],  # 刚拟合完的法向量可视化
             'pixel_costs':[], # 计算出来的代价
-            'W_plane_pixel':[], # 平面置信度 像素级
-            'W_plane_tri':[], # 平面置信度 三角级别
-            'final_normal':[] # 最终法向量
+            'W_plane_pixel':[], # 平面置信度 像素级（传播后）
+            'W_plane_pixel_init': [],  # 传播前物理冷启动置信度 像素级
+            'W_plane_tri':[], # 平面置信度 三角级别（传播后）
+            'W_plane_tri_init': [],  # 传播前物理冷启动 三角级别
+            'final_normal':[], # 最终法向量
+            'pixel_counts':[] #  每个三角形包含的密集像素计数 ,原分辨率的
         }
         score = []
         
@@ -585,8 +588,9 @@ class PatchmatchNet(nn.Module):
                                                            depth_min=depth_min)
 
 
-                (depth_samples, pixel_costs, view_weights,normal_samples,output_plane['final_plane'],edge_alpha,
-                 continuity_loss,smoothness_loss,W_plane_pixel,W_plane_tri) = self.plane_patchmatch_agent.forward(
+                (depth_samples, pixel_costs, view_weights, normal_samples, output_plane['final_plane'], edge_alpha,
+                 continuity_loss, smoothness_loss, W_plane_pixel, W_plane_tri, W_plane_tri_polarized,
+                 pixel_counts_tensor, W_plane_pixel_init, W_plane_tri_init) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
                                                                     ref_feature[f'stage_{l}'],
@@ -624,6 +628,8 @@ class PatchmatchNet(nn.Module):
                 # 经过传播得到的平面
                 output_plane['normal_pro']=normal_samples[1]
 
+                output_plane['pixel_counts'] = pixel_counts_tensor
+
                 # 没有进行传播得到的平面，刚拟合完的初始平面
                 # 将B,N,4 分别转化为,B,H,W,1 和B,H,W,3 可视化用
                 output_plane['depth_no_pro'] = depth_samples[0]
@@ -632,7 +638,9 @@ class PatchmatchNet(nn.Module):
                 output_plane['pixel_costs'] = pixel_costs
 
                 output_plane['W_plane_pixel'] = W_plane_pixel
+                output_plane['W_plane_pixel_init'] = W_plane_pixel_init
                 output_plane['W_plane_tri'] = W_plane_tri
+                output_plane['W_plane_tri_init'] = W_plane_tri_init
 
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
@@ -682,7 +690,7 @@ class PatchmatchNet(nn.Module):
             feat_s0=ref_feature['stage_0'],
             final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
             tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
-            W_plane_tri=W_plane_tri.detach(),  # [B, N_tri] 稀疏平面门控
+            W_plane_tri=W_plane_tri_polarized.detach(),  # [B, N_tri] 稀疏平面门控
             intrinsics_s0=intrinsics_mats['stage_0'][:, 0],  # [B, 3, 3]
             depth_range=(depth_min, depth_max),  # 场景深度裁剪范围
             depth_stage1_pixels=output_plane['depth_stage1_pixels']

@@ -183,7 +183,7 @@ def save_depth():
     # TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4, drop_last=False)
     # todo:图片太大了无法多进程
     TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,
-                               num_workers=4,
+                               num_workers=0,
                                drop_last=False)
 
     # model
@@ -230,7 +230,7 @@ def save_depth():
             # max_lambda_s = 3.0
             max_lambda_c = 0.0
             max_lambda_s = 0.0
-            current_temp =0.15
+            current_temp =0.55
             outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                             sample_cuda["depth_min"], sample_cuda["depth_max"],
                             vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
@@ -357,7 +357,7 @@ def save_depth():
                 # 提前提取平面置信度 (W_plane)，供平面 MAE 切分和最终保存使用
                 # ====================================================================
                 depth_est_sq = np.squeeze(depth_est)  # [H, W]
-
+                w_plane_sq = []
                 if 'W_plane_pixel' in outputs["output_plane"]:
                     w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
                     w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data,
@@ -376,7 +376,6 @@ def save_depth():
                     gt_curr = np.squeeze(depth_gt_np[b_idx])
                     tri_id_curr = np.squeeze(tri_id_maps_np[b_idx])
 
-                    # 尺寸保护
                     if gt_curr.shape != depth_est_sq.shape:
                         gt_curr = cv2.resize(gt_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
                                              interpolation=cv2.INTER_NEAREST)
@@ -384,62 +383,134 @@ def save_depth():
                         tri_id_curr = cv2.resize(tri_id_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
                                                  interpolation=cv2.INTER_NEAREST)
 
-                    # 有效区域掩码
                     mask_diff = (depth_est_sq > 0) & (gt_curr > 0) & (tri_id_curr >= 0)
 
                     if mask_diff.any():
                         diff_map = np.zeros_like(depth_est_sq)
                         abs_error_array = np.abs(depth_est_sq[mask_diff] - gt_curr[mask_diff])
                         diff_map[mask_diff] = abs_error_array
-
-                        # 🌟 计算全局 MAE
                         mean_abs_error = np.mean(abs_error_array)
 
-                        # 🌟 新增功能 1：分离并计算绝对平面区域的 MAE (W_plane > 0.9)
-                        mask_planar = mask_diff & (w_plane_sq > 0.8)
+                        # 过滤提取高不确定性平面区域 (W_plane > 0.80)
+                        mask_planar = mask_diff & (w_plane_sq > 0.80)
                         if mask_planar.any():
                             planar_mae = np.mean(np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar]))
-                            planar_text = f"\nFlat Region MAE (W>0.9): {planar_mae:.4f}m"
+                            planar_text = f"\nFlat Region MAE (W>0.80): {planar_mae:.4f}m"
                         else:
+                            planar_mae = 0.0
                             planar_text = ""
 
+                        # ── 图一：全局误差图（基于 replace 防爆设计） ────────────────────────
                         diff_max_plot = max(np.percentile(abs_error_array, 95), 0.5)
-
+                        
                         plt.figure(figsize=(10, 8))
                         diff_map_masked = np.ma.masked_where(~mask_diff, diff_map)
                         cmap = plt.get_cmap('jet')
                         cmap.set_bad(color='black')
-
+                        
                         im = plt.imshow(diff_map_masked, cmap=cmap, vmin=0, vmax=diff_max_plot)
                         cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
                         cbar.set_label('Absolute Error (Meters)', size=14)
-
                         plt.title(f'Stage 1 MAE: {mean_abs_error:.4f}m {planar_text}\nMax Cutoff: {diff_max_plot:.2f}m',
                                   fontsize=14, fontweight='bold')
                         plt.axis('off')
-
+                        
+                        # 刚性落锁路径：先 format 拿到标准基准路径
                         diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', '_dif.png'))
+                        os.makedirs(os.path.dirname(diff_filename), exist_ok=True) # 🛡️ 刚性子目录防爆铁闸一
                         plt.savefig(diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                         plt.close()
+
+                        # ── 图二：仅平面区域误差图（W_plane > 0.80，满足用户只展现平面 MAE 的渴望） ──
+                        if mask_planar.any():
+                            planar_err_array = np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar])
+                            planar_diff_map = np.zeros_like(depth_est_sq)
+                            planar_diff_map[mask_planar] = planar_err_array
+
+                            # 误差上限用平面区域自己的 95 百分位，使得色标分布针对平面高分辨率拉伸，拒绝曲面大误差污染
+                            planar_diff_max = max(np.percentile(planar_err_array, 95), 0.1)
+
+                            plt.figure(figsize=(10, 8))
+                            # 刚性隔离：将平面区域外（曲面、虚空、背景）全部标记为 True 实施严格黑色放逐
+                            planar_map_masked = np.ma.masked_where(~mask_planar, planar_diff_map)
+                            cmap_planar = plt.get_cmap('jet')
+                            cmap_planar.set_bad(color='black') # 外部曲面死死抹黑
+                            
+                            im2 = plt.imshow(planar_map_masked, cmap=cmap_planar, vmin=0, vmax=planar_diff_max)
+                            cbar2 = plt.colorbar(im2, fraction=0.046, pad=0.04)
+                            cbar2.set_label('Absolute Error (Meters)', size=14)
+                            
+                            plt.title(
+                                f'Flat Region MAE (W_plane > 0.80): {planar_mae:.4f}m'
+                                f'\nMax Cutoff: {planar_diff_max:.2f}m'
+                                f'  |  Flat pixels: {mask_planar.sum()} / {mask_diff.sum()}',
+                                fontsize=13, fontweight='bold'
+                            )
+                            plt.axis('off')
+                            
+                            # 🛡️ 核心修复：直接采用字符串级特征平替，在全局文件名基础上加上 _planar 后缀，
+                            # 彻底规避原模板 filename 中由于多传参数炸出多层未建立文件夹的致命 Bug！
+                            planar_diff_filename = diff_filename.replace('_dif.png', '_dif_planar.png')
+                            os.makedirs(os.path.dirname(planar_diff_filename), exist_ok=True) # 🛡️ 刚性子目录防爆铁闸二
+                            
+                            plt.savefig(planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                            plt.close()
 
                 # ====================================================================
                 # 🚨 4. 生成平面置信度 (W_plane) 大图 (用于论文展示)
                 # ====================================================================
-                if 'W_plane_pixel' in outputs["output_plane"]:
+                # 🚨 1. 必须修正：不要使用字符串硬编码，直接从已解析的物理场中获取
+                # 确保你的上游数据字典里的 key 是 'W_plane_pixel' 且已经广播回了 [B, H, W]
+                if 'W_plane_pixel' in outputs.get("output_plane", {}):
+                    w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
+                    w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data,
+                                                                                   torch.Tensor) else w_plane_data
+                    w_plane_sq = np.squeeze(w_plane_np)
+                    
+                    # 强制尺寸闭环
+                    if w_plane_sq.shape != depth_est_sq.shape:
+                        w_plane_sq = cv2.resize(w_plane_sq, (depth_est_sq.shape[1], depth_est_sq.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        
+                    # 🎯 【硬核修正】：直接使用你在上方计算好的有效 valid_mask，不要用 locals()!
+                    # 如果 valid_mask 未定义，这里直接赋值为一个全 1 的掩码
+                    current_mask = valid_mask if 'valid_mask' in locals() and valid_mask is not None else np.ones_like(depth_est_sq, dtype=bool)
+
                     conf_jet_filename = os.path.join(args.outdir, filename.format('confidence_s1', '_jet.png'))
+                    os.makedirs(os.path.dirname(conf_jet_filename), exist_ok=True) # 强制建立路径
 
                     w_plane_uint8 = (np.clip(w_plane_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
-                    w_plane_uint8_inv = 255 - w_plane_uint8  # 反转：平面(蓝) 曲面(红)
+                    w_plane_uint8_inv = 255 - w_plane_uint8 
 
-                    if 'valid_mask' in locals():
-                        w_plane_uint8_inv[~valid_mask] = 0
+                    # 应用掩码，处理虚空与背景
+                    w_plane_uint8_inv[~current_mask] = 0
 
                     w_plane_color = cv2.applyColorMap(w_plane_uint8_inv, cv2.COLORMAP_JET)
-                    if 'valid_mask' in locals():
-                        w_plane_color[~valid_mask] = 0
+                    w_plane_color[~current_mask] = 0 # 虚空区涂黑
 
                     cv2.imwrite(conf_jet_filename, w_plane_color)
+                    print(f"✅ 置信度图已成功写入: {conf_jet_filename}")
 
+                    # =====================================================================
+                    # 👑 【新增对比实验硬核资产】：熔炼并导出 W > 0.80 的 0/1 刚性流形掩码二值图
+                    # =====================================================================
+                    # 机制精剖：将连续概率空间一刀切。大于0.80的黄金平面记为 255（纯白），其余及背景统统归 0（纯黑）
+                    binary_mask_np = np.zeros_like(w_plane_sq, dtype=np.uint8)
+                    binary_mask_np[(w_plane_sq > 0.80) & current_mask] = 255
+
+                    # 动态生成专属基准文件名，加上 _oracle_mask 后缀，防止混淆文件目录
+                    oracle_mask_filename = os.path.join(args.outdir, filename.format('plane_mask_01', '_oracle_mask.png'))
+                    os.makedirs(os.path.dirname(oracle_mask_filename), exist_ok=True)
+                    
+                    # 写入单通道灰度/二值图磁盘
+                    cv2.imwrite(oracle_mask_filename, binary_mask_np)
+                    print(f"👑 黄金实验 0/1 刚性掩码已导出至: {oracle_mask_filename}")
+                else:
+                    # 彻底告别沉默，报错提示你 key 没匹配上
+                    print(f"⚠️ 警告: outputs['output_plane'] 中未找到 'W_plane_pixel'，跳过置信度可视化")
+
+    
+
+                
                 # ====================================================================
                 # 🚨 新增功能 3：生成 Stage 1 纯自由像素级 (Pixel-wise) 深度的差异热力图
                 # 这是最原汁原味的 Baseline，用于和网格约束后的结果做对比
@@ -522,11 +593,11 @@ def save_depth():
                         # 计算 Stage 0 阶段的纯平面区域 MAE
                         w_plane_sq_s0 = cv2.resize(w_plane_sq, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
                                                    interpolation=cv2.INTER_LINEAR)
-                        mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.9)
+                        mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.80)
                         if mask_planar_s0.any():
                             planar_mae_s0 = np.mean(
                                 np.abs(depth_est_s0_sq[mask_planar_s0] - gt_curr_s0[mask_planar_s0]))
-                            planar_text_s0 = f"\nFlat Region MAE (W>0.9): {planar_mae_s0:.4f}m"
+                            planar_text_s0 = f"\nFlat Region MAE (W>0.80): {planar_mae_s0:.4f}m"
                         else:
                             planar_text_s0 = ""
 

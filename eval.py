@@ -35,6 +35,12 @@ parser.add_argument('--testlist', help='testing scan list')
 
 parser.add_argument('--batch_size', type=int, default=1, help='testing batch size')
 parser.add_argument('--n_views', type=int, default=5, help='num of view')
+parser.add_argument(
+    '--num_workers',
+    type=int,
+    default=0,
+    help='DataLoader workers; use 0 to avoid shared-memory mmap errors (ENOMEM) on large MVS batches',
+)
 
 
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
@@ -115,7 +121,15 @@ def save_depth():
     # dataset, dataloader
     MVSDataset = find_dataset_def(args.dataset)
     test_dataset = MVSDataset(args.testpath, args.testlist, "test", args.n_views)
-    TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+    # 大分辨率 MVS 样本在多进程下易触发 mmap 失败 (Cannot allocate memory)
+    TestImgLoader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available() and args.num_workers == 0,
+    )
 
     # model
     model = PatchmatchNet(patchmatch_interval_scale=args.patchmatch_interval_scale,
@@ -129,7 +143,10 @@ def save_depth():
 
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
-    state_dict = torch.load(args.loadckpt)
+    try:
+        state_dict = torch.load(args.loadckpt, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(args.loadckpt, map_location=device)
     model.load_state_dict(state_dict['model'])
     model.eval()
     

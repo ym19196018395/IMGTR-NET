@@ -67,45 +67,48 @@ class EdgeHead(nn.Module):
         midpoints_uv[:, 0] = (midpoints_norm[:, 0] + 1.0) / 2.0 * (W - 1)
         midpoints_uv[:, 1] = (midpoints_norm[:, 1] + 1.0) / 2.0 * (H - 1)
 
-        # 2. 构造齐次坐标并反投影为射线方向 (Ray)
+        # 2. 构造齐次坐标并反投影为相机系射线方向 (Ray)
         ones = torch.ones(E, 1, device=device)
         uv_homo = torch.cat([midpoints_uv, ones], dim=-1)  # [E, 3]
 
-        K_inv = torch.inverse(intrinsics)  # [3, 3]
+        K_inv = torch.inverse(intrinsics.float())  # [3, 3]
         rays = torch.matmul(K_inv, uv_homo.unsqueeze(-1)).squeeze(-1)  # [E, 3]
 
-        # 3. 提取平面参数 n 和 d
+        # 3. 提取两端三角形解析平面参数 n 和 d
         n1, d1 = planes_t1[:, :3], planes_t1[:, 3:]
         n2, d2 = planes_t2[:, :3], planes_t2[:, 3:]
 
-        # 4. 分别用 T1 和 T2 的平面方程计算该射线上的深度 Z
-        # Z = -d / (n * ray)
+        # 4. 分别计算射线与法向的点积（余弦分量）
         denom1 = torch.sum(n1 * rays, dim=-1, keepdim=True)
-        denom1 = torch.where(torch.abs(denom1) < 1e-6, torch.tensor(1e-6, device=device), denom1)
-        depth1 = -d1 / denom1  # [E, 1]
-
         denom2 = torch.sum(n2 * rays, dim=-1, keepdim=True)
-        denom2 = torch.where(torch.abs(denom2) < 1e-6, torch.tensor(1e-6, device=device), denom2)
-        depth2 = -d2 / denom2  # [E, 1]
 
-        # 5. 获得绝对精确的深度差
-        depth_diff = torch.abs(depth1 - depth2)  # [E, 1]
+        # 保底自卫，消灭绝对零点
+        denom1_safe = torch.where(torch.abs(denom1) < 1e-6, torch.sign(denom1 + 1e-10) * 1e-6, denom1)
+        denom2_safe = torch.where(torch.abs(denom2) < 1e-6, torch.sign(denom2 + 1e-10) * 1e-6, denom2)
 
-        return depth_diff
+        # 5. 解析求解当前视线上的绝对 Z 深度
+        depth1 = -d1 / denom1_safe  # [E, 1]
+        depth2 = -d2 / denom2_safe  # [E, 1]
 
-    def extract_static_features(self, feat, tri_infos, dense_depth=None):
+        # 🎯 【第一性原理修正点】：计算 3D 空间射线上两点之间的相对位移向量
+        # 射线绝对视差 |Z1 - Z2| 点乘余弦张角，瞬间原位转化为不随面倾斜而产生特征爆炸的正交点到面投影距离！
+        cos_projection = torch.max(torch.abs(denom1), torch.abs(denom2))
+        
+        # 物理量纲完美收拢，最大值被刚性卡死在真实场景几何落差内部
+        orthogonal_metric_diff = torch.abs(depth1 - depth2) * cos_projection # [E, 1]
+
+        return orthogonal_metric_diff
+
+    def extract_static_features(self, feat, tri_infos, dense_depth=None, intrinsics=None):
         """
-        【循环外调用】
-        只在 iter_idx == 0 之前执行一次，提取不变的图像特征和初始稠密深度差。
-        返回: List[Tuple(feat_mid, dense_depth_diff)]，长度为 B
+        【EdgeHead·常数流形寄存器】只在循环外执行 O(1) 一次。
+        物理机制：利用固定深度图反解出 3D 空间中死死焊接的探测点云位移向量 vec_L2R，作为循环内的常数铁锚。
         """
         device = feat.device
         B, C, H, W = feat.shape
         feat_proj = self.proj(feat)
 
         static_feats_list = []
-
-        # 定义采样步长
         pixel_step = 1.25
         step_tensor = torch.tensor([pixel_step * (2.0 / W), pixel_step * (2.0 / H)], device=device).view(1, 2)
 
@@ -115,86 +118,115 @@ class EdgeHead(nn.Module):
             E = current_edges.shape[0]
 
             if E == 0:
-                static_feats_list.append((None, None))
+                static_feats_list.append((None, None, None))
                 continue
 
-            # 1. 提取中点图像特征 (RGB Context)
+            # 1. 提取中点高维图像环境特征
             curr_feat_map = feat_proj[b].unsqueeze(0)
             mid_grid = midpoints_norm.unsqueeze(0).unsqueeze(2)
-            feat_mid = F.grid_sample(curr_feat_map, mid_grid, align_corners=True).view(feat_proj.shape[1], E).permute(1,
-                                                                                                                      0)
+            feat_mid = F.grid_sample(curr_feat_map, mid_grid, align_corners=True).view(feat_proj.shape[1], E).permute(1, 0)
 
-            # 2. 提取 CNN 稠密深度差 (Dense Depth Context)
-            if dense_depth is not None:
+            # 2. 🪐【核心重构】：计算 3D 视锥绝对坐标位移差常数张量
+            if dense_depth is not None and intrinsics is not None:
                 curr_dense_depth = dense_depth[b].unsqueeze(0).detach()
                 endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
 
-                # 计算边缘正交探测方向
+                # 探测点正交方向偏转
                 edge_vec = endpoints[:, 1, :] - endpoints[:, 0, :]
                 ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
                 ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)
                 scaled_ortho = ortho_vec * step_tensor
 
-                # 探测点采样
                 probe_left_grid = (midpoints_norm + scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
                 probe_right_grid = (midpoints_norm - scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
 
-                d_left = F.grid_sample(curr_dense_depth, probe_left_grid, align_corners=True).view(1, E).permute(1, 0)
-                d_right = F.grid_sample(curr_dense_depth, probe_right_grid, align_corners=True).view(1, E).permute(1, 0)
-                dense_depth_diff = torch.abs(d_left - d_right).clamp(max=500.0)
-            else:
-                dense_depth_diff = torch.zeros(E, 1, device=device)
+                # 重采样固定深度场
+                d_left = F.grid_sample(curr_dense_depth, probe_left_grid, align_corners=True).view(E)
+                d_right = F.grid_sample(curr_dense_depth, probe_right_grid, align_corners=True).view(E)
 
-            static_feats_list.append((feat_mid, dense_depth_diff))
+                # 像素坐标反解反投影
+                u_left = (probe_left_grid[0, :, 0, 0] + 1.0) / 2.0 * (W - 1)
+                v_left = (probe_left_grid[0, :, 0, 1] + 1.0) / 2.0 * (H - 1)
+                u_right = (probe_right_grid[0, :, 0, 0] + 1.0) / 2.0 * (W - 1)
+                v_right = (probe_right_grid[0, :, 0, 1] + 1.0) / 2.0 * (H - 1)
+
+                curr_K = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
+                fx, fy = curr_K[0, 0], curr_K[1, 1]
+                cx, cy = curr_K[0, 2], curr_K[1, 2]
+
+                # 熔炼出 3D 绝对空间点云常数
+                X_L = (u_left - cx) * d_left / fx
+                Y_L = (v_left - cy) * d_left / fy
+                P_left = torch.stack([X_L, Y_L, d_left], dim=1)  # [E, 3]
+
+                X_R = (u_right - cx) * d_right / fx
+                Y_R = (v_right - cy) * d_right / fy
+                P_right = torch.stack([X_R, Y_R, d_right], dim=1)  # [E, 3]
+
+                # 刚性备份常数位移向量，死死寄存
+                vec_L2R = P_right - P_left  # [E, 3]
+            else:
+                vec_L2R = torch.zeros((E, 3), device=device)
+
+            static_feats_list.append((feat_mid, vec_L2R))
 
         return static_feats_list
 
     def dynamic_forward(self, static_feats_list, tri_infos, tri_planes, intrinsics, H, W):
         """
-        【循环内调用】
-        每一轮迭代都用最新的平面参数计算解析面深度差，并结合静态特征输出最新概率。
-        由于不包含 grid_sample，本函数执行极快。
+        【EdgeHead·流形双动态进化版】循环内调用。
+        
+        机制精谱：
+        - 让 `dense_depth_diff`（固定深度图）与 `plane_depth_diff`（解析面方程）
+          共同通过每一轮最新优化的 tri_planes 法向实施动态规约点投影！
+        - 零渲染开销，在稀疏拓扑空间内部全速合流更新。
         """
         device = tri_planes.device
         B = len(static_feats_list)
         output_alphas_list = []
 
         for b in range(B):
-            feat_mid, dense_depth_diff = static_feats_list[b]
+            feat_mid, vec_L2R = static_feats_list[b]
             if feat_mid is None:
                 output_alphas_list.append(torch.zeros(0, device=device))
                 continue
 
             current_edges = tri_infos[0]['edges_list'][b].to(device)
-            current_planes = tri_planes[b]  # [N, 4]
+            current_planes = tri_planes[b]  # 最新的、不断被 GNN 熨平进化的平面方程 [N, 4]
             curr_intrinsics = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
             midpoints_norm = tri_infos[0]['edges_midpoints'][b].to(device)
             E = current_edges.shape[0]
 
             idx1, idx2 = current_edges[:, 0].long(), current_edges[:, 1].long()
-
-            # --- 3. 动态特征: 重新计算解析面深度差 ---
-            # 直接使用最新的平面参数
             planes_t1 = current_planes[idx1]
             planes_t2 = current_planes[idx2]
+
+            # 🎯 【动态特征一：随法向自愈而协同沉降的稠密点到面垂直距离】
+            # 查表提取两端更新后的高纯度法向量
+            n_left = planes_t1[:, :3]
+            n_right = planes_t2[:, :3]
+            
+            # 无任何采样开销，原位稀疏点乘！假断层信号会随朝向变准而瞬间塌陷归零！
+            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * n_left, dim=1, keepdim=True))
+            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * n_right, dim=1, keepdim=True))
+            dense_depth_diff = torch.max(dist_to_plane_L, dist_to_plane_R).clamp(max=500.0) # [E, 1]
+
+            # 🎯 【动态特征二：全新解析面方程几何视差距离（保持动态）】
             plane_depth_diff = self._compute_analytical_depth_diff(
                 midpoints_norm, planes_t1, planes_t2, curr_intrinsics, H, W
             ).clamp(max=500.0)
 
-            # --- 4. 特征重组与 MLP 推理 ---
+            # --- 4. 两条动态几何总线无伤并网，递交 MLP 推理 ---
             mlp_input = torch.cat([
-                feat_mid,  # Static [E, D]
-                dense_depth_diff,  # Static [E, 1]
-                plane_depth_diff  # Dynamic [E, 1]
+                feat_mid,          # 图像高频语义环境 [E, D]
+                dense_depth_diff,  # 🌟 升级：随法向收敛而自愈的密集几何距离 [E, 1]
+                plane_depth_diff   # 随平面演进而收敛的解析几何视差 [E, 1]
             ], dim=1)
 
             logits = self.edge_mlp(mlp_input).squeeze(1) * self.edge_scale
-
-            # --- 5. 软门控输出 (移除 STE) ---
-            # 使用普通的 Sigmoid，允许梯度平滑回传，减少误判锁死风险
             alphas = torch.sigmoid(logits)
 
-            # 边界物理强制
+            # 边界刚性锁
             is_boundary = (idx1 == idx2)
             if is_boundary.any():
                 alphas = alphas.clone()

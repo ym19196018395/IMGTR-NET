@@ -7,7 +7,7 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -326,6 +326,13 @@ def tensor_to_pseudocolor(tensor_map, mask=None, colormap=cv2.COLORMAP_JET, inve
 
     return color_tensor.unsqueeze(0)  # 输出变为 [1, 3, H, W]
 
+def cosine_temperature_schedule(progress, t_min=0.55, t_max=1.0):
+    """余弦平滑退火控温：progress∈[0,1] 时温度从 t_max 柔和降至 t_min。"""
+    prog_val = max(0.0, min(float(progress), 1.0))
+    cos_decay = 0.5 * (1.0 + math.cos(prog_val * math.pi))
+    return t_min + (t_max - t_min) * cos_decay
+
+
 def get_smooth_weight_with_decay(progress, start_prog, end_prog, decay_prog, max_weight, end_ratio=0.1):
     """
     终极版：带退坡松绑的平滑过渡权重 (Cosine Warmup + Plateau + Cosine Decay)
@@ -366,6 +373,96 @@ def get_smooth_weight_with_decay(progress, start_prog, end_prog, decay_prog, max
 
         # 在 min_weight 和 max_weight 之间进行余弦插值
         return min_weight + (max_weight - min_weight) * smooth_ratio_down
+
+
+def build_w_plane_tensorboard_views(output_plane, mask_s1_batch0=None):
+    """
+    将传播前/后平面置信度转为 TensorBoard 伪彩色图及差分图。
+    返回 dict，键为空则对应张量不可用。
+    """
+    views = {}
+    if 'W_plane_pixel' not in output_plane or 'W_plane_pixel_init' not in output_plane:
+        return views
+
+    w_after = output_plane['W_plane_pixel'][0, 0]
+    w_before = output_plane['W_plane_pixel_init'][0, 0]
+    mask = mask_s1_batch0
+
+    views['W_plane_传播后'] = tensor_to_pseudocolor(tensor_map=w_after, mask=mask, invert=True)
+    views['W_plane_传播前_物理冷启动'] = tensor_to_pseudocolor(tensor_map=w_before, mask=mask, invert=True)
+
+    w_diff = (w_after - w_before).abs()
+    views['W_plane_更新前后差分_abs'] = tensor_to_pseudocolor(tensor_map=w_diff, mask=mask, invert=False)
+    return views
+
+
+def compute_stage1_flat_region_mae_tensors(outputs, pixel_depth_s1, depth_gt_s1, device):
+    """
+    W_plane > 0.80 高置信平面区域内的 Stage 1 深度 MAE（纯 GPU 张量，无 matplotlib）。
+    
+    升级特性：
+    1. planar_err_vis [B,1,H,W]: 差值等比例放大图像。0.5米判定摸顶，让 0.08m 级别的优秀误差清晰可见，其余抹黑。
+    2. planar_color_vis [B,3,H,W]: 刚性红蓝判定图。大于0.80的平面为纯蓝，小于0.80的曲面/碎面为纯红，背景纯黑。
+    """
+    # 1. 建立高鲁棒性字典探针，封杀 KeyError
+    output_plane_dict = outputs.get("output_plane", {})
+    if 'W_plane_pixel' in output_plane_dict:
+        w_plane_pixel = output_plane_dict['W_plane_pixel']
+        if w_plane_pixel.shape[2:] != depth_gt_s1.shape[2:]:
+            w_plane_pixel = F.interpolate(
+                w_plane_pixel, size=depth_gt_s1.shape[2:], mode='bilinear', align_corners=True
+            )
+    else:
+        w_plane_pixel = torch.zeros_like(depth_gt_s1)
+
+    # 2. 密集拓扑有效合规检测
+    tri_id_map = output_plane_dict.get('tri_id_map', None)
+    if tri_id_map is not None:
+        tri_valid = (tri_id_map >= 0)
+        if tri_valid.dim() == 3:
+            tri_valid = tri_valid.unsqueeze(1)
+    else:
+        tri_valid = torch.ones_like(depth_gt_s1, dtype=torch.bool)
+
+    # 3. 完美合成平面单纯形掩码场
+    mask_valid = (pixel_depth_s1 > 0) & (depth_gt_s1 > 0) & tri_valid
+    mask_planar = mask_valid & (w_plane_pixel > 0.80)  # 严格对齐 0.80 刚性判据
+
+    # 4. 解析空间绝对误差提取
+    err_map_dense = torch.abs(pixel_depth_s1 - depth_gt_s1)
+
+    if mask_planar.any():
+        planar_mae_val = err_map_dense[mask_planar].mean()
+    else:
+        planar_mae_val = torch.tensor(0.0, device=device)
+
+    # =====================================================================
+    # 👑 【核心修改点一】：单通道深度差值等比例放大（解救纯黑）
+    # =====================================================================
+    # 设定最高截止线为 0.5 米。任何大于 0.5 米的误差被判定为摸顶(1.0 full brightness)
+    # 此时 0.1 米的误差会被等比例映射放大为 0.2 的灰度亮度，在 Tensorboard 里呈现清晰的白色/灰色轮廓
+    max_error_cutoff = 0.5
+    error_amplified = torch.clamp(err_map_dense / max_error_cutoff, 0.0, 1.0)
+    # 平面区域外（曲面、背景）施加物理黑色放逐（归 0）
+    planar_err_vis = torch.where(mask_planar, error_amplified, torch.zeros_like(error_amplified))
+
+    # =====================================================================
+    # 👑 【核心修改点二】：3通道 RGB 刚性红蓝相变判定图生成
+    # =====================================================================
+    B, _, H, W = depth_gt_s1.shape
+    planar_color_vis = torch.zeros(B, 3, H, W, device=device)
+    
+    # 满足 W > 0.80 的刚性大平白墙区域 ──> 赋予纯蓝色 [0, 0, 1]
+    planar_color_vis[:, 2:3, :, :] = mask_planar.float()
+    
+    # 有效深度区域内，但是 W <= 0.80 的高频曲面/断层小碎面区域 ──> 赋予纯红色 [1, 0, 0]
+    mask_soft_curved = mask_valid & (~mask_planar)
+    planar_color_vis[:, 0:1, :, :] = mask_soft_curved.float()
+    
+    # 其余区域（无效全黑背景）自动保持默认的零值纯黑色 [0, 0, 0]
+
+    return planar_mae_val, planar_err_vis, planar_color_vis, mask_planar
+
 
 def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
@@ -414,6 +511,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_cost=0.2
     weight_alpha = 1.0
     max_lambda_dnc_s1 = 0.05 * 50
+    max_lambda_plane = 1.0
 
     # 1. 连通性约束 (早启动，早满载，晚退坡)：
     # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
@@ -432,9 +530,12 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     lambda_dnc_s1 = get_smooth_weight_with_decay(progress, 0.0, 0.2, 1.0, max_lambda_dnc_s1, end_ratio=1.0)
 
+    lambda_plane_s1=get_smooth_weight_with_decay(progress, 0.05, 0.15, 1.0, max_lambda_plane, end_ratio=1.0)
+
     # lambda_c,lambda_s,lambda_n=0.0,0.0,0.0
 
-    current_temp = max(1.0 - progress * 0.9, 0.1)  # 从 1.0 平滑退火至 0.15 极化极值
+    # 余弦柔和退火控温 [1.0 -> 0.55]，避免线性下坠引发 Softmax 阶跃相变
+    current_temp = cosine_temperature_schedule(progress)
 
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
@@ -504,27 +605,31 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     )
 
     # DNC损失
-    loss_dnc_s1=0.0
-    # loss_dnc_s1 = compute_gated_dnc_loss(
-    #     Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
-    #     N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
-    #     W_plane_pixel=outputs["output_plane"]['W_plane_pixel'].detach(),  # 高隔离度空间软路由拦截闸
-    #     tri_id_map= outputs["output_plane"]['tri_id_map'],
-    #     intrinsics=ref_intrinsics,
-    #     valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
-    # )
+    # loss_dnc_s1=0.0
+
+    loss_dnc_s1 = compute_gated_dnc_loss(
+        Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
+        N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
+        W_plane_pixel=outputs["output_plane"]['W_plane_pixel'].detach(),  # 高隔离度空间软路由拦截闸
+        tri_id_map= outputs["output_plane"]['tri_id_map'],
+        intrinsics=ref_intrinsics,
+        valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
+    )
 
     # 平面置信度
     loss_plane_s1=compute_confidence_supervision_loss(
-        pixel_depth_pred=depth_patchmatch['stage_1'][-1],
+        pixel_depth_pred=depth_patchmatch['stage_1'][-1].detach(),
         pixel_depth_gt=depth_gt['stage_1'],
+        pixel_normal_pred=outputs["output_plane"]["normal_pro_pure"],
         tri_id_map=outputs["output_plane"]['tri_id_map'],
         W_pred=outputs["output_plane"]["W_plane_tri"],
         progress=progress,
         depth_range=(sample_cuda["depth_min"], sample_cuda["depth_max"]),
-        valid_mask=valid_mask_s1
+        valid_mask=valid_mask_s1,
+        intrinsics=ref_intrinsics,pixel_counts=outputs["output_plane"]["pixel_counts"]
     )
 
+    # loss_plane_s1=lambda_plane_s1*loss_plane_s1
     # ====================================================
     # 3. 损失函数的混合
     # ====================================================
@@ -586,9 +691,16 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                       "smoothness_loss":smoothness_loss,
                       "normal_loss":normal_loss,
                       "cost_margin_loss":cost_margin_loss,
-                      "loss_plane_s1":loss_plane_s1}
+                      "loss_plane_s1":loss_plane_s1,
+                      "loss_dnc_s1":loss_dnc_s1
+                      }
 
-    image_outputs = []
+    image_outputs = {}
+
+    pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
+    planar_mae_val, _ , planar_err_masked , _= compute_stage1_flat_region_mae_tensors(
+        outputs, pixel_depth_s1, depth_gt['stage_1'], device
+    )
 
     # ====================================================
     # 4.可视化
@@ -617,15 +729,9 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
         ref_img_edge_alpha_gt = image_outputs_gt["ref_img_edge_alpha"]
 
-        # 给平面置信度转换颜色
-        if 'W_plane_pixel' in outputs["output_plane"]:
-            w_plane_tb_tensor = tensor_to_pseudocolor(
-                tensor_map=outputs["output_plane"]['W_plane_pixel'][0, 0],
-                mask=mask['stage_1'][0, 0] if 'stage_1' in mask else None,
-                invert=True  # 开启红蓝反转
-            )
-        else:
-            w_plane_tb_tensor = None
+        mask_s1_b0 = mask['stage_1'][0, 0] if 'stage_1' in mask else None
+        w_plane_views = build_w_plane_tensorboard_views(outputs["output_plane"], mask_s1_batch0=mask_s1_b0)
+        w_plane_tb_tensor = w_plane_views.get('W_plane_传播后')
 
         vis_nomal_final=get_visual_normal(outputs["output_plane"]['final_normal'], valid_mask_s0)
 
@@ -655,7 +761,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         # ===== tensorboard显示图片和曲线 ======================================
 
         image_outputs = {  # 暂时注释一些图片，输出的图片太多了
-            "最终预测结果": vis_depth_final,
+            # "最终预测结果": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'] ,
             "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
             # "patchmatch预测的stage2深度值": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
@@ -663,7 +769,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             "ref_img": sample["imgs"]['stage_0'][:, 0],
             # todo:暂时不要真值法向量可视化
             # "根据深度真值生成的法向量": gt_normals_vis,
-            "物理平面置信度_W_plane": w_plane_tb_tensor,
+            "物理平面置信度_W_plane_传播后": w_plane_tb_tensor,
             "最终预测的法向量":vis_nomal_final,
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图传播完
@@ -685,7 +791,25 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         # image_outputs["errormap_patchmatch_stage_3"] = (depth_patchmatch['stage_3'][-1] - depth_gt['stage_3']).abs() * \
         #                                                mask['stage_3']
 
+        image_outputs["stage1_planar_error_map"] = planar_err_masked
+        image_outputs.update(w_plane_views)
 
+    # 平面置信度更新幅度标量（有效三角网格内）
+    if 'W_plane_pixel' in outputs["output_plane"] and 'W_plane_pixel_init' in outputs["output_plane"]:
+        w_a = outputs["output_plane"]['W_plane_pixel']
+        w_b = outputs["output_plane"]['W_plane_pixel_init']
+        tri_ok = outputs["output_plane"]['tri_id_map'] >= 0
+        if tri_ok.dim() == 3:
+            tri_ok = tri_ok.unsqueeze(1)
+        conf_valid = tri_ok & (w_a > 0) & (w_b > 0)
+        if conf_valid.any():
+            scalar_outputs["w_plane_mean_abs_update"] = (w_a - w_b).abs()[conf_valid].mean()
+            scalar_outputs["w_plane_mean_before"] = w_b[conf_valid].mean()
+            scalar_outputs["w_plane_mean_after"] = w_a[conf_valid].mean()
+        else:
+            scalar_outputs["w_plane_mean_abs_update"] = 0.0
+            scalar_outputs["w_plane_mean_before"] = 0.0
+            scalar_outputs["w_plane_mean_after"] = 0.0
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
@@ -710,6 +834,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # threshold = 8mm
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
+    scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 
@@ -751,7 +876,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     max_lambda_cost = 0.2
     max_lambda_dnc_s1 = 0.05
 
-    current_temp = max(0.15, 1.0 - progress * 0.85)  # 从 1.0 平滑退火至 0.15 极化极值
+    current_temp = cosine_temperature_schedule(progress)
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch, depth_gt['stage_1'],
@@ -801,19 +926,21 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     )
 
     # DNC损失
-    loss_dnc_s1 = compute_gated_dnc_loss(
-        Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
-        N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
-        W_plane_pixel=outputs["output_plane"]['W_plane_pixel'],  # 高隔离度空间软路由拦截闸
-        tri_id_map=outputs["output_plane"]['tri_id_map'],
-        intrinsics=ref_intrinsics,
-        valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
-    )
+    # loss_dnc_s1 = compute_gated_dnc_loss(
+    #     Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
+    #     N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
+    #     W_plane_pixel=outputs["output_plane"]['W_plane_pixel'],  # 高隔离度空间软路由拦截闸
+    #     tri_id_map=outputs["output_plane"]['tri_id_map'],
+    #     intrinsics=ref_intrinsics,
+    #     valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
+    # )
+    loss_dnc_s1=0.0
 
-    normal_loss = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
-                                             tri_id_map=outputs["output_plane"]['tri_id_map'],
-                                             gt_normals_math_s0=gt_normals_math,
-                                             depth_stage_1=depth_gt['stage_1'])
+    # normal_loss = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
+    #                                          tri_id_map=outputs["output_plane"]['tri_id_map'],
+    #                                          gt_normals_math_s0=gt_normals_math,
+    #                                          depth_stage_1=depth_gt['stage_1'])
+    normal_loss = 0.0
 
     # 计算 Cost Margin Loss
     cost_margin_loss = compute_pixel_cost_margin_loss(
@@ -844,11 +971,18 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
         "loss_alpha_sup": loss_alpha_sup,
         "continuity_loss": continuity_loss,
         "smoothness_loss": smoothness_loss,
-        "normal_loss": normal_loss,
+        # "normal_loss": normal_loss,
         "cost_margin_loss":cost_margin_loss,
-        "loss_dnc_s1":loss_dnc_s1}
+        # "loss_dnc_s1":loss_dnc_s1
+        }
 
     image_outputs = {}
+
+    pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
+    planar_mae_val, planar_err_masked, _ , _ = compute_stage1_flat_region_mae_tensors(
+        outputs, pixel_depth_s1, depth_gt['stage_1'], device
+    )
+
     if detailed_summary:
         image_outputs_pre = generate_edge_alpha_overlays(
             ref_imgs=sample["imgs"]['stage_0'][:, 0],
@@ -863,22 +997,16 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             device=device, overlay_alpha=0.6, line_thickness=1
         )
 
-        # 给平面置信度转换颜色
-        if 'W_plane_pixel' in outputs["output_plane"]:
-            w_plane_tb_tensor = tensor_to_pseudocolor(
-                tensor_map=outputs["output_plane"]['W_plane_pixel'][0, 0],
-                mask=mask['stage_1'][0, 0] if 'stage_1' in mask else None,
-                invert=True  # 开启红蓝反转
-            )
-        else:
-            w_plane_tb_tensor = None
+        mask_s1_b0 = mask['stage_1'][0, 0] if 'stage_1' in mask else None
+        w_plane_views = build_w_plane_tensorboard_views(outputs["output_plane"], mask_s1_batch0=mask_s1_b0)
+        w_plane_tb_tensor = w_plane_views.get('W_plane_传播后')
 
         vis_nomal_final = get_visual_normal(outputs["output_plane"]['final_normal'], valid_mask_s0)
 
         vis_depth_final = get_visual_depth(depth_est['stage_0'], valid_mask_s0)
 
         image_outputs = {
-            "最终预测结果": vis_depth_final,
+            # "最终预测结果": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'],
             # "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
             "最终预测的法向量": vis_nomal_final,
@@ -890,8 +1018,26 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'],
             "ref_img_edge_alpha_pre": image_outputs_pre["ref_img_edge_alpha"],
             "ref_img_edge_alpha_gt": image_outputs_gt["ref_img_edge_alpha"],
-            "物理平面置信度_W_plane": w_plane_tb_tensor
+            "物理平面置信度_W_plane_传播后": w_plane_tb_tensor,
+            "stage1_planar_error_map": planar_err_masked,
         }
+        image_outputs.update(w_plane_views)
+
+    if 'W_plane_pixel' in outputs.get("output_plane", {}) and 'W_plane_pixel_init' in outputs.get("output_plane", {}):
+        w_a = outputs["output_plane"]['W_plane_pixel']
+        w_b = outputs["output_plane"]['W_plane_pixel_init']
+        tri_ok = outputs["output_plane"]['tri_id_map'] >= 0
+        if tri_ok.dim() == 3:
+            tri_ok = tri_ok.unsqueeze(1)
+        conf_valid = tri_ok & (w_a > 0) & (w_b > 0)
+        if conf_valid.any():
+            scalar_outputs["w_plane_mean_abs_update"] = (w_a - w_b).abs()[conf_valid].mean()
+            scalar_outputs["w_plane_mean_before"] = w_b[conf_valid].mean()
+            scalar_outputs["w_plane_mean_after"] = w_a[conf_valid].mean()
+        else:
+            scalar_outputs["w_plane_mean_abs_update"] = 0.0
+            scalar_outputs["w_plane_mean_before"] = 0.0
+            scalar_outputs["w_plane_mean_after"] = 0.0
 
     # if detailed_summary:
     #     image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
@@ -925,6 +1071,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # threshold = 8mm
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
+    scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 

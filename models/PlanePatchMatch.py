@@ -213,7 +213,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         nn.init.constant_(self.self_gate_net_n[2].bias, 2.0)
         nn.init.zeros_(self.self_gate_net_n[2].weight)
 
-        # 4. 🔥 【精准修改点：矩阵扩容】深度传播专属门控 (GNN_Z): 全量多模态特征总线接入
+        # 4. 【精准修改点：矩阵扩容】深度传播专属门控 (GNN_Z): 全量多模态特征总线接入
         # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) = 2H + 7
         self.gate_net_z = nn.Sequential(
             nn.Linear(hidden_dim * 2 + 7, hidden_dim),  # 👈 扩容为 2H + 7
@@ -221,7 +221,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-        # 5. 🔥 【精准修改点：矩阵扩容】法向传播专属门控 (GNN_N): 全量多模态特征总线接入
+        # 5. 【精准修改点：矩阵扩容】法向传播专属门控 (GNN_N): 全量多模态特征总线接入
         # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) = 2H + 7
         self.gate_net_n = nn.Sequential(
             nn.Linear(hidden_dim * 2 + 7, hidden_dim),  # 👈 扩容为 2H + 7
@@ -251,7 +251,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs, rays_centroids, depth_max,prev_costs,W_plane_tri,
-                pixel_counts=None, ref_feature=None, centroids_norm=None, temperature=0.2):
+                pixel_counts=None, ref_feature=None, centroids_norm=None, temperature=0.2, W_raw_anchor=None):
         """
         前向双解耦核心计算图流动
         Args:
@@ -262,24 +262,19 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             rays_centroids:    [B, N, 3] 三角形中心视锥射线
             depth_max:         场景最大深度裁剪边界
             prev_costs:        [B, N, 1] 💾 核心增量：上一轮迭代的历史光度代价快照 (用于计算变异度 delta_cost)
-            W_plane_tri:       🎯 核心解耦注入：由外部过滤系统计算出的当前三角形平面置信度 [B, N, 1]
+            W_plane_tri:       核心解耦注入：由外部过滤系统计算出的当前三角形平面置信度 [B, N, 1]
             pixel_counts:      每个三角形包含的密集像素计数
             ref_feature:       图像级 Stage 1 语义感知特征
             centroids_norm:    归一化三角形质心
-            temperature:       🎯 可微退火控温系数 (从1.0渐变到0.1，逼近硬性选择)
+            temperature:       可微退火控温系数 (从1.0渐变到0.1，逼近硬性选择)
+            W_raw_anchor:      刚性追加尾部入参
         Returns:
             final_planes:      传递精修后的下一代面片方程 [B, N, 4]
-            W_plane_tri_learn: 🔥【Learn轨】带完整求导梯度的置信度张量 [B, N, 1]，送入 L_conf 进行硬核监督
+            W_plane_tri_learn: 【Learn轨】带完整求导梯度的置信度张量 [B, N, 1]，送入 L_conf 进行硬核监督
         """
         B, N, _ = current_planes.shape
         device = current_planes.device
         F_curr = None
-
-        # =====================================================================
-        # 🛡️ 核心锁定一：自适应置信度张量维度拦截 (修复高级索引与广播碰撞)
-        # =====================================================================
-        if W_plane_tri.dim() == 2:
-            W_plane_tri = W_plane_tri.unsqueeze(-1)  # 强制升维至 [B, N, 1]
 
         # =====================================================================
         # 1. 特征域归一化与隐空间映射
@@ -297,27 +292,6 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         init_hidden = self.init_encoder(plane_feat)  # [B, N, H]
 
         # =====================================================================
-        # 满血可学习置信度头前向反馈与双轨断流锁
-        # =====================================================================
-
-        # 💾 核心修正：计算 Transient 动态匹配代价变异量量纲
-        if prev_costs is not None:
-            delta_cost = torch.abs(current_costs - prev_costs)
-        else:
-            delta_cost = torch.zeros_like(current_costs)
-
-        # 串联宏观先验特征、实时匹配代价、以及收敛速度探测器 delta_cost
-        # 此时特征量纲完美合流：[隐特征(H), 实时代价(1), 代价变异度(1), 历史置信度(1)] -> 形状严格对齐 [B, N, H + 3]
-        W_update_input = torch.cat([init_hidden, current_costs, delta_cost, W_plane_tri], dim=-1)
-        W_plane_tri_raw = self.confidence_predict_head(W_update_input)
-
-        # 借助不确定性回归约束，值域刚性锁定，并强行施加安全钳制防止 BCE 阶跃分母求导爆炸
-        W_plane_tri_learn = torch.clamp(torch.sigmoid(W_plane_tri_raw), min=1e-6, max=1.0)  # 🧾 【Learn轨】
-
-        # 🛑 核心防线：对 Reg 轨实施强力阻断！防止光滑性约束的偏导数逆向洗劫、抹杀置信度头的特征表达力
-        W_plane_tri_reg = W_plane_tri_learn.detach()  # 🛡️ 【Reg轨】
-
-        # =====================================================================
         # 2. 图像特征感知采样 (采样中心高频梯度)
         # =====================================================================
         feat_dist = torch.zeros((B, N, 3, 1), device=device)
@@ -331,6 +305,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             F_curr_exp = F_curr.unsqueeze(2)
             feat_dist = ((F_curr_exp - F_neighbor) ** 2).sum(dim=-1, keepdim=True)  # [B, N, 3, 1]
 
+
         # =====================================================================
         # 3. 收集图网络邻居异构上下文
         # =====================================================================
@@ -340,14 +315,37 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         neighbor_scaled_planes = scaled_planes[batch_idx, neighbor_indices]  # [B, N, 3, 4]
         neighbor_costs = current_costs[batch_idx, neighbor_indices]  # [B, N, 3, 1]
 
-        # 🎯 核心读取：提取邻居平面置信度，用于熔断机制
-        # 🎯 修复高级索引碰撞：先 squeeze 后提取再 unsqueeze，确保形状绝对契合 [B, N, 3, 1]
-        W_plane_tri_sq = W_plane_tri.squeeze(-1)
-        neighbor_W_conf = W_plane_tri[batch_idx, neighbor_indices]  # [B, N, 3, 1]
-
         self_scaled_expand = scaled_planes.unsqueeze(2)  # [B, N, 1, 4]
         plane_diff = neighbor_scaled_planes - self_scaled_expand  # [B, N, 3, 4]
 
+        # =====================================================================
+        # 时空门控自愈置信度循环更新总线 (置信度图神经网络传导)
+        # =====================================================================
+
+        # 💾 计算 Transient 动态匹配代价变异量量纲
+        if prev_costs is not None:
+            delta_cost = torch.abs(current_costs - prev_costs)
+        else:
+            delta_cost = torch.zeros_like(current_costs)
+
+        if W_plane_tri is None:
+            # 物理机制：第一轮冷启动几何天生带毒。我们强行免检放行，给全图下发 1.0 满血置信度先验！
+            # 迫使系统先各向异性地根据 matching cost 把法向带正，不让混乱的初始误差在第 0 步就污染记忆！
+            W_plane_tri_learn = torch.ones_like(current_costs)
+            W_plane_tri_reg = torch.ones_like(current_costs)
+        else:
+            if W_plane_tri.dim() == 2:
+                W_plane_tri = W_plane_tri.unsqueeze(-1)  # 强制升维至 [B, N, 1]
+                
+            # 串联宏观先验特征、实时匹配代价、以及收敛速度探测器 delta_cost
+            # 此时特征量纲严格对齐 [B, N, H + 3]，绝不引爆一丁点 Linear 矩阵维度冲突！
+            W_update_input = torch.cat([init_hidden, current_costs, delta_cost, W_plane_tri], dim=-1)
+            W_plane_tri_raw = self.confidence_predict_head(W_update_input)
+
+            # 借助不确定性回归约束，值域刚性锁定
+            W_plane_tri_learn = torch.clamp(torch.sigmoid(W_plane_tri_raw), min=1e-6, max=1.0)  # 🧾 【Learn轨】
+            W_plane_tri_reg = W_plane_tri_learn.detach()  # 🛡️ 【Reg轨】
+  
         # =====================================================================
         # 4. 双重完全解耦门控计算 (自卫分配与邻居流形熔断)
         # =====================================================================
@@ -397,8 +395,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # =====================================================================
         # 🎯 核心修复：强制将自身 Logits 升维成 4 维 [B, N, 1, 1]，确保与 neighbor_logits 的 4 维空间绝对右对齐！
         # 我们架设保底减速带，强行维持 Softmax 消息流在测试集上的高流动性，消灭面片微观碎裂化
-        # safe_temp = max(float(temperature), 0.5)  # 凸流形保底温标，前向严禁跨入阶跃相变断崖
-        safe_temp = temperature  # 凸流形保底温标，前向严禁跨入阶跃相变断崖
+        # 与外层余弦退火 [0.55, 1.0] 对齐，避免硬地板 0.5 抵消尾盘控温
+        safe_temp = max(float(temperature), 0.55)
 
         # 强制将自身 Logits 升维成 4 维 [B, N, 1, 1]，确保空间绝对右对齐
         self_logits_z_4d = self_weight_logits_z.unsqueeze(-1)
@@ -1149,7 +1147,8 @@ class PlanePatchMatchModule(nn.Module):
 
         # 生成三角形的平面置信度
         W_plane_tri = self._compute_plane_confidence(
-            ref_feature, depth_stage1, no_prop_depth, surface_var, tri_id_map, max_tri_num
+            ref_feature, depth_stage1, no_prop_depth, surface_var, tri_id_map, max_tri_num,
+            current_planes=current_planes, rays_centroids=rays_centroids,
         )
 
         # ==========================================
@@ -1164,7 +1163,8 @@ class PlanePatchMatchModule(nn.Module):
         static_edge_feats = self.edge_head.extract_static_features(
             feat=ref_feature.detach(),
             tri_infos=tri_infos,
-            dense_depth=depth_stage1.detach()
+            dense_depth=depth_stage1.detach(),
+            intrinsics=ref_intrinsics  # 👈 刚性丢入相机参数，完成 3D 绝对位移空间解算
         )
 
         # 边断裂概率输出后续算loss
@@ -1173,6 +1173,7 @@ class PlanePatchMatchModule(nn.Module):
         # 初始化上一轮代价缓存 (第一轮没有历史，设为 None)
         prev_costs = None
 
+        W_raw_anchor = W_plane_tri.clone().detach() # 👈 进循环前，原地备份最纯净的物理冷启动初始置信度
         # ==========================================
         # 5. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
@@ -1192,6 +1193,13 @@ class PlanePatchMatchModule(nn.Module):
             edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
                     edge_alpha, tri_infos, max_tri_num, device)
 
+            
+            if iter_idx == 0:
+                # 第一轮冷启动：强制投递 None！封闭空域传播，拒绝不确定性毒素内耗！
+                W_gating_input = None
+            else:
+                W_gating_input = W_plane_tri
+
             # 5.1 ym-modify 传播：全新双解耦网络，完美注入 W_plane_tr，在传播中不断更新w_plane
             new_planes,W_plane_tri_learn = self.propagator(
                 current_planes=current_planes,
@@ -1202,16 +1210,21 @@ class PlanePatchMatchModule(nn.Module):
                 rays_centroids=rays_centroids,
                 depth_max=depth_max,
                 prev_costs=prev_costs,
-                W_plane_tri=W_plane_tri,
+                W_plane_tri=W_gating_input,
                 centroids_norm=centroids_norm,
                 pixel_counts=pixel_counts_tensor,
-                temperature=current_temp  # 可根据当前训练的 Epoch 动态退火压低
+                temperature=current_temp,  # 可根据当前训练的 Epoch 动态退火压低
+                W_raw_anchor=W_raw_anchor  # 刚性投递，防止置信度头多轮迭代后神经失忆
             )
 
             # 将本轮的代价封存，作为下一轮的“历史代价”
             prev_costs = current_costs.detach()
-            # 将本轮预测出的全新置信度，直接覆盖，成为下一轮邻居查表的身份牌！
-            W_plane_tri = W_plane_tri_learn
+            
+            # 防范第 0 步的毒素改写历史 anchor，第 1 轮继续以纯净的真理种子作为 GRU 的时序记忆起点！
+            if iter_idx == 0:
+                W_plane_tri = W_raw_anchor
+            else:
+                W_plane_tri = W_plane_tri_learn
 
             # # 对传播进行一个保护
             new_planes = fitter_module.enforce_depth_hard_constraint(
@@ -1245,6 +1258,19 @@ class PlanePatchMatchModule(nn.Module):
 
 
         final_planes = current_planes
+        # =====================================================================
+        # 👑 【核心重构：外层全标度刚性上界饱和铁闸】
+        # =====================================================================
+        # 物理因果：在这里对置信度降下全管线统一的 SmoothStep 极化法案！
+        # 设定上界 theta_high = 0.80（刚性严苛对齐，深度误差需锁定在 1.20 米内）。
+        # 强行注入 .detach() 锁定，阻断下游光滑性损失（L_smoothness）逆向洗劫置信度更新头。
+        th_low, th_high = 0.05, 0.80
+        W_pure = W_plane_tri.detach().squeeze(-1)                       # 刚性挤压退化的 [B, N, 1] 至 [B, N]
+        x_norm = torch.clamp((W_pure - th_low) / (th_high - th_low + 1e-8), 0.0, 1.0)
+            
+        # 降下三阶 Hermite 极化算子，强制将高于 0.80 的不确定性拉满至严格的 1.0 铁板
+        W_tri_polarized = ((norm_val := x_norm) ** 2 * (3.0 - 2.0 * norm_val)).detach()
+        W_plane_tri_polarized = W_tri_polarized.unsqueeze(-1)  # 升维 [B, N, 1] 供下游光滑性损失平稳查表    
 
         # ==========================================
         # 7. 渲染与输出和计算损失
@@ -1285,7 +1311,7 @@ class PlanePatchMatchModule(nn.Module):
                 pixel_counts=pixel_counts_tensor,  # 每个三角形的大小
                 intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
-                W_plane_tri=W_plane_tri.detach(),
+                W_plane_tri=W_plane_tri_polarized.detach(),
                 H=H, W=W,
                 sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
                 lambda_ang=5.0  # 可调：法向平滑的相对强度
@@ -1318,6 +1344,8 @@ class PlanePatchMatchModule(nn.Module):
 
         # 将三角形置信度转化为全分辨率稠密灰度图
         W_plane_pixel_out = self._scatter_triangle_to_pixel(W_plane_tri, tri_id_map)
+        # 传播前：_compute_plane_confidence 冷启动锚点（与循环内 W_raw_anchor 一致）
+        W_plane_pixel_init = self._scatter_triangle_to_pixel(W_raw_anchor, tri_id_map)
 
         return (depth_samples, pixel_costs,
                 view_weights,
@@ -1325,7 +1353,9 @@ class PlanePatchMatchModule(nn.Module):
                 final_planes,
                 edge_alpha,
                 continuity_loss,smoothness_loss,
-                W_plane_pixel_out,W_plane_tri) # 分别是像素级别和三角形级别的
+                W_plane_pixel_out, W_plane_tri, W_plane_tri_polarized,
+                pixel_counts_tensor,
+                W_plane_pixel_init, W_raw_anchor)  # 更新前/后对比用
 
     # ==========================================
     # 辅助函数 (Placeholders)
@@ -1612,12 +1642,16 @@ class PlanePatchMatchModule(nn.Module):
 
         return tri_costs
 
-    def _compute_plane_confidence(self, ref_feature, depth_stage1, no_prop_depth, surface_var, tri_id_map, max_tri_num):
+    def _compute_plane_confidence(self, ref_feature, depth_stage1, no_prop_depth, surface_var, tri_id_map,
+                                max_tri_num, current_planes, rays_centroids):
         """
         将几何冲突、高频纹理梯度与 SVD 表面变异度熔炼为三角形级别的平面置信度 W_plane.
         所有计算运行在 torch.no_grad() 下，绝对隔绝反向传播梯度。
         """
         with torch.no_grad():
+            B, _, H, W = depth_stage1.shape
+            device = depth_stage1.device
+
             # 1. 检查空间分辨率对齐，封杀隐式广播核爆
             if ref_feature.shape[2:] != depth_stage1.shape[2:]:
                 depth_stage1 = F.interpolate(depth_stage1, size=ref_feature.shape[2:], mode='bilinear',
@@ -1640,11 +1674,36 @@ class PlanePatchMatchModule(nn.Module):
             T_feat_clean = F.relu(T_feat - noise_floor)
             T_feat_scaled = torch.tanh(T_feat_clean * 1.5)
 
-            # 3. 计算几何冲突 (Geometric Conflict)
-            C_geo_abs = torch.abs(depth_stage1.detach() - no_prop_depth.detach()).clamp(min=1e-4)
-            C_geo_norm = C_geo_abs / (depth_stage1.detach() + 1e-6)
+            # =====================================================================
+            # 3. 倾斜流形自适应视线补偿 (Geometric Conflict)
+            # =====================================================================
+            # n_curr = current_planes[..., :3]  # [B, N, 3]
+            # denom_curr = (n_curr * rays_centroids).sum(dim=-1, keepdim=True)  # [B, N, 1]
 
-            # 4. 熔炼像素级非平面惩罚地图
+            # # 物理级三角形面片视线夹角余弦值计算
+            # cos_tri = denom_curr.abs().clamp(min=0.1, max=1.0).squeeze(-1)  # [B, N]
+
+            # # 将密集格式一阶拉平，强制执行 .long() 显式转型防御，杜绝 C++ 内部指针发散
+            # flat_tri_id = tri_id_map.view(B, -1).long()  # [B, H*W]
+            
+            # # 空间边界实体点合规检查掩码
+            # valid_px = (flat_tri_id >= 0) & (flat_tri_id < max_tri_num)
+            # safe_idx = flat_tri_id.clamp(0, max_tri_num - 1)
+
+            # # 执行视点不变高通量查表，每个像素精准带回所属三角形的真实纯净 cos 值
+            # cos_gathered = torch.gather(cos_tri, 1, safe_idx)  # [B, H*W]
+            
+            # # 虚空无主背景处强制用 1.0 保底进行物理绝缘，不释放任何错误几何拉扯
+            # cos_gathered = torch.where(valid_px, cos_gathered, torch.ones_like(cos_gathered))
+            
+            # # 重新规整形态，完美降维输出 [B, 1, H, W] 标准张量，与 depth 场绝对同构！
+            # cos_theta = cos_gathered.view(B, 1, H, W)
+
+            # todo：暂时不用svd不干净的法向量进行一个计算
+            C_geo_abs = torch.abs(depth_stage1.detach() - no_prop_depth.detach())
+            C_geo_norm = (C_geo_abs / (depth_stage1.detach() + 1e-6))
+
+            # 4. 熔炼像素级非平面惩罚项
             pixel_curve_penalty = C_geo_norm * T_feat_scaled
 
             # 5. 像素级聚合至稀疏三角形网格 [B, N]
@@ -1655,11 +1714,11 @@ class PlanePatchMatchModule(nn.Module):
             ).squeeze(-1)
 
             # 6. 引入 Surface Variation 表面粗糙度方差
-            sv_scaled = torch.tanh(surface_var * 8.0)  # 进一步放宽粗糙度敏感底线
+            sv_scaled = torch.tanh(surface_var * 10.0)  # 进一步放宽粗糙度敏感底线
 
-            # 🎯 【尺度校准点】：将过度严苛的 10.0 系数下调至 4.0 黄金分割线，允许微小形变流形软着陆
-            alpha_conf = 4.0
-            beta_conf = 4.0
+            # 降下刚性惩罚重锤
+            alpha_conf = 10.0  # 几何冲突惩罚全面加码！
+            beta_conf = 10.0   # 表面粗糙度惩罚全面加码！
 
             total_penalty = alpha_conf * tri_curve_penalty + beta_conf * sv_scaled
             W_raw = torch.exp(-total_penalty)
@@ -1667,8 +1726,8 @@ class PlanePatchMatchModule(nn.Module):
             # ==========================================================
             # 2. 🚀 工业级多项式死区门控区间重组
             # ==========================================================
-            theta_low = 0.15  # 适当抬高熔断底线，树冠与杂乱碎屑更快切断
-            theta_high = 0.75  # 🎯 关键修正：下调绝对平面门槛，与后向柯西 Label 空间完美咬合对齐！
+            theta_low = 0.20   # 适当抬高截断底线，让黄绿过渡区直接掉落死区
+            theta_high = 0.80  # 刚性还原高门槛，只有真正的 0.069m 级别绝对平整面才配拿到高置信度！
 
             # 线性映射并强制收拢至凸空间
             x = torch.clamp((W_raw - theta_low) / (theta_high - theta_low + 1e-8), 0.0, 1.0)
