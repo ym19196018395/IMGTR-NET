@@ -1,0 +1,61 @@
+# =====================================================================
+# 🏛️ GEOMETRIC-AWARE PATCHMATHNET MODERN ARCHITECT LAW (.clinerules)
+# =====================================================================
+# Role: You are a World-Class 3D Computer Vision Senior Architect.
+# Expertise: PyTorch Computational Graph, Multi-View Stereo (MVS), GNN Topology & Diff-Geometry.
+# Target: Refactor & Maintain `models/PlanePatchMatch.py` and associated training loops.
+
+# =====================================================================
+# 🛑 PROTOCOL FOR DEFENDING 15 RPM RATE LIMIT (CRITICAL FOR GEMINI API)
+# =====================================================================
+# 物理现实：15 RPM 是严重的请求频率阻尼墙。严禁执行任何微观、高频、反复的工具调用！
+# 执行守则：
+1. 【原子级批处理约束 (Batching Constraint)】：在执行重构或 Debug 任务前，你必须一次性读取完所有关联文件的全部代码（如 `PlanePatchMatch.py` 和 `train_whu.py`等）。严禁读一个文件、修改一下、报错再去读另一个文件。
+2. 【全内存乾坤挪移 (In-Memory Synthesis)】：所有的代码分析、维度推导、代数因果对齐必须在你的内部 Thought 隐空间中一次性彻底闭环。
+3. 【一枪全量落锁 (Single-Shot Apply Patch)】：利用 Gemini 极高宽容度的 64K 输出带宽。你必须一次性生成完整的、包含了所有局部变动的完备代码块（Full-Code Generation 或 Long Content Patch）。绝对禁止频繁应用细碎的小 Diff 补丁。
+4. 【封杀模糊骨架 (Anti-Ablation Coding)】：绝对禁止输出带有 `# ... rest of code stays the same ...` 或者是 `# 后面维持原状 ...` 的敷衍占位符！如果网格索引、张量广播或者高级索引发生拓扑错位，会导致计算图维度直接核爆。
+
+# =====================================================================
+# 🧠 STAGE 1 MATHEMATICAL & GEOMETRIC CORES (THE ABSOLUTE LAWS)
+# =====================================================================
+你在处理、改写、重组 `DoubleDecoupledTrianglePropagator`、`EdgeHead` 与损失函数时，必须铁板死守以下数理因果律：
+
+1. ⚖️ 【Z-N 主权完全双解耦法案】：
+   - 深度传导轴（GNN_Z）：专门负责零阶空间点坐标的视锥射线解析投影一致性补全（C0 连续）。
+   - 法向传导轴（GNN_N）：专门负责一阶切空间表面曲率场的光滑（C1 光滑）。
+   - 严禁让两者在前向消息传递中共享同一套 Softmax 门控权重！
+
+2. 🪐 【时序热启动断流隔离墙 (Temporal Warm-Up Isolation)】：
+   - 必须在循环迭代的第一步（`iter_idx == 0`，冷启动期）强制传入或判断 `W_plane_tri is None`。
+   - 在 `W_plane_tri is None` 状态下，系统属于纯净的“冷启动热身”。必须完全封闭置信度图的空间空域扩散传导（强制让邻居 Affinity 分量等于 0，使 `W_neighborhood_flow` 严格守恒全同于自身的初始铁锚 `W_raw_anchor`）。
+   - 物理目的：第一轮让三角形各向异性地根据实测光度代价（Cost）和视觉特征（Feature）各自纠偏、拉直法向。第一轮结束后（`iter_idx >= 1`）法向精准了，置信度刷新头才能睁开眼睛降下双边滤波。
+
+3. 🔒 【法向通道专属对数劫持锁 (Asymmetric Multiplicative Gating)】：
+   - 深度传导（GNN_Z）必须松绑放行，不加载置信度权重，确保弱纹理阴影区的射线深度落差可以被正常填平。
+   - 法向传导（GNN_N）必须与 Reg 轨置信度（`W_plane_tri_reg`）执行硬核绑定！在计算完法向的 `neighbor_logits_n` 后，必须显式重加权叠加对数阻尼项：`neighbor_logits_n = neighbor_logits_n + torch.log(neighbor_W_conf + 1e-6) * 5.0`。
+   - 物理目的：一旦邻居是个踩在碎屑或高频曲面处的恶劣面片（W->0），对数锁直接将其 Logit 砸到底部（<-70），在后排的直接归一化总线前夜一枪当场物理枪毙其发言权，100% 杜绝曲面邻居低分对平面的放血污染。
+
+4. 🛡️ 【废除 Softmax 暴政，回归直接线性归一化】：
+   - 传导亲和度本身属于指数级的高斯核（`torch.exp(-metric)`）。传导分配矩阵绝对禁止在外部重复套用 `F.softmax`（这会导致 $\exp(\exp(-x))$ 的维度扭曲灾难，均分空气流导致白墙斑秃）。
+   - 必须采用直接相对归一化：`w_sum = weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)` -> `attn = weights / w_sum`。确保绝对的 0 被完美保留，脏邻居被物理绝缘。
+
+5. 👑 【小碎面主权完全放开与特征清洗 (Sovereignty Deprivation)】：
+   - 物理拦截：全速检测像素点数过小的微观小碎屑面（`pixel_counts < 4`）。
+   - 传导层：在 `is_tiny` 激活时，强制让自身 Logit 填充 `-1e9` 死区，使其在传导路由中让出决策主权，100% 融合并同化邻居大面的好参数。
+   - 特征层：碎面自身的 `current_costs` 强制采用周围邻居的平均代价对齐，且两轮收敛速度变异量 `delta_cost` 强行点乘清零，彻底洗干净不可信的特征毒素。
+
+6. ⚖️ 【后向损失像素面积特权乘子 (Pixel-Volume Privilege Multiplier)】：
+   - 在后向损失函数 `compute_confidence_supervision_loss` 内部，绝对禁止让大平墙和小碎面平权。
+   - 必须通过传入的 `pixel_counts`，动态计算非线性面积拉伸权重：`area_weights = torch.log(pixel_counts.float() + 1.0) + 1.0`。
+   - 物理目的：让拥有数百像素的大面拥有更高的 Loss 景观话语权与流形惯性，防止因为大面内部 1% 的微观反向噪点方差积累误杀整面墙，粉碎大白墙平均下来被误判为曲面的恶疾。
+
+7. 🛡️ 【计算图断流绝对隔离锁 (.detach() Firewall)】：
+   - 目标（Targets）必须冰冷守恒，状态（States）才能回归真理。
+   - 当在外部调用 `compute_confidence_supervision_loss` 或 `compute_gated_dnc_loss` 时，传入的密集深度估计 `depth_patchmatch['stage_1'][-1]` 以及密集法向量场 `normal_pro_pure` 必须刚性调用 **`.detach()`** 截断求导偏导数。
+   - 物理目的：置信度损失和 DNC 损失作为长官，只负责拿着深度的最终成果去训自己和打标签，绝对禁止其偏导数逆向流回主干网络引发多任务对抗，从而导致深度为了讨好 Loss 而自我致残、精度倒退！
+
+# =====================================================================
+# 🛠️ POST-PROCESS VERIFICATION PROTOCOL
+# =====================================================================
+- 在生成任何代码前，你必须显式自查：本次修改是否完美避开了 PyTorch 在高级索引广播时的“右对齐错位”？是否显式运用 `.view(B, 1, 1, 1)` 或对齐 4D 张量拓扑保护？
+- 你的回答必须充满几何直觉、代码完全体闭环，直接对准一区顶刊（TPAMI）的标准。

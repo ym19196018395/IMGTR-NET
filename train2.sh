@@ -39,7 +39,7 @@ python train_whu.py --dataset dtu_whu --batch_size 5 --epochs 24 \
 --patchmatch_num_sample 8 8 16 --propagate_neighbors 0 8 16 --evaluate_neighbors 9 9 9 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train5 \
-2>&1 | tee txt_logs/${timestamp}_5_平面置信度回归到以前的状态,平面置信度第一轮不传播,取消大面积权重.log \
+--logdir ./checkpoints/tensorboard_train9 \
+2>&1 | tee txt_logs/${timestamp}_9_放大连续性约束的收尾权重,取消DNC,让平面置信度每一轮都参与传播.log \
  "$@"
 

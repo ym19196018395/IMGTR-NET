@@ -510,7 +510,31 @@ def save_depth():
 
     
 
-                
+                # ==========================================
+                # 4.2 👑 可视化传播前（Before Propagation/Init）的平面置信度
+                # ==========================================
+                if 'W_plane_pixel_init' in outputs.get("output_plane", {}):
+                    w_before_data = outputs["output_plane"]['W_plane_pixel_init'][b_idx]
+                    w_before_np = w_before_data.detach().cpu().numpy() if isinstance(w_before_data, torch.Tensor) else w_before_data
+                    w_before_sq = np.squeeze(w_before_np)
+                    
+                    if w_before_sq.shape != depth_est_sq.shape:
+                        w_before_sq = cv2.resize(w_before_sq, (depth_est_sq.shape[1], depth_est_sq.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                    # 1) 传播前 Jet 伪彩图落盘（与传播后形成最完美的 Ablation 视觉对比！）
+                    conf_before_filename = os.path.join(args.outdir, filename.format('confidence_s1_init', '_jet_before.png'))
+                    os.makedirs(os.path.dirname(conf_before_filename), exist_ok=True) 
+                    
+                    w_before_uint8 = (np.clip(w_before_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    w_before_uint8_inv = 255 - w_before_uint8 
+                    w_before_uint8_inv[~current_mask] = 0
+
+                    w_before_color = cv2.applyColorMap(w_before_uint8_inv, cv2.COLORMAP_JET)
+                    w_before_color[~current_mask] = 0 
+                    cv2.imwrite(conf_before_filename, w_before_color)
+                    print(f"✅ 传播前初始置信度图已写入: {conf_before_filename}")
+                else:
+                    print(f"⚠️ 提示: 未找到 'W_plane_pixel_init'，无法生成传播前对比图")
                 # ====================================================================
                 # 🚨 新增功能 3：生成 Stage 1 纯自由像素级 (Pixel-wise) 深度的差异热力图
                 # 这是最原汁原味的 Baseline，用于和网格约束后的结果做对比

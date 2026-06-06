@@ -7,7 +7,7 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -515,7 +515,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 1. 连通性约束 (早启动，早满载，晚退坡)：
     # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
-    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.6, max_lambda_c, end_ratio=0.05)
+    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.6, max_lambda_c, end_ratio=0.2)
 
     # 2. 光滑性约束 (中启动，中满载，早退坡)：
     # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
@@ -605,16 +605,16 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     )
 
     # DNC损失
-    # loss_dnc_s1=0.0
+    loss_dnc_s1=0.0
 
-    loss_dnc_s1 = compute_gated_dnc_loss(
-        Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
-        N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
-        W_plane_pixel=outputs["output_plane"]['W_plane_pixel'].detach(),  # 高隔离度空间软路由拦截闸
-        tri_id_map= outputs["output_plane"]['tri_id_map'],
-        intrinsics=ref_intrinsics,
-        valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
-    )
+    # loss_dnc_s1 = compute_gated_dnc_loss(
+    #     Z_pixel=depth_patchmatch['stage_1'][-1],  # 🚀 直接复用物理防爆渲染器出的 1通道 密集真实深度
+    #     N_pixel=outputs["output_plane"]['normal_pro_pure'],  # 🚀 采用我们单独剥离出来的未被可视化污染的 3通道 密集真法向
+    #     W_plane_pixel=outputs["output_plane"]['W_plane_pixel'].detach(),  # 高隔离度空间软路由拦截闸
+    #     tri_id_map= outputs["output_plane"]['tri_id_map'],
+    #     intrinsics=ref_intrinsics,
+    #     valid_mask=valid_mask_s1  # 强力剔除全黑虚空背景
+    # )
 
     # 平面置信度
     loss_plane_s1=compute_confidence_supervision_loss(

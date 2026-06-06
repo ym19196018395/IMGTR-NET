@@ -1,0 +1,38 @@
+# ====================================================================
+# Geometric-Aware PatchMatchNet - Git 版本控制拦截墙
+# ====================================================================
+
+# 1. 强行拦截所有模型权重与 Checkpoint（严禁推送到 GitHub）
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+
+txt_logs/
+
+# 2. 强行拦截 TensorBoard 产生的所有运行日志与事件
+logdir/
+logs/
+**/tensorboard_test/
+**/tensorboard_train29/
+*.tfevents.*
+
+# 3. 强行拦截测试/评估输出的巨型三维点云与图像结果
+outputs/
+outputs_eth/
+*.pfm
+*.png
+*.npy
+*.npz
+
+# 4. 强行拦截本地历史插件缓存（就是我们刚装的那个）
+.history/
+
+# 5. 拦截 Python 系统噪音与 IDE 缓存
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+ppt.py
+readPfm.py

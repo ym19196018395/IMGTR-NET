@@ -1194,11 +1194,8 @@ class PlanePatchMatchModule(nn.Module):
                     edge_alpha, tri_infos, max_tri_num, device)
 
             
-            if iter_idx == 0:
-                # 第一轮冷启动：强制投递 None！封闭空域传播，拒绝不确定性毒素内耗！
-                W_gating_input = None
-            else:
-                W_gating_input = W_plane_tri
+            # 取消第一轮断流冷启动：每一轮都使用当前 W_plane_tri 参与置信度门控更新。
+            W_gating_input = W_plane_tri
 
             # 5.1 ym-modify 传播：全新双解耦网络，完美注入 W_plane_tr，在传播中不断更新w_plane
             new_planes,W_plane_tri_learn = self.propagator(
@@ -1220,11 +1217,8 @@ class PlanePatchMatchModule(nn.Module):
             # 将本轮的代价封存，作为下一轮的“历史代价”
             prev_costs = current_costs.detach()
             
-            # 防范第 0 步的毒素改写历史 anchor，第 1 轮继续以纯净的真理种子作为 GRU 的时序记忆起点！
-            if iter_idx == 0:
-                W_plane_tri = W_raw_anchor
-            else:
-                W_plane_tri = W_plane_tri_learn
+            # 取消第一轮 anchor 恢复逻辑：每一轮都使用本轮预测的置信度更新结果。
+            W_plane_tri = W_plane_tri_learn
 
             # # 对传播进行一个保护
             new_planes = fitter_module.enforce_depth_hard_constraint(
@@ -1259,7 +1253,7 @@ class PlanePatchMatchModule(nn.Module):
 
         final_planes = current_planes
         # =====================================================================
-        # 👑 【核心重构：外层全标度刚性上界饱和铁闸】
+        # 👑 【核心重构：外层全标度刚性上界饱和铁闸】~
         # =====================================================================
         # 物理因果：在这里对置信度降下全管线统一的 SmoothStep 极化法案！
         # 设定上界 theta_high = 0.80（刚性严苛对齐，深度误差需锁定在 1.20 米内）。

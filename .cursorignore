@@ -1,0 +1,20 @@
+# 1. 屏蔽文件夹（包含所有子内容，无论嵌套多深）
+checkpoints/
+outputs_eth/
+txt_logs/
+evaluations/
+.history/
+
+# 2. 屏蔽所有二进制日志与缓存文件
+*.tfevents.*
+__pycache__/
+.git/
+.vscode/
+
+# 3. 屏蔽评估产出的二进制文件
+*.pfm
+*.png
+*.npy
+*.npz
+*.ckpt
+*.pth
