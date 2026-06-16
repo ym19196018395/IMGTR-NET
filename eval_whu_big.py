@@ -4,7 +4,10 @@ import os
 from matplotlib import pyplot as plt
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+# 控制要暴露给进程的 GPU id：优先使用外部环境变量 GPU_ID，
+# 否则使用已有的 CUDA_VISIBLE_DEVICES，最后回退到 '0'
+_gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu_choice)
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -334,6 +337,37 @@ def save_depth():
                     depth_gray[~valid_mask] = 255
                     vis_gray_filename = depth_filename.replace('.pfm', '_black_vis.png')
                     cv2.imwrite(vis_gray_filename, depth_gray)
+
+                    # ==========================================
+                    # 【初始平面拟合 (未传播) 深度图可视化】
+                    # ==========================================
+                    if 'depth_no_pro' in outputs.get('output_plane', {}):
+                        depth_no_pro = outputs['output_plane']['depth_no_pro'][b_idx]
+                        if isinstance(depth_no_pro, torch.Tensor):
+                            depth_no_pro = depth_no_pro.detach().cpu().numpy()
+                        depth_no_pro = np.squeeze(depth_no_pro)
+
+                        valid_no_pro = depth_no_pro > 0
+                        if valid_no_pro.any():
+                            d_min_np = np.percentile(depth_no_pro[valid_no_pro], 1)
+                            d_max_np = np.percentile(depth_no_pro[valid_no_pro], 99)
+                            depth_no_pro_vis = (depth_no_pro - d_min_np) / (d_max_np - d_min_np + 1e-8)
+                            depth_no_pro_vis = np.clip(depth_no_pro_vis, 0, 1)
+                            depth_no_pro_uint8 = (depth_no_pro_vis * 255).astype(np.uint8)
+
+                            no_pro_color = cv2.applyColorMap(depth_no_pro_uint8, cv2.COLORMAP_JET)
+                            no_pro_color[~valid_no_pro] = 0
+                            vis_no_pro_color_filename = depth_filename.replace('.pfm', '_noprop_vis.png')
+                            cv2.imwrite(vis_no_pro_color_filename, no_pro_color)
+
+                            depth_no_pro_gray = depth_no_pro_uint8.copy()
+                            depth_no_pro_gray[~valid_no_pro] = 255
+                            vis_no_pro_gray_filename = depth_filename.replace('.pfm', '_noprop_black_vis.png')
+                            cv2.imwrite(vis_no_pro_gray_filename, depth_no_pro_gray)
+
+                        # 额外保存原始未传播深度 PFM，方便后续对比分析
+                        no_pro_depth_filename = depth_filename.replace('.pfm', '_noprop.pfm')
+                        save_pfm(no_pro_depth_filename, depth_no_pro.astype(np.float32))
 
 
                 # ==========================================

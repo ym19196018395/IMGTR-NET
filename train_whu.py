@@ -7,7 +7,10 @@ from models.edge_head import EdgeLabelGenerator
 from models.PlanePatchMatch import *
 from models.sum_loss import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# 控制要暴露给进程的 GPU id：优先使用外部环境变量 GPU_ID，
+# 否则使用已有的 CUDA_VISIBLE_DEVICES，最后回退到 '0'
+_gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu_choice)
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -26,6 +29,7 @@ from utils import *
 import gc
 import sys
 import datetime
+import subprocess
 from datasets.dtu_whu import collate_keep_list
 
 # ym_add 这对应的就是实际的cuda
@@ -69,6 +73,12 @@ parser.add_argument('--propagate_neighbors', nargs='+', type=int, default=[0, 8,
                     help='num of neighbors for adaptive propagation on stages 1,2,3')
 parser.add_argument('--evaluate_neighbors', nargs='+', type=int, default=[9, 9, 9],
                     help='num of neighbors for adaptive matching cost aggregation of adaptive evaluation on stages 1,2,3')
+
+# Optional: run large-scene evaluation using the final checkpoint after training
+parser.add_argument('--run_big_eval', action='store_true', help='After training, run eval_whu_big on a large testset')
+parser.add_argument('--big_eval_dataset', default='dtu_whu_eval_big', help='dataset name for big eval')
+parser.add_argument('--big_eval_testpath', default='/home/ym/Experiment/Datas/WHU_MVS_dataset', help='test data path for big eval')
+parser.add_argument('--big_eval_testlist', default='lists/whu/bigtest.txt', help='test list file for big eval')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -515,7 +525,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 1. 连通性约束 (早启动，早满载，晚退坡)：
     # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
-    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.6, max_lambda_c, end_ratio=0.2)
+    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.6, max_lambda_c, end_ratio=0.05)
 
     # 2. 光滑性约束 (中启动，中满载，早退坡)：
     # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
@@ -1079,5 +1089,89 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 if __name__ == '__main__':
     if args.mode == "train":
         train()
+        # 如果用户请求，在训练结束后启动大图评估（使用最新保存的 checkpoint）
+        if args.run_big_eval:
+            # 训练结束后先释放训练过程中占用的 GPU 内存，避免子进程启动时 OOM
+            print("Releasing training GPU memory before big eval...")
+            try:
+                del model, optimizer, train_dataset, test_dataset, TrainImgLoader, TestImgLoader
+            except NameError:
+                pass
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # 查找最新的 ckpt
+            if os.path.isdir(args.logdir):
+                ckpts = [fn for fn in os.listdir(args.logdir) if fn.endswith('.ckpt')]
+                parsed_ckpts = []
+                for fn in ckpts:
+                    try:
+                        idx = int(fn.split('_')[-1].split('.')[0])
+                    except ValueError:
+                        continue
+                    parsed_ckpts.append((idx, fn))
+
+                # 优先选择当前训练最大 epoch 之内的 checkpoint，避免旧 run 的大序号文件被误选
+                valid_ckpts = [(idx, fn) for idx, fn in parsed_ckpts if idx <= args.epochs - 1]
+                if valid_ckpts:
+                    valid_ckpts.sort(key=lambda x: x[0])
+                    last_ckpt = os.path.join(args.logdir, valid_ckpts[-1][1])
+                elif parsed_ckpts:
+                    parsed_ckpts.sort(key=lambda x: x[0])
+                    last_ckpt = os.path.join(args.logdir, parsed_ckpts[-1][1])
+                else:
+                    last_ckpt = args.loadckpt
+            else:
+                last_ckpt = args.loadckpt
+
+            if last_ckpt is None:
+                print('No checkpoint found to run big eval. Skipping.')
+            else:
+                eval_script = os.path.join(os.path.dirname(__file__), 'eval_whu_big.py')
+                cmd = [sys.executable, eval_script,
+                       '--dataset', args.big_eval_dataset,
+                       '--testpath', args.big_eval_testpath,
+                       '--testlist', args.big_eval_testlist,
+                       '--loadckpt', last_ckpt,
+                       '--outdir', args.logdir,
+                       '--n_views', str(5)]
+
+                # 传递 patchmatch 与 propagation 相关参数，保持评估一致性
+                # 将每个 list 参数作为单次 flag 传入后跟多个值（符合 argparse with nargs='+')
+                if isinstance(args.patchmatch_iteration, (list, tuple)):
+                    cmd += ['--patchmatch_iteration'] + [str(v) for v in args.patchmatch_iteration]
+                else:
+                    cmd += ['--patchmatch_iteration', str(args.patchmatch_iteration)]
+
+                if isinstance(args.patchmatch_num_sample, (list, tuple)):
+                    cmd += ['--patchmatch_num_sample'] + [str(v) for v in args.patchmatch_num_sample]
+                else:
+                    cmd += ['--patchmatch_num_sample', str(args.patchmatch_num_sample)]
+
+                if isinstance(args.patchmatch_interval_scale, (list, tuple)):
+                    cmd += ['--patchmatch_interval_scale'] + [str(v) for v in args.patchmatch_interval_scale]
+                else:
+                    cmd += ['--patchmatch_interval_scale', str(args.patchmatch_interval_scale)]
+
+                if isinstance(args.patchmatch_range, (list, tuple)):
+                    cmd += ['--patchmatch_range'] + [str(v) for v in args.patchmatch_range]
+                else:
+                    cmd += ['--patchmatch_range', str(args.patchmatch_range)]
+
+                if isinstance(args.propagate_neighbors, (list, tuple)):
+                    cmd += ['--propagate_neighbors'] + [str(v) for v in args.propagate_neighbors]
+                else:
+                    cmd += ['--propagate_neighbors', str(args.propagate_neighbors)]
+
+                if isinstance(args.evaluate_neighbors, (list, tuple)):
+                    cmd += ['--evaluate_neighbors'] + [str(v) for v in args.evaluate_neighbors]
+                else:
+                    cmd += ['--evaluate_neighbors', str(args.evaluate_neighbors)]
+
+                print('Running big-eval command:', ' '.join(cmd))
+                try:
+                    subprocess.run(cmd, check=True)
+                except subprocess.CalledProcessError as e:
+                    print('Big eval failed:', e)
     elif args.mode == "val":
         test()

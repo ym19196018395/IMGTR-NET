@@ -172,7 +172,7 @@ class EdgeHead(nn.Module):
 
         return static_feats_list
 
-    def dynamic_forward(self, static_feats_list, tri_infos, tri_planes, intrinsics, H, W):
+    def dynamic_forward(self, static_feats_list, tri_infos, tri_planes, intrinsics, H, W, W_plane_tri=None):
         """
         【EdgeHead·流形双动态进化版】循环内调用。
         
@@ -215,6 +215,34 @@ class EdgeHead(nn.Module):
             plane_depth_diff = self._compute_analytical_depth_diff(
                 midpoints_norm, planes_t1, planes_t2, curr_intrinsics, H, W
             ).clamp(max=500.0)
+
+            # # --- 3. 👑【终局范式：流形共识偏差自适应阻尼锁】---
+            if W_plane_tri is not None:
+                active_conf_map = W_plane_tri.squeeze(-1) if W_plane_tri.dim() == 3 else W_plane_tri
+                W_left = active_conf_map[b, idx1].unsqueeze(-1)  # [E, 1]
+                W_right = active_conf_map[b, idx2].unsqueeze(-1) # [E, 1]
+                
+                # 🪐【数理因果】：仅在【存在显著置信度极化差异】时才激活几何惩罚
+                # 计算两端平面与曲面的置信度差值绝对值（代表流形主权冲突）
+                conf_diff = torch.abs(W_left - W_right)
+                # 计算两端的置信度均值（代表是否处于高置信度流形内）
+                conf_mean = (W_left + W_right) / 2.0
+                
+                # 👑 核心逻辑：
+                # 只有当：置信度差异大（存在平面侵略曲面的可能） AND 均值较高（至少有一端是平面）
+                # 才会引发深度的“伪放大”，诱导边缘检测器落锁断开。
+                # 如果两端都是低分曲面（W_mean < 0.3），该乘子趋于 1.0，完全解开平滑限制，任由网络拟合！
+                
+                # 使用非线性函数：在置信度差异超过 0.3 且均值较高时，才激进放大视差
+                # 这样既保护了曲面的自由度，又铁腕阻断了平面对曲面的蚕食
+                trigger = (conf_diff > 0.3) & (conf_mean > 0.4)
+                
+                # 放大系数设为动态，避免固定倍数带来的数值波动
+                base_multiplier = 1.0 + (conf_diff * 4.0) 
+                planar_consensus_multiplier = torch.where(trigger, base_multiplier, torch.ones_like(base_multiplier))
+                
+                # 只有当 planar_consensus_multiplier > 1.0 时，才会放大视差诱导断裂
+                plane_depth_diff = plane_depth_diff * planar_consensus_multiplier
 
             # --- 4. 两条动态几何总线无伤并网，递交 MLP 推理 ---
             mlp_input = torch.cat([

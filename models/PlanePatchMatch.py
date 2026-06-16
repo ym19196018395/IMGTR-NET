@@ -329,10 +329,9 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             delta_cost = torch.zeros_like(current_costs)
 
         if W_plane_tri is None:
-            # 物理机制：第一轮冷启动几何天生带毒。我们强行免检放行，给全图下发 1.0 满血置信度先验！
-            # 迫使系统先各向异性地根据 matching cost 把法向带正，不让混乱的初始误差在第 0 步就污染记忆！
-            W_plane_tri_learn = torch.ones_like(current_costs)
-            W_plane_tri_reg = torch.ones_like(current_costs)
+            # 实验一的优良血统：第 0 轮冷启动，由于法向尚未熨平，强制沿用初始真理铁锚自保
+            W_plane_tri_learn = W_raw_anchor.clone()
+            W_plane_tri_reg = W_raw_anchor.clone()
         else:
             if W_plane_tri.dim() == 2:
                 W_plane_tri = W_plane_tri.unsqueeze(-1)  # 强制升维至 [B, N, 1]
@@ -1023,6 +1022,11 @@ class PlanePatchMatchModule(nn.Module):
 
         # === 🔥 新增：EdgeHead作为内部模块 ===
         self.edge_head = EdgeHead(feat_channels)
+        
+        # =====================================================================
+        # 👑 【修改通道一】：将平滑器通道严格绑定为传入的 feat_channels (16 维)，彻底终结报错
+        # =====================================================================
+        self.cost_smoother = DenseCostSmoother(ref_channels=feat_channels)
 
         self.propagator_iter = propagator_iter
 
@@ -1080,7 +1084,7 @@ class PlanePatchMatchModule(nn.Module):
 
         # 把原始的像素数 Tensor
         pixel_counts_tensor = torch.stack(pixel_counts, dim=0)  # [B, N_max]
-
+    
         # 三角形质心坐标[B, N_max, 2]
         centroids_norm = self.fitter.collate_centroids_norm(
             tri_infos[0]['centers_list'], device
@@ -1106,22 +1110,20 @@ class PlanePatchMatchModule(nn.Module):
         # ==========================================
         # 2. 拟合与生成 (Fitting & Generation)，根据stage2预测深度来拟合生成假设平面
         # ==========================================
-        # 使用优化后的 get_plane_hypotheses 直接得到 [B, N, K, 4]
-        # 其中 [:, :, 0, :] 是原始 SVD 拟合结果,[:, :, 1, :] 是前向平行, [:, :, 2-K:, :] 是随机扰动结果
-        # todo:暂时不需要假设了，直接用拟合的结果,用了假设之后导致平面传播的一塌糊涂，很失败
+
         hypotheses,surface_var = self.fitter.get_plane_hypotheses(
             depth_stage2=depth_stage1,
             tri_id_map=tri_id_map,
             intrinsics_s1=ref_intrinsics,
             max_num_triangles=max_tri_num
-        )  # Output: [B, N_tri, 1, 4]
+        )  # Output: [B, N_tri, 1, 1]
 
-        # [B, N_tri, K, 4] -> [B, N_tri, 4] (取第0个假设,最佳平面的前3通道)
+        # [B, N_tri, K, 1] -> [B, N_tri, 4] (取第0个假设,最佳平面的前3通道)
         # 进行一个可视化看看效果，拟合的初始平面
         # before_best_guess_planes = hypotheses[:, :, 0, :]  # [B, N_tri, 4]
 
         # 直接取出唯一的平面作为基底 (不需要 argmin)
-        current_planes = hypotheses.squeeze(2)  # [B, N_tri, 4]
+        current_planes = hypotheses.squeeze(2)  # [B, N_tri, 1]
 
         # ==========================================
         # 3. 计算 SVD 基底的物理代价 (作为特征)
@@ -1133,8 +1135,25 @@ class PlanePatchMatchModule(nn.Module):
             ref_feature, src_features, ref_proj, src_projs,
             pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics
         )
-        # 聚合为三角形代价 [B, N_tri, 1]
-        current_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
+        
+        # =====================================================================
+        # 👑 【修改通道二】：自适应多假设维度动态广播总线（无伤简化版）
+        # =====================================================================
+        B_out, H_out, W_out, K_out = pixel_costs.shape
+        pixel_costs_tensor = pixel_costs.permute(0, 3, 1, 2).reshape(B_out * K_out, 1, H_out, W_out)
+        
+        # 🎯【姚敏空间优化】：动态检查 K_out 尺度。若 K_out=1，直接白嫖指针，斩断无意义的内存间跨拷贝
+        if K_out > 1:
+            ref_feat_detached = ref_feature.detach().repeat_interleave(K_out, dim=0)
+        else:
+            ref_feat_detached = ref_feature.detach()
+            
+        # 纯化全分辨率密集代价场
+        pixel_costs_clean_tensor = self.cost_smoother(pixel_costs_tensor, ref_feat_detached)
+        pixel_costs_clean = pixel_costs_clean_tensor.view(B_out, K_out, H_out, W_out).permute(0, 2, 3, 1)
+        
+        # 三角形平均归约
+        current_costs = self.aggregate_costs_per_triangle(pixel_costs_clean, tri_id_map, max_tri_num)
 
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
@@ -1186,7 +1205,8 @@ class PlanePatchMatchModule(nn.Module):
                     tri_infos=tri_infos,
                     tri_planes=current_planes.detach(),  # 👈 永远使用最新修正的平面
                     intrinsics=ref_intrinsics,
-                    H=H, W=W
+                    H=H, W=W,
+                    W_plane_tri=W_plane_tri.detach()  # 👈 断开传播，纯粹作为特征输入
             )
 
             # 转换为三角形级别格式 [B, N_max, 3]
@@ -1243,8 +1263,23 @@ class PlanePatchMatchModule(nn.Module):
                         ref_intrinsic=ref_intrinsics,
                         is_debug=False
                     ).detach()
+                    
+                    # =====================================================================
+                    # 👑 【修改通道三】：循环内部多轨自适应神经双边降噪总线（无伤简化版）
+                    # =====================================================================
+                    B_loop, H_loop, W_loop, K_loop = pixel_costs_new.shape
+                    pixel_costs_loop_tensor = pixel_costs_new.permute(0, 3, 1, 2).reshape(B_loop * K_loop, 1, H_loop, W_loop)
+                    
+                    # 🚀 动态兼容循环内部可能爆发的 propagation 候选集分裂拓扑
+                    if K_loop > 1:
+                        ref_feat_loop_detached = ref_feature.detach().repeat_interleave(K_loop, dim=0)
+                    else:
+                        ref_feat_loop_detached = ref_feature.detach()
+                    
+                    pixel_costs_loop_clean_tensor = self.cost_smoother(pixel_costs_loop_tensor, ref_feat_loop_detached).detach()
+                    pixel_costs_new_clean = pixel_costs_loop_clean_tensor.view(B_loop, K_loop, H_loop, W_loop).permute(0, 2, 3, 1)
 
-                current_costs = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num).detach()
+                current_costs = self.aggregate_costs_per_triangle(pixel_costs_new_clean, tri_id_map, max_tri_num).detach()
 
             # 5.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
@@ -1701,11 +1736,11 @@ class PlanePatchMatchModule(nn.Module):
             pixel_curve_penalty = C_geo_norm * T_feat_scaled
 
             # 5. 像素级聚合至稀疏三角形网格 [B, N]
-            tri_curve_penalty = self.aggregate_costs_per_triangle(
+            tri_curve_penalty = self.scatter_penalty_to_triangle(
                 pixel_curve_penalty.permute(0, 2, 3, 1),
                 tri_id_map,
                 max_tri_num
-            ).squeeze(-1)
+            )
 
             # 6. 引入 Surface Variation 表面粗糙度方差
             sv_scaled = torch.tanh(surface_var * 10.0)  # 进一步放宽粗糙度敏感底线
@@ -1731,6 +1766,62 @@ class PlanePatchMatchModule(nn.Module):
 
         # 强制加上退化维度防护，输出标准的 [B, N, 1] 拓扑
         return W_plane_final.unsqueeze(-1) if W_plane_final.dim() == 2 else W_plane_final
+
+    def scatter_penalty_to_triangle(self, pixel_penalty, tri_id_map, max_num_tri):
+        """
+        将像素级惩罚项（值域[0,+∞)）聚合为三角形级别的算术平均值。
+        
+        专门用于 _compute_plane_confidence 中的 pixel_curve_penalty 聚合，
+        与 aggregate_costs_per_triangle 的软过滤逻辑完全隔离。
+    
+        Args:
+            pixel_penalty: [B, H, W, 1]  像素级惩罚项，值域[0,+∞)
+            tri_id_map:    [B, H, W]     三角形ID映射
+            max_num_tri:   int           最大三角形数量
+    
+        Returns:
+            tri_penalty:   [B, N_tri]    三角形级别算术平均惩罚值
+        """
+        B, H, W, K = pixel_penalty.shape
+        device = pixel_penalty.device
+    
+        # 1. 展平
+        flat_penalty = pixel_penalty.reshape(B, -1, K)  # [B, H*W, 1]
+        flat_ids     = tri_id_map.reshape(B, -1)         # [B, H*W]
+    
+        # 2. 有效mask
+        valid_mask = (flat_ids >= 0) & (flat_ids < max_num_tri)
+    
+        # 3. Scatter索引
+        batch_offset = (torch.arange(B, device=device) * max_num_tri).view(B, 1)
+        safe_ids     = flat_ids.clone()
+        safe_ids[~valid_mask] = 0
+        global_ids   = (safe_ids + batch_offset).view(-1)
+    
+        flat_mask        = valid_mask.reshape(-1)
+        valid_global_ids = global_ids[flat_mask]
+        valid_penalty    = flat_penalty.reshape(-1, K)[flat_mask]  # [V, 1]
+    
+        # 4. Scatter累加（算术平均，分母=N）
+        total_bins    = B * max_num_tri
+        flat_sum      = torch.zeros(total_bins, K, device=device)
+        flat_counts   = torch.zeros(total_bins, 1, device=device)
+    
+        idx_expand = valid_global_ids.unsqueeze(1).expand(-1, K)
+        flat_sum.scatter_add_(0, idx_expand, valid_penalty)
+        flat_counts.scatter_add_(
+            0,
+            valid_global_ids.unsqueeze(1),
+            torch.ones(valid_global_ids.shape[0], 1, device=device)
+        )
+    
+        # 5. 均值，无像素的三角形设为0（无惩罚）
+        has_pixels  = (flat_counts > 0)
+        flat_mean   = flat_sum / (flat_counts + 1e-6)
+        flat_mean   = torch.where(has_pixels, flat_mean, torch.zeros_like(flat_mean))
+    
+        # 输出 [B, N_tri]（squeeze掉K=1的维度）
+        return flat_mean.view(B, max_num_tri, K).squeeze(-1)
 
     def _scatter_triangle_to_pixel(self, tri_values, tri_id_map):
         """
@@ -1817,6 +1908,26 @@ class DensePlaneFitter(nn.Module)   :
         """
         B = depth_stage2.shape[0]
         device = depth_stage2.device
+        
+        # ym-note 6.11 在大斜面原版可能就存在问题。
+        # =====================================================================
+        # 【新增：2D密集空间二阶拉普拉斯算子感知大闸】
+        # 物理因果：一阶导数在陡峭斜面上不为0，而二阶拉普拉斯微分在刚性连续斜面/曲面上恒等于0！
+        # 机制：在全分辨率空间预先解算出二阶流形断层，彻底为大斜面与樟树叶等曲面完美解绑。
+        # =====================================================================
+        with torch.no_grad():
+            # 刚性消毒保底
+            depth_stage2_clean = torch.nan_to_num(depth_stage2, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # 复制边界填充，防止图像最边缘爆出伪拉普拉斯阶跃
+            padded_depth = F.pad(depth_stage2_clean, (1, 1, 1, 1), mode='replicate')
+            
+            # 标准五点离散拉普拉斯算子: ▽²Z = Z(x+1) + Z(x-1) + Z(y+1) + Z(y-1) - 4*Z(center)
+            dense_laplacian = torch.abs(
+                padded_depth[:, :, 2:, 1:-1] + padded_depth[:, :, :-2, 1:-1] +
+                padded_depth[:, :, 1:-1, 2:] + padded_depth[:, :, 1:-1, :-2] -
+                4.0 * padded_depth[:, :, 1:-1, 1:-1]
+            ) # [B, 1, H_s2, W_s2]
 
         # ==========================================
         # Step 1: 投影与采样 (保持不变)
@@ -1827,6 +1938,11 @@ class DensePlaneFitter(nn.Module)   :
         grid_batch = self.sampling_grid.unsqueeze(0).expand(B, -1, -1, -1)
         sampled_depth = F.grid_sample(
             depth_stage2, grid_batch, mode='bilinear', padding_mode='border', align_corners=True
+        )
+        
+        # 🪐【同步并网】：利用完全相同的采样场，将二阶断层能量同步投影到三角形物理晶格尺度
+        sampled_laplacian = F.grid_sample(
+            dense_laplacian, grid_batch, mode='bilinear', padding_mode='border', align_corners=True
         )
 
         if sampled_depth.max() < 1e-4:
@@ -1874,47 +1990,60 @@ class DensePlaneFitter(nn.Module)   :
 
         if valid_ids.max() >= total_bins:
             valid_ids = torch.clamp(valid_ids, max=total_bins - 1)
+            
+        # ----------------------------------------------------------------
+        # 🪐【数理纠偏核心一】：解算自适应透视温标墙，融合高陡度软截断核
+        # ----------------------------------------------------------------
+        # 原位提取该位置有效像素在 2D 空间的拉普拉斯二阶突变分值
+        laplacian_flat_raw = sampled_laplacian.view(-1)[valid_mask].double() # [V]
+        
+        # 🎯【姚敏天才构想落地】：采用局部像素绝对深度 pt_z 的 7% 作为断崖容忍红线
+        # 保底设置 15 厘米最小厚度，防止超近景除零误杀；上设保底上限。目标直指阶跃断层！
+        alpha_percent = 0.05
+        adaptive_tau_lap = (pt_z * alpha_percent).clamp(min=0.15, max=2.0)
+        
+        # 高陡度连续可微反向 Sigmoid 门控势能墙 (k_slope=16.0 形成高分辨率物理开关)
+        k_slope = 16.0
+        valid_geo_weights = torch.sigmoid(-k_slope * (laplacian_flat_raw - adaptive_tau_lap))
+        valid_geo_weights = torch.clamp(valid_geo_weights, min=1e-3, max=1.0)
 
         # ----------------------------------------------------------------
-        # 3.1 统计协方差矩阵元素
+        # 3.1 运用各向异性软权重并行累加一阶/二阶加权统计量
         # ----------------------------------------------------------------
-        # 基础统计量
+        pt_x_w = pt_x * valid_geo_weights
+        pt_y_w = pt_y * valid_geo_weights
+        pt_z_w = pt_z * valid_geo_weights
+
+        # 一阶累加总线 (分子总线：Sum w_i * P_i)
         sum_P = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float64)
-        sum_P.index_add_(0, valid_ids, valid_points_64)  # Sum P
+        sum_P.index_add_(0, valid_ids, valid_points_64 * valid_geo_weights.unsqueeze(1))
 
-        # 二阶统计量
-        sum_xx = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x ** 2)
-        sum_xy = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids,
-                                                                                               pt_x * pt_y)
-        sum_xz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids,
-                                                                                               pt_x * pt_z)
-        sum_yy = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y ** 2)
-        sum_yz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids,
-                                                                                               pt_y * pt_z)
-        sum_zz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_z ** 2)
+        # 二阶累加总线 (分子总线：Sum w_i * P_i * P_i^T)
+        sum_xx = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_x_w)
+        sum_xy = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_y_w)
+        sum_xz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_z_w)
+        sum_yy = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_y_w)
+        sum_yz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_z_w)
+        sum_zz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_z * pt_z_w)
 
-        # 计数 N
+        # 🪐【数理纠偏核心二】：双线分母完全同构闭环（锁死平移不变性，根治截距漂移）
+        # 1. counts_for_wls: 纯正的权重分母 Sum w_i，同时服务于质心和协方差校正，达成严密代数对齐！
+        # 2. counts: 完好保留最原始的朴素格子计数 N，供下游异常平面过滤/Fallback掩码无伤白嫖，零工程债！
+        counts_for_wls = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
+        counts_for_wls.scatter_add_(0, valid_ids, valid_geo_weights)
+        
         ones = torch.ones_like(valid_ids, dtype=torch.float64)
         counts = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
         counts.scatter_add_(0, valid_ids, ones)
 
         # ----------------------------------------------------------------
-        # 3.2 构建协方差矩阵 (Covariance Matrix)
+        # 3.2 构建纯几何域水密级加权协方差矩阵 (Covariance Matrix)
         # ----------------------------------------------------------------
-
-        # 即使 counts < 3，我们也需要计算质心 (作为前向平行平面的深度)
-        # clamp(min=1) 防止除零，对于 count=0 的情况，centroid 会是 0 (sum_P也是0)
-
-        safe_counts = counts.clamp(min=3)
-        centroids = sum_P / safe_counts.unsqueeze(1)  # [Total, 3]
-
-        # 🚨 3. 质心消毒：如果 sum_P 全是 0 导致 0/0，把 NaN 洗掉
+        safe_counts_wls = counts_for_wls.clamp(min=3.0)
+        
+        # 严格同构加权质心估计： mu = (Sum w_i * P_i) / (Sum w_i)
+        centroids = sum_P / safe_counts_wls.unsqueeze(1)  # [Total, 3]
         centroids = torch.nan_to_num(centroids, nan=0.0)
-
-        # 初始化 normals 和 d_vals
-        # 默认全部初始化为 [0, 0, 1] (前向平行)
-        normals = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float32)
-        normals[:, 2] = 1.0
 
         sum_PPt = torch.stack([
             sum_xx, sum_xy, sum_xz,
@@ -1922,12 +2051,15 @@ class DensePlaneFitter(nn.Module)   :
             sum_xz, sum_yz, sum_zz
         ], dim=1).reshape(total_bins, 3, 3)
 
-        # Cov = Sum(PP^t) - N * mu * mu^T
-        center_correction = torch.bmm(sum_P.unsqueeze(2), sum_P.unsqueeze(1)) / safe_counts.view(-1, 1, 1)
+        # 严格同构加权中心矩阵校正： center_correction = (Sum w_i * P_i)(Sum w_i * P_i)^T / (Sum w_i)
+        center_correction = torch.bmm(sum_P.unsqueeze(2), sum_P.unsqueeze(1)) / safe_counts_wls.view(-1, 1, 1)
         covariance = sum_PPt - center_correction
-
-        # 数值稳定性处理 (防止 svd 不收敛)
         covariance = torch.nan_to_num(covariance, nan=0.0)
+
+        # 初始化 normals 和 d_vals
+        # 默认全部初始化为 [0, 0, 1] (前向平行)
+        normals = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float32)
+        normals[:, 2] = 1.0
 
         # ----------------------------------------------------------------
         # 🔥 核心修复：SVD 改为 EIGH (对称特征分解) 🔥
@@ -2540,3 +2672,49 @@ class PlaneVisualizer:
 
         return depth_map, normal_vis
 
+class DenseCostSmoother(nn.Module):
+    def __init__(self, ref_channels):
+        """
+        满血双边各向异性代价平滑网络
+        Args:
+            ref_channels: 动态对齐骨干网特征通道数，彻底拔除 32 维硬编码地雷
+        """
+        super().__init__()
+        in_channels = 1 + ref_channels
+        
+        self.layer0 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.layer2 = nn.Conv2d(16, 1, kernel_size=3, stride=1, padding=1, bias=True)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in [self.layer0, self.layer1]:
+            for layer in m:
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
+                    
+        # 零初始化残差连接保底
+        nn.init.constant_(self.layer2.weight, 0.0)
+        if self.layer2.bias is not None:
+            nn.init.constant_(self.layer2.bias, 0.0)
+
+    def forward(self, pixel_costs, ref_feature_detached):
+        """
+        Args:
+            pixel_costs: [B * K, 1, H, W]
+            ref_feature_detached: [B * K, C, H, W]
+        """
+        x = torch.cat([pixel_costs, ref_feature_detached], dim=1)
+        residual_correction = self.layer2(self.layer1(self.layer0(x)))
+        
+        # 对残差修正后的光度代价施加严格物理边界约束，捍卫 [-1, 1] 纯净量纲
+        return torch.clamp(pixel_costs + residual_correction, min=-1.0, max=1.0)
