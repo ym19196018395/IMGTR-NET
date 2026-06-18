@@ -1135,25 +1135,8 @@ class PlanePatchMatchModule(nn.Module):
             ref_feature, src_features, ref_proj, src_projs,
             pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics
         )
-        
-        # =====================================================================
-        # 👑 【修改通道二】：自适应多假设维度动态广播总线（无伤简化版）
-        # =====================================================================
-        B_out, H_out, W_out, K_out = pixel_costs.shape
-        pixel_costs_tensor = pixel_costs.permute(0, 3, 1, 2).reshape(B_out * K_out, 1, H_out, W_out)
-        
-        # 🎯【姚敏空间优化】：动态检查 K_out 尺度。若 K_out=1，直接白嫖指针，斩断无意义的内存间跨拷贝
-        if K_out > 1:
-            ref_feat_detached = ref_feature.detach().repeat_interleave(K_out, dim=0)
-        else:
-            ref_feat_detached = ref_feature.detach()
-            
-        # 纯化全分辨率密集代价场
-        pixel_costs_clean_tensor = self.cost_smoother(pixel_costs_tensor, ref_feat_detached)
-        pixel_costs_clean = pixel_costs_clean_tensor.view(B_out, K_out, H_out, W_out).permute(0, 2, 3, 1)
-        
-        # 三角形平均归约
-        current_costs = self.aggregate_costs_per_triangle(pixel_costs_clean, tri_id_map, max_tri_num)
+        # 聚合为三角形代价 [B, N_tri, 1]
+        current_costs = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
 
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
@@ -1264,22 +1247,7 @@ class PlanePatchMatchModule(nn.Module):
                         is_debug=False
                     ).detach()
                     
-                    # =====================================================================
-                    # 👑 【修改通道三】：循环内部多轨自适应神经双边降噪总线（无伤简化版）
-                    # =====================================================================
-                    B_loop, H_loop, W_loop, K_loop = pixel_costs_new.shape
-                    pixel_costs_loop_tensor = pixel_costs_new.permute(0, 3, 1, 2).reshape(B_loop * K_loop, 1, H_loop, W_loop)
-                    
-                    # 🚀 动态兼容循环内部可能爆发的 propagation 候选集分裂拓扑
-                    if K_loop > 1:
-                        ref_feat_loop_detached = ref_feature.detach().repeat_interleave(K_loop, dim=0)
-                    else:
-                        ref_feat_loop_detached = ref_feature.detach()
-                    
-                    pixel_costs_loop_clean_tensor = self.cost_smoother(pixel_costs_loop_tensor, ref_feat_loop_detached).detach()
-                    pixel_costs_new_clean = pixel_costs_loop_clean_tensor.view(B_loop, K_loop, H_loop, W_loop).permute(0, 2, 3, 1)
-
-                current_costs = self.aggregate_costs_per_triangle(pixel_costs_new_clean, tri_id_map, max_tri_num).detach()
+                current_costs = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num).detach()
 
             # 5.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
@@ -1928,6 +1896,15 @@ class DensePlaneFitter(nn.Module)   :
                 padded_depth[:, :, 1:-1, 2:] + padded_depth[:, :, 1:-1, :-2] -
                 4.0 * padded_depth[:, :, 1:-1, 1:-1]
             ) # [B, 1, H_s2, W_s2]
+            
+            # # 【形态学收缩】：利用最大值的对偶项实现极细边缘雕刻（Min-Pooling）
+            # # 注意：max_pool2d 不支持 float64，故在此全功率在 float32 空间完成，后面同步采样后转为 double
+            # dense_laplacian = -F.max_pool2d(
+            #     -dense_laplacian, 
+            #     kernel_size=3, 
+            #     stride=1, 
+            #     padding=1
+            # )
 
         # ==========================================
         # Step 1: 投影与采样 (保持不变)
@@ -1940,7 +1917,7 @@ class DensePlaneFitter(nn.Module)   :
             depth_stage2, grid_batch, mode='bilinear', padding_mode='border', align_corners=True
         )
         
-        # 🪐【同步并网】：利用完全相同的采样场，将二阶断层能量同步投影到三角形物理晶格尺度
+        # 各向异性拉普拉斯场在三角拓扑上的亚像素级重映射采样
         sampled_laplacian = F.grid_sample(
             dense_laplacian, grid_batch, mode='bilinear', padding_mode='border', align_corners=True
         )
@@ -1990,22 +1967,39 @@ class DensePlaneFitter(nn.Module)   :
 
         if valid_ids.max() >= total_bins:
             valid_ids = torch.clamp(valid_ids, max=total_bins - 1)
-            
+
         # ----------------------------------------------------------------
         # 🪐【数理纠偏核心一】：解算自适应透视温标墙，融合高陡度软截断核
         # ----------------------------------------------------------------
         # 原位提取该位置有效像素在 2D 空间的拉普拉斯二阶突变分值
         laplacian_flat_raw = sampled_laplacian.view(-1)[valid_mask].double() # [V]
         
-        # 🎯【姚敏天才构想落地】：采用局部像素绝对深度 pt_z 的 7% 作为断崖容忍红线
-        # 保底设置 15 厘米最小厚度，防止超近景除零误杀；上设保底上限。目标直指阶跃断层！
-        alpha_percent = 0.05
+        # 放宽温标至 8% 减少斜屋顶误伤，降低陡度平滑过渡
+        alpha_percent = 0.03
         adaptive_tau_lap = (pt_z * alpha_percent).clamp(min=0.15, max=2.0)
         
         # 高陡度连续可微反向 Sigmoid 门控势能墙 (k_slope=16.0 形成高分辨率物理开关)
         k_slope = 16.0
         valid_geo_weights = torch.sigmoid(-k_slope * (laplacian_flat_raw - adaptive_tau_lap))
         valid_geo_weights = torch.clamp(valid_geo_weights, min=1e-3, max=1.0)
+
+        # 🪐【双分母并行分流寄存总线】
+        ones_v = torch.ones_like(valid_ids, dtype=torch.float64)
+        counts = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
+        counts.scatter_add_(0, valid_ids, ones_v)           # 纯实际视觉面积像素数 N
+        
+        counts_for_cov = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
+        counts_for_cov.scatter_add_(0, valid_ids, valid_geo_weights) # 加权主权能量和 Σw
+
+        # 计算三角形内部有效几何能量的面积覆盖率
+        weight_coverage = counts_for_cov / counts.clamp(min=1.0) # [Total_bins]
+        
+        # 🎯【覆盖率阈值】：中线拦截机制。当有效面积被拉普拉斯判掉 70% 以上时 (Σw/N < 0.3)
+        #                 判定为跨断崖严重投毒三角形，刚性剥夺其运行 WLS 产生随机法线的资格
+        low_coverage_mask = (weight_coverage < 0.30) & (counts > 5.0)
+
+        # 铁腕锁定进入加权最小二乘 eigh 求解的合法三角形标志位
+        valid_fit_mask = (counts > 3.0) & (~low_coverage_mask)
 
         # ----------------------------------------------------------------
         # 3.1 运用各向异性软权重并行累加一阶/二阶加权统计量
@@ -2017,6 +2011,10 @@ class DensePlaneFitter(nn.Module)   :
         # 一阶累加总线 (分子总线：Sum w_i * P_i)
         sum_P = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float64)
         sum_P.index_add_(0, valid_ids, valid_points_64 * valid_geo_weights.unsqueeze(1))
+        
+        # 纯几何（未加权）一阶总线，用于作为绝不坍缩的质心核心备份线
+        sum_P_pure = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float64)
+        sum_P_pure.index_add_(0, valid_ids, valid_points_64)
 
         # 二阶累加总线 (分子总线：Sum w_i * P_i * P_i^T)
         sum_xx = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_x_w)
@@ -2026,23 +2024,15 @@ class DensePlaneFitter(nn.Module)   :
         sum_yz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_z_w)
         sum_zz = torch.zeros(total_bins, device=self.device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_z * pt_z_w)
 
-        # 🪐【数理纠偏核心二】：双线分母完全同构闭环（锁死平移不变性，根治截距漂移）
-        # 1. counts_for_wls: 纯正的权重分母 Sum w_i，同时服务于质心和协方差校正，达成严密代数对齐！
-        # 2. counts: 完好保留最原始的朴素格子计数 N，供下游异常平面过滤/Fallback掩码无伤白嫖，零工程债！
-        counts_for_wls = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
-        counts_for_wls.scatter_add_(0, valid_ids, valid_geo_weights)
-        
-        ones = torch.ones_like(valid_ids, dtype=torch.float64)
-        counts = torch.zeros(total_bins, device=self.device, dtype=torch.float64)
-        counts.scatter_add_(0, valid_ids, ones)
 
         # ----------------------------------------------------------------
         # 3.2 构建纯几何域水密级加权协方差矩阵 (Covariance Matrix)
         # ----------------------------------------------------------------
-        safe_counts_wls = counts_for_wls.clamp(min=3.0)
+        centroids_weighted = sum_P / counts_for_cov.clamp(min=1e-6).unsqueeze(1)
+        centroids_pure = sum_P_pure / counts.clamp(min=1.0).unsqueeze(1)
         
-        # 严格同构加权质心估计： mu = (Sum w_i * P_i) / (Sum w_i)
-        centroids = sum_P / safe_counts_wls.unsqueeze(1)  # [Total, 3]
+        # 合法网格运行纯正 WLS 重心；触发熔断和空三角形强制对齐纯几何中心，深度绝对零偏移！
+        centroids = torch.where(valid_fit_mask.unsqueeze(1), centroids_weighted, centroids_pure)
         centroids = torch.nan_to_num(centroids, nan=0.0)
 
         sum_PPt = torch.stack([
@@ -2051,8 +2041,8 @@ class DensePlaneFitter(nn.Module)   :
             sum_xz, sum_yz, sum_zz
         ], dim=1).reshape(total_bins, 3, 3)
 
-        # 严格同构加权中心矩阵校正： center_correction = (Sum w_i * P_i)(Sum w_i * P_i)^T / (Sum w_i)
-        center_correction = torch.bmm(sum_P.unsqueeze(2), sum_P.unsqueeze(1)) / safe_counts_wls.view(-1, 1, 1)
+        # 严格执行严格同构去中心化： Cov = Sum(w*P*P^T) - (Sum w*P)(Sum w*P)^T / (Sum w)
+        center_correction = torch.bmm(sum_P.unsqueeze(2), sum_P.unsqueeze(1)) / counts_for_cov.clamp(min=1.0).view(-1, 1, 1)
         covariance = sum_PPt - center_correction
         covariance = torch.nan_to_num(covariance, nan=0.0)
 
@@ -2061,32 +2051,18 @@ class DensePlaneFitter(nn.Module)   :
         normals = torch.zeros(total_bins, 3, device=self.device, dtype=torch.float32)
         normals[:, 2] = 1.0
 
-        # ----------------------------------------------------------------
-        # 🔥 核心修复：SVD 改为 EIGH (对称特征分解) 🔥
-        # ----------------------------------------------------------------
-
-        # 1. 识别有效拟合的三角形
-        valid_fit_mask = (counts > 3)
-
-        # 2. 正则化: 增加 eps 使得特征值分离
-        # 增大 eps 到 1e-5，对于 float32 来说 1e-6 可能太小
+        # 正则化: 增加 eps 使得特征值分离，防止简并奇异值震碎反向传播梯度
         eps = 1e-4
-        # 构造扰动向量 [eps, 10*eps, 100*eps]
-        # 这样即使 covariance 全为 0，特征值也会被强行拉开差距
         perturb_vec = torch.tensor([1.0, 10.0, 100.0], device=device, dtype=covariance.dtype) * eps
         perturb_matrix = torch.diag(perturb_vec).unsqueeze(0)  # [1, 3, 3]
 
-        # 加到原来的协方差矩阵上
+        # 刚性施加扰动，确保浮点数两极分离
         covariance = covariance + perturb_matrix
 
-        # 3. 梯度防火墙 (Gradient Firewall)
-        # 任何无效的三角形，强行把协方差矩阵设为 Identity
-        # I 的特征值是 1,1,1 (虽然重复，但我们后续会处理)，或者设为 diag(1, 2, 3) 避免特征值重复
-
-        # 构造一个特征值绝对不重复的安全矩阵: diag(100, 10, 1)
-        # 这样最小特征向量明确是 Z 轴 [0,0,1]
+        # 构造用于前向防御的安全常数对角矩阵: diag(100, 10, 1)，使其最小特征向量明确指向 Z 轴
         safe_matrix = torch.diag(torch.tensor([100.0, 10.0, 1.0], device=device, dtype=covariance.dtype)).unsqueeze(0)
 
+        #  Interlock 互锁大闸：让 mask_expand 严格继承通过了覆盖率检验的 valid_fit_mask！
         mask_expand = valid_fit_mask.view(-1, 1, 1).expand_as(covariance)
         covariance_safe = torch.where(mask_expand, covariance, safe_matrix.expand_as(covariance))
 
@@ -2179,7 +2155,10 @@ class DensePlaneFitter(nn.Module)   :
 
             # is_invalid = invalid_tris | is_bad_geom | is_bad_normal # [Total, 1]
 
-            is_invalid = invalid_tris | is_bad_geom  # [Total, 1]
+            # 👑 【修改通道三】：低覆盖率断崖信号刚性并网互锁
+            # 物理因果：低覆盖率三角形在上游已输出完美的 [0,0,1] 安全法线，且手握无缩水的 centroids_pure 深度。
+            #          在这里强行并网，使其 100% 被路由替换为截距绝对平滑、饱满的前向平行面，将黑缝漏洞物理填满！
+            is_invalid = invalid_tris | is_bad_geom | low_coverage_mask.unsqueeze(1)  # [Total, 1]
 
             # (可选) 打印过滤日志
             bad_ratio = is_invalid.float().mean()
