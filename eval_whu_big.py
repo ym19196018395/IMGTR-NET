@@ -201,8 +201,23 @@ def save_depth():
 
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
+    # 使用更鲁棒的加载：过滤掉 checkpoint 中当前模型不存在的 key（例如旧版的 cost_smoother）
     state_dict = torch.load(args.loadckpt)
-    model.load_state_dict(state_dict['model'])
+    ckpt_model_state = state_dict.get('model', state_dict)
+    current_model_state = model.state_dict()
+    # 找出多余的 keys 和缺失的 keys，打印提示以便调试
+    ckpt_keys = set(ckpt_model_state.keys())
+    model_keys = set(current_model_state.keys())
+    unexpected_keys = ckpt_keys - model_keys
+    missing_keys = model_keys - ckpt_keys
+    if unexpected_keys:
+        print(f"Warning: unexpected keys in checkpoint (will be ignored): {list(sorted(unexpected_keys))[:20]}")
+    if missing_keys:
+        print(f"Note: missing keys from checkpoint (will be randomly initialized): {list(sorted(missing_keys))[:20]}")
+
+    # 过滤并加载已有的权重，非严格模式以允许部分缺失
+    filtered_state = {k: v for k, v in ckpt_model_state.items() if k in model_keys}
+    model.load_state_dict(filtered_state, strict=False)
     model.eval()
     
     with torch.no_grad():
@@ -489,6 +504,78 @@ def save_depth():
                             
                             plt.savefig(planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                             plt.close()
+
+                    # ====================================================================
+                    # 🚨 3.b 生成 Stage 1 未传播预测与 GT 的差异热力图 (基于 W_plane_pixel_init)
+                    # ====================================================================
+                    if 'depth_no_pro' in outputs.get("output_plane", {}) and 'W_plane_pixel_init' in outputs.get("output_plane", {}):
+                        depth_no_pro_data = outputs["output_plane"]['depth_no_pro'][b_idx]
+                        if isinstance(depth_no_pro_data, torch.Tensor):
+                            depth_no_pro_data = depth_no_pro_data.detach().cpu().numpy()
+                        depth_no_pro_sq = np.squeeze(depth_no_pro_data)
+
+                        w_before_data = outputs["output_plane"]['W_plane_pixel_init'][b_idx]
+                        w_before_np = w_before_data.detach().cpu().numpy() if isinstance(w_before_data, torch.Tensor) else w_before_data
+                        w_before_sq = np.squeeze(w_before_np)
+                        if w_before_sq.shape != depth_no_pro_sq.shape:
+                            w_before_sq = cv2.resize(w_before_sq, (depth_no_pro_sq.shape[1], depth_no_pro_sq.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                        if gt_curr.shape != depth_no_pro_sq.shape:
+                            gt_no_pro = cv2.resize(gt_curr, (depth_no_pro_sq.shape[1], depth_no_pro_sq.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            tri_id_no_pro = cv2.resize(tri_id_curr, (depth_no_pro_sq.shape[1], depth_no_pro_sq.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        else:
+                            gt_no_pro = gt_curr
+                            tri_id_no_pro = tri_id_curr
+
+                        mask_diff_no_pro = (depth_no_pro_sq > 0) & (gt_no_pro > 0) & (tri_id_no_pro >= 0)
+                        if mask_diff_no_pro.any():
+                            diff_map_no_pro = np.zeros_like(depth_no_pro_sq)
+                            abs_error_array_no_pro = np.abs(depth_no_pro_sq[mask_diff_no_pro] - gt_no_pro[mask_diff_no_pro])
+                            diff_map_no_pro[mask_diff_no_pro] = abs_error_array_no_pro
+                            mean_abs_error_no_pro = np.mean(abs_error_array_no_pro)
+
+                            mask_planar_no_pro = mask_diff_no_pro & (w_before_sq > 0.80)
+                            if mask_planar_no_pro.any():
+                                planar_mae_no_pro = np.mean(np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro]))
+                                planar_no_pro_text = f"\nFlat Region MAE (W_before>0.80): {planar_mae_no_pro:.4f}m"
+                            else:
+                                planar_mae_no_pro = 0.0
+                                planar_no_pro_text = ""
+
+                            diff_max_plot_no_pro = max(np.percentile(abs_error_array_no_pro, 95), 0.5)
+                            plt.figure(figsize=(10, 8))
+                            diff_map_masked_no_pro = np.ma.masked_where(~mask_diff_no_pro, diff_map_no_pro)
+                            cmap_no_pro = plt.get_cmap('jet')
+                            cmap_no_pro.set_bad(color='black')
+                            im_no_pro = plt.imshow(diff_map_masked_no_pro, cmap=cmap_no_pro, vmin=0, vmax=diff_max_plot_no_pro)
+                            cbar_no_pro = plt.colorbar(im_no_pro, fraction=0.046, pad=0.04)
+                            cbar_no_pro.set_label('Absolute Error (Meters)', size=14)
+                            plt.title(f'Stage 1 No-Propagation MAE: {mean_abs_error_no_pro:.4f}m {planar_no_pro_text}\nMax Cutoff: {diff_max_plot_no_pro:.2f}m',
+                                      fontsize=14, fontweight='bold')
+                            plt.axis('off')
+                            diff_filename_no_pro = os.path.join(args.outdir, filename.format('depth_diff_s1_noprop', '_dif.png'))
+                            os.makedirs(os.path.dirname(diff_filename_no_pro), exist_ok=True)
+                            plt.savefig(diff_filename_no_pro, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                            plt.close()
+
+                            if mask_planar_no_pro.any():
+                                planar_diff_map_no_pro = np.zeros_like(depth_no_pro_sq)
+                                planar_diff_map_no_pro[mask_planar_no_pro] = np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro])
+                                planar_diff_max_no_pro = max(np.percentile(np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro]), 95), 0.1)
+                                plt.figure(figsize=(10, 8))
+                                planar_map_masked_no_pro = np.ma.masked_where(~mask_planar_no_pro, planar_diff_map_no_pro)
+                                cmap_planar_no_pro = plt.get_cmap('jet')
+                                cmap_planar_no_pro.set_bad(color='black')
+                                im_planar_no_pro = plt.imshow(planar_map_masked_no_pro, cmap=cmap_planar_no_pro, vmin=0, vmax=planar_diff_max_no_pro)
+                                cbar_planar_no_pro = plt.colorbar(im_planar_no_pro, fraction=0.046, pad=0.04)
+                                cbar_planar_no_pro.set_label('Absolute Error (Meters)', size=14)
+                                plt.title(f'Flat Region No-Propagation MAE (W_before > 0.80): {planar_mae_no_pro:.4f}m\nMax Cutoff: {planar_diff_max_no_pro:.2f}m',
+                                          fontsize=13, fontweight='bold')
+                                plt.axis('off')
+                                planar_diff_filename_no_pro = diff_filename_no_pro.replace('_dif.png', '_dif_planar.png')
+                                os.makedirs(os.path.dirname(planar_diff_filename_no_pro), exist_ok=True)
+                                plt.savefig(planar_diff_filename_no_pro, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                                plt.close()
 
                 # ====================================================================
                 # 🚨 4. 生成平面置信度 (W_plane) 大图 (用于论文展示)

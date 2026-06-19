@@ -581,9 +581,8 @@ class PatchmatchNet(nn.Module):
                 # 2. 传入PlanePatchmatch模型,根据stage2的深度信息拟合stage1的平面
                 # ================================================================
 
-                num_hypotheses=4
                 # 平面拟合
-                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=1, perturbation_range=0.05,
+                self.dense_plane_fitter = DensePlaneFitter(height, width, device,num_hypotheses=self.num_hypotheses,perturbation_range=0.05,
                                                            depth_max=depth_max,
                                                            depth_min=depth_min)
 
