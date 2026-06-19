@@ -1252,7 +1252,6 @@ class PlanePatchMatchModule(nn.Module):
                         ref_intrinsic=ref_intrinsics,
                         is_debug=False
                     ).detach()
-
                 current_costs = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num).detach()
 
             # 5.3 状态更新，进入下一次迭代
