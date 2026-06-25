@@ -10,6 +10,8 @@ checkpoints/
 
 txt_logs/
 
+.agents/
+
 # 2. 强行拦截 TensorBoard 产生的所有运行日志与事件
 logdir/
 logs/

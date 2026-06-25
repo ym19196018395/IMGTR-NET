@@ -286,6 +286,31 @@ class MVSDataset(Dataset):
 
                 cdt_data = get_cdt_datas(triangulation_filename, H=H, W=W)
 
+                # --- 🚨 新增：读取离线超轻量 npz 几何特征并进行一维极速判定与降级 ---
+                npz_path = os.path.join(self.datapath, self.mode, "Images", scan, "triangulation", f"geom_svd_{file_id}.npz")
+                if os.path.exists(npz_path):
+                    npz_data = np.load(npz_path)
+                    tri_conf = npz_data['tri_initial_conf'].copy()
+                    tri_err95 = npz_data['tri_svd_err95']
+                    
+                    # 极速一维判定与降级
+                    degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
+                    tri_conf[degrade_mask] = 0.75
+                    
+                    # 兼容新老版 npz (保存 tri_svd_plane 或 tri_svd_normal)
+                    if 'tri_svd_plane' in npz_data:
+                        tri_plane = npz_data['tri_svd_plane'].copy()
+                    else:
+                        tri_normal = npz_data['tri_svd_normal']
+                        tri_plane = np.zeros((len(tri_normal), 4), dtype=np.float32)
+                        tri_plane[:, :3] = tri_normal
+                    
+                    tri_conf_cleaned = tri_conf
+                    tri_normal_cleaned = tri_plane[:, :3] # 全部保留，不因置信度抹零
+                    tri_plane_cleaned = tri_plane
+                else:
+                    raise FileNotFoundError(f"🚨 [HYBRID ERROR] 未找到离线预处理几何文件: {npz_path}。请先运行 preprocess_whu_mvs.py 生成该文件！")
+
             # 对矩阵进行一个处理，分别求得不同大小图片的投影矩阵
             proj_mat = extrinsics.copy()
 
@@ -378,18 +403,21 @@ class MVSDataset(Dataset):
                 "mask": mask,  # 1*H0 * W0
                 "vertexs": vertexs,  # ndarray (Nv, ..)
                 "lines": lines,  # ndarray (Nl, ..)
-                "triangles": triangles  # list of ndarrays
+                "triangles": triangles,  # list of ndarrays
+                "tri_conf_cleaned": tri_conf_cleaned,
+                "tri_normal_cleaned": tri_normal_cleaned,
+                "tri_plane_cleaned": tri_plane_cleaned
                 }
 
 
 def collate_keep_list(batch):
     """
-    跳过cdt-data，后面单独进行一个处理
+    跳过cdt-data与一维变长数组，后面单独进行一个处理
     """
     out = {}
     keys = batch[0].keys()
     for k in keys:
-        if k in ['triangles', 'vertexs', 'lines']:
+        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned']:
             out[k] = [b[k] for b in batch]
         else:
             out[k] = default_collate([b[k] for b in batch])

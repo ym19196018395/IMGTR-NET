@@ -10,6 +10,7 @@ _gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0
 os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu_choice)
 import torch
 import torch.nn as nn
+import scipy.ndimage as ndimage
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
@@ -30,6 +31,8 @@ from datasets.dtu_whu import collate_keep_list
 
 import resource
 import platform
+
+error_num=0.2
 
 # if platform.system() == 'Linux':
 #     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -80,6 +83,112 @@ parser.add_argument('--photo_thres', type=float, default=0.8, help='threshold fo
 args = parser.parse_args()
 print("argv:", sys.argv[1:])
 print_args(args)
+
+def compute_gt_planar_soft_confidence(gt_depth_s0, tri_id_s0, intrinsics_s0, sigma=0.05, min_pixels=10):
+    """
+    计算基于 3D 正交最小二乘平面拟合 (OLS/PCA) 与自适应小三角形温标补偿的连续软置信度真值 (W_GT)。
+    极简高速版：剔除两阶段迭代与微观法向量运算，仅在 CPU 上利用 numpy 实对称特征分解快速拟合。
+    """
+    H, W = gt_depth_s0.shape
+    planar_soft_conf_s0 = np.zeros((H, W), dtype=np.float32)
+    tri_conf_dict = {}
+
+    # 额外处理：找出处于三角形边界且发生深度值突变（悬空）的像素并进行 Dropout 剔除
+    # 1. 计算深度图一阶差分以识别深度断裂线（突变阈值设为 0.25米）
+    dx = np.zeros_like(gt_depth_s0)
+    dy = np.zeros_like(gt_depth_s0)
+    dx[:, :-1] = np.abs(gt_depth_s0[:, 1:] - gt_depth_s0[:, :-1])
+    dy[:-1, :] = np.abs(gt_depth_s0[1:, :] - gt_depth_s0[:-1, :])
+    depth_mutant = (dx > 0.25) | (dy > 0.25)
+
+    # 2. 计算三角形 ID 的分界线（即边界线）
+    dtri_x = np.zeros_like(tri_id_s0)
+    dtri_y = np.zeros_like(tri_id_s0)
+    dtri_x[:, :-1] = tri_id_s0[:, 1:] != tri_id_s0[:, :-1]
+    dtri_y[:-1, :] = tri_id_s0[1:, :] != tri_id_s0[:-1, :]
+    tri_boundary = (dtri_x != 0) | (dtri_y != 0)
+    
+    # 膨胀三角形边界，使其完全覆盖边界两侧
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    tri_boundary_expanded = cv2.dilate(tri_boundary.astype(np.uint8), kernel, iterations=1) > 0
+
+    # 3. 悬边噪点 Dropout
+    discard_mask = depth_mutant & tri_boundary_expanded
+    
+    valid_mask = (gt_depth_s0 > 0) & (tri_id_s0 >= 0) & (~discard_mask)
+    if not np.any(valid_mask):
+        return planar_soft_conf_s0, tri_conf_dict
+
+    # 1. 快速反投影 3D 点云
+    v_indices, u_indices = np.where(valid_mask)
+    z = gt_depth_s0[v_indices, u_indices]
+    
+    fx = intrinsics_s0[0, 0]
+    fy = intrinsics_s0[1, 1]
+    cx = intrinsics_s0[0, 2]
+    cy = intrinsics_s0[1, 2]
+    
+    x = (u_indices - cx) / fx * z
+    y = (v_indices - cy) / fy * z
+    points_3d = np.stack([x, y, z], axis=1)  # [M, 3]
+    tri_ids_valid = tri_id_s0[v_indices, u_indices].astype(int)
+
+    # 2. 统计各三角形的像素点数
+    tri_counts = np.bincount(tri_ids_valid)
+    valid_tri_ids = np.where(tri_counts >= min_pixels)[0]
+    if len(valid_tri_ids) == 0:
+        return planar_soft_conf_s0, tri_conf_dict
+
+    # 3. 按 tri_id 排序以实现高效的分段提取 (规避 mask 过滤开销)
+    sort_idx = np.argsort(tri_ids_valid)
+    points_sorted = points_3d[sort_idx]
+    tri_ids_sorted = tri_ids_valid[sort_idx]
+
+    left_boundaries = np.searchsorted(tri_ids_sorted, valid_tri_ids, side='left')
+    right_boundaries = np.searchsorted(tri_ids_sorted, valid_tri_ids, side='right')
+
+    for tri_id, left, right in zip(valid_tri_ids, left_boundaries, right_boundaries):
+        pts = points_sorted[left:right]  # [N, 3]
+        N = len(pts)
+        
+        # 4. 快速 OLS 平面拟合 (PCA)
+        centroid = np.mean(pts, axis=0)
+        pts_centered = pts - centroid
+        cov = np.dot(pts_centered.T, pts_centered) / N
+        
+        try:
+            # np.linalg.eigh 针对实对称矩阵比 svd 更加高速稳定
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            normal = eigenvectors[:, 0]  # 最小特征值对应的法向量
+        except np.linalg.LinAlgError:
+            tri_conf_dict[tri_id] = 0.0
+            continue
+            
+        # 5. 计算平均绝对正交距离
+        dists = np.abs(np.dot(pts_centered, normal))
+        mean_dist = np.mean(dists)
+        
+        # 6. 小三角形像素自适应温标补偿 (指数衰减)
+        scale_compensator = 1.0 + 1.5 * np.exp(-N / 30.0)
+        sigma_adapted = sigma * scale_compensator
+        
+        # 7. 基于柯西核映射得到 [0, 1] 软概率
+        conf = 1.0 / (1.0 + (mean_dist / sigma_adapted) ** 2)
+        conf = np.clip(conf, 0.0, 1.0)
+        
+        tri_conf_dict[tri_id] = float(conf)
+
+    # 8. 建立映射数组，以极快速度进行批量映射填充
+    max_id = np.max(tri_id_s0)
+    conf_lookup = np.zeros(max_id + 1, dtype=np.float32)
+    for tid, val in tri_conf_dict.items():
+        if tid <= max_id:
+            conf_lookup[tid] = val
+            
+    planar_soft_conf_s0[valid_mask] = conf_lookup[tri_id_s0[valid_mask].astype(int)]
+        
+    return planar_soft_conf_s0, tri_conf_dict
+
 
 
 # read intrinsics and extrinsics
@@ -324,6 +433,354 @@ def save_depth():
                 # 去除多余的维度
                 depth_est = np.squeeze(depth_est)
 
+                # ====================================================================
+                # 👑 【新增静态软平面真值】：计算 Stage 0 物理平面软置信度，并利用拓扑对齐到 Stage 1
+                # ====================================================================
+                planar_soft_conf_s0 = None
+                planar_soft_conf_s1 = None
+                gt_normal_map_s1 = None
+                tri_conf_dict = {}
+                if "depth" in sample and "stage_0" in sample["depth"] and tri_id_maps_s0_np is not None:
+                    gt_curr_s0 = np.squeeze(sample["depth"]["stage_0"][b_idx].detach().cpu().numpy() if isinstance(sample["depth"]["stage_0"][b_idx], torch.Tensor) else sample["depth"]["stage_0"][b_idx])
+                    tri_id_curr_s0 = np.squeeze(tri_id_maps_s0_np[b_idx])
+                    
+                    # 尺寸保护
+                    if tri_id_curr_s0.shape != gt_curr_s0.shape:
+                        tri_id_curr_s0 = cv2.resize(tri_id_curr_s0, (gt_curr_s0.shape[1], gt_curr_s0.shape[0]),
+                                                    interpolation=cv2.INTER_NEAREST)
+                    
+                    # 获取 Stage 0 内参
+                    intrinsics_s0 = sample["intrinsics_mats"]['stage_0'][b_idx, 0]
+                    if isinstance(intrinsics_s0, torch.Tensor):
+                        intrinsics_s0 = intrinsics_s0.detach().cpu().numpy()
+                    
+                    gt_normal_map_s0 = None
+                    tri_normal_dict = {}
+                    # 3D OLS 拟合计算软置信度真值 (sigma=0.05)
+                    planar_soft_conf_s0, tri_conf_dict = compute_gt_planar_soft_confidence(gt_curr_s0, tri_id_curr_s0, intrinsics_s0, sigma=0.05, min_pixels=3)
+                    
+                    if tri_conf_dict is not None:
+                        # 🎯 不采用插值缩放，直接用 Stage 1 的三角形 ID 检索对齐！
+                        tri_id_curr = np.squeeze(tri_id_maps_np[b_idx])
+                        if isinstance(tri_id_curr, torch.Tensor):
+                            tri_id_curr = tri_id_curr.detach().cpu().numpy()
+                        # 尺寸保护以防万一
+                        H_s1, W_s1 = depth_est.shape
+                        if tri_id_curr.shape != (H_s1, W_s1):
+                            tri_id_curr = cv2.resize(tri_id_curr, (W_s1, H_s1), interpolation=cv2.INTER_NEAREST)
+
+                        # ====================================================================
+                        # 🚨 6. 【新增实验】取平面置信度大于 0.8 的区域，用深度真值进行 SVD 拟合，测试精度极限与降级置信度
+                        # ====================================================================
+                        gt_normal_dict = {}
+                        try:
+                            from models.PlanePatchMatch import DensePlaneFitter, PlaneVisualizer
+                            
+                            H_svd, W_svd = gt_curr_s0.shape
+                            d_min_tensor = sample["depth_min"][b_idx:b_idx+1].to(device).float()
+                            d_max_tensor = sample["depth_max"][b_idx:b_idx+1].to(device).float()
+                            
+                            fitter_svd = DensePlaneFitter(
+                                height_s1=H_svd,
+                                width_s1=W_svd,
+                                device=device,
+                                num_hypotheses=1,
+                                depth_min=d_min_tensor,
+                                depth_max=d_max_tensor
+                            )
+                            visualizer_svd = PlaneVisualizer(height=H_svd, width=W_svd, device=device)
+
+                            # 数据准备与转换
+                            depth_tensor = torch.from_numpy(gt_curr_s0).unsqueeze(0).unsqueeze(0).to(device).float()
+                            tri_id_tensor = torch.from_numpy(tri_id_curr_s0).unsqueeze(0).to(device).long()
+                            intrinsics_tensor = torch.from_numpy(intrinsics_s0).unsqueeze(0).to(device).float()
+                            max_tri_num = int(np.max(tri_id_curr_s0)) + 1
+
+                            # 运行 SVD 拟合得到平面参数
+                            hypotheses, _ = fitter_svd.get_plane_hypotheses(
+                                depth_stage2=depth_tensor,
+                                tri_id_map=tri_id_tensor,
+                                intrinsics_s1=intrinsics_tensor,
+                                max_num_triangles=max_tri_num
+                            )
+                            current_planes = hypotheses[:, :, 0, :].detach()
+
+                            # 渲染拟合平面深度图
+                            depth_range = (d_min_tensor, d_max_tensor)
+                            depth_gt_svd_tensor, _ = visualizer_svd.render_from_planes(
+                                plane_params=current_planes,
+                                tri_id_map=tri_id_tensor,
+                                intrinsics=intrinsics_tensor,
+                                depth_range=depth_range
+                            )
+                            depth_gt_svd = np.squeeze(depth_gt_svd_tensor.detach().cpu().numpy())
+
+                            # 过滤出置信度大于 0.8 的有效区域并进行误差滤波
+                            mask_diff_svd = (depth_gt_svd > 0) & (gt_curr_s0 > 0) & (tri_id_curr_s0 >= 0)
+                            if planar_soft_conf_s0 is not None:
+                                if planar_soft_conf_s0.shape != mask_diff_svd.shape:
+                                    planar_soft_conf_s0_resized = cv2.resize(planar_soft_conf_s0, (mask_diff_svd.shape[1], mask_diff_svd.shape[0]), interpolation=cv2.INTER_NEAREST)
+                                else:
+                                    planar_soft_conf_s0_resized = planar_soft_conf_s0
+                                mask_diff_svd = mask_diff_svd & (planar_soft_conf_s0_resized > 0.80)
+
+                            if mask_diff_svd.any():
+                                pixel_err_map = np.abs(depth_gt_svd - gt_curr_s0)
+                                active_tids = [tid for tid, conf in tri_conf_dict.items() if conf > 0.80]
+                                exclude_mask = np.zeros_like(gt_curr_s0, dtype=bool)
+                                
+                                for tid in active_tids:
+                                    px_mask = (tri_id_curr_s0 == tid) & (depth_gt_svd > 0) & (gt_curr_s0 > 0)
+                                    if np.any(px_mask):
+                                        # 计算该三角形内部像素的 95% 分位数拟合误差
+                                        pct95_err = np.percentile(pixel_err_map[px_mask], 95)
+                                        # 如果其拟合精度超过 8cm，则判定为边缘畸变三角形，将置信度降低到 0.75
+                                        if pct95_err > 0.08:
+                                            exclude_mask[px_mask] = True
+                                            tri_conf_dict[tid] = 0.75
+
+                                # 重新生成并 resize planar_soft_conf_s0，使得后面画图能使用正确的降级置信度
+                                conf_values_s0 = np.array([tri_conf_dict.get(tid, 0.0) for tid in tri_id_curr_s0.flat], dtype=np.float32)
+                                planar_soft_conf_s0 = conf_values_s0.reshape(tri_id_curr_s0.shape)
+                                if planar_soft_conf_s0.shape != mask_diff_svd.shape:
+                                    planar_soft_conf_s0_resized = cv2.resize(planar_soft_conf_s0, (mask_diff_svd.shape[1], mask_diff_svd.shape[0]), interpolation=cv2.INTER_NEAREST)
+                                else:
+                                    planar_soft_conf_s0_resized = planar_soft_conf_s0
+
+                                mask_diff_svd = (depth_gt_svd > 0) & (gt_curr_s0 > 0) & (tri_id_curr_s0 >= 0) & (planar_soft_conf_s0_resized > 0.80)
+
+                            if mask_diff_svd.any():
+                                diff_map_svd = np.zeros_like(depth_gt_svd)
+                                abs_error_array_svd = np.abs(depth_gt_svd[mask_diff_svd] - gt_curr_s0[mask_diff_svd])
+                                diff_map_svd[mask_diff_svd] = abs_error_array_svd
+                                mean_abs_error_svd = np.mean(abs_error_array_svd)
+
+                                # 绘制平面区域 SVD 拟合深度热力图
+                                diff_max_plot_svd = error_num
+                                plt.figure(figsize=(10, 8))
+                                diff_map_masked_svd = np.ma.masked_where(~mask_diff_svd, diff_map_svd)
+                                cmap_svd = plt.get_cmap('jet')
+                                cmap_svd.set_bad(color='black')
+
+                                im_svd = plt.imshow(diff_map_masked_svd, cmap=cmap_svd, vmin=0, vmax=diff_max_plot_svd)
+                                cbar_svd = plt.colorbar(im_svd, fraction=0.046, pad=0.04)
+                                cbar_svd.set_label('Absolute Error (Meters)', size=14)
+                                plt.title(f'GT SVD Fit Plane (Conf > 0.8) MAE: {mean_abs_error_svd:.4f}m\nMax Cutoff: {diff_max_plot_svd:.2f}m', fontsize=14, fontweight='bold')
+                                plt.axis('off')
+                                diff_filename_svd = os.path.join(args.outdir, filename.format('depth_diff_gt_svd', '_dif.png'))
+                                os.makedirs(os.path.dirname(diff_filename_svd), exist_ok=True)
+                                plt.savefig(diff_filename_svd, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                                plt.close()
+
+                            # 绘制全场景（All Regions）SVD 拟合深度误差热力图
+                            mask_diff_svd_all = (depth_gt_svd > 0) & (gt_curr_s0 > 0) & (tri_id_curr_s0 >= 0)
+                            if mask_diff_svd_all.any():
+                                diff_map_svd_all = np.zeros_like(depth_gt_svd)
+                                abs_error_array_svd_all = np.abs(depth_gt_svd[mask_diff_svd_all] - gt_curr_s0[mask_diff_svd_all])
+                                diff_map_svd_all[mask_diff_svd_all] = abs_error_array_svd_all
+                                mean_abs_error_svd_all = np.mean(abs_error_array_svd_all)
+
+                                diff_max_plot_svd_all = error_num
+                                plt.figure(figsize=(10, 8))
+                                diff_map_masked_svd_all = np.ma.masked_where(~mask_diff_svd_all, diff_map_svd_all)
+                                cmap_svd_all = plt.get_cmap('jet')
+                                cmap_svd_all.set_bad(color='black')
+                                im_svd_all = plt.imshow(diff_map_masked_svd_all, cmap=cmap_svd_all, vmin=0, vmax=diff_max_plot_svd_all)
+                                cbar_svd_all = plt.colorbar(im_svd_all, fraction=0.046, pad=0.04)
+                                cbar_svd_all.set_label('Absolute Error (Meters)', size=14)
+                                plt.title(f'GT SVD Fit Plane (All Regions) MAE: {mean_abs_error_svd_all:.4f}m\nMax Cutoff: {diff_max_plot_svd_all:.2f}m', fontsize=14, fontweight='bold')
+                                plt.axis('off')
+                                diff_filename_svd_all = os.path.join(args.outdir, filename.format('depth_diff_gt_svd_all', '_dif.png'))
+                                os.makedirs(os.path.dirname(diff_filename_svd_all), exist_ok=True)
+                                plt.savefig(diff_filename_svd_all, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                                plt.close()
+
+                            # 提取 GPU 拟合的平面方程参数作为真值
+                            current_planes_np = current_planes[0].cpu().numpy()  # [max_tri_num, 4]
+                            gt_plane_dict = {}
+                            for tid in range(max_tri_num):
+                                conf = tri_conf_dict.get(tid, 0.0)
+                                if conf > 0.80:
+                                    param = current_planes_np[tid]
+                                    normal = param[:3]
+                                    d_val = param[3]
+                                    norm_val = np.linalg.norm(normal)
+                                    if norm_val > 1e-8:
+                                        unit_normal = normal / norm_val
+                                        unit_d = d_val / norm_val
+                                    else:
+                                        unit_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                                        unit_d = 0.0
+                                    # 解决朝向二义性
+                                    if unit_normal[2] < 0:
+                                        unit_normal = -unit_normal
+                                        unit_d = -unit_d
+                                    gt_normal_dict[tid] = unit_normal
+                                    gt_plane_dict[tid] = np.array([unit_normal[0], unit_normal[1], unit_normal[2], unit_d], dtype=np.float32)
+                                else:
+                                    gt_normal_dict[tid] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                                    gt_plane_dict[tid] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+                        except Exception as svd_err:
+                            print(f"[SVD FIT EXPERIMENT ERROR] 拟合报错，跳过当前样本: {svd_err}")
+
+                        # 保障机制：若 SVD 法向量字典为空，回退到原本的 OLS 法向量字典
+                        if len(gt_normal_dict) == 0:
+                            gt_normal_dict = tri_normal_dict
+
+                        # 🚨 【新增双重验证】：将实时计算得到的置信度、法向量以及 4 维平面方程参数与 dataset 传入的预处理数据进行对齐与对比
+                        if "tri_conf_cleaned" in sample and "tri_normal_cleaned" in sample:
+                            tri_conf_pre = sample["tri_conf_cleaned"][b_idx]
+                            tri_normal_pre = sample["tri_normal_cleaned"][b_idx]
+                            tri_plane_pre = sample.get("tri_plane_cleaned", [None])[b_idx]
+                            
+                            tri_conf_pre = tri_conf_pre.detach().cpu().numpy() if isinstance(tri_conf_pre, torch.Tensor) else tri_conf_pre
+                            tri_normal_pre = tri_normal_pre.detach().cpu().numpy() if isinstance(tri_normal_pre, torch.Tensor) else tri_normal_pre
+                            if tri_plane_pre is not None:
+                                tri_plane_pre = tri_plane_pre.detach().cpu().numpy() if isinstance(tri_plane_pre, torch.Tensor) else tri_plane_pre
+                            
+                            # 构建实时计算的置信度、法线和 4 维平面数组
+                            tri_conf_real = np.zeros(max_tri_num, dtype=np.float32)
+                            tri_normal_real = np.zeros((max_tri_num, 3), dtype=np.float32)
+                            tri_plane_real = np.zeros((max_tri_num, 4), dtype=np.float32)
+                            for tid in range(max_tri_num):
+                                tri_conf_real[tid] = tri_conf_dict.get(tid, 0.0)
+                                tri_normal_real[tid] = gt_normal_dict.get(tid, np.array([0.0, 0.0, 0.0], dtype=np.float32))
+                                tri_plane_real[tid] = gt_plane_dict.get(tid, np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32))
+                            
+                            # 对齐到两者的最小值长度，以防因为最大三角形ID变化产生维度不匹配
+                            compare_len = min(max_tri_num, len(tri_conf_pre))
+                            conf_diff = np.abs(tri_conf_real[:compare_len] - tri_conf_pre[:compare_len])
+                            
+                            # 计算法线夹角偏差（仅对比置信度 > 0.8 的有效法线）
+                            val_mask = (tri_conf_real[:compare_len] > 0.80) & (tri_conf_pre[:compare_len] > 0.80)
+                            if np.any(val_mask):
+                                n_real = tri_normal_real[:compare_len][val_mask]
+                                n_pre = tri_normal_pre[:compare_len][val_mask]
+                                
+                                # 归一化以确保准确计算夹角
+                                n_real_mag = np.linalg.norm(n_real, axis=-1, keepdims=True)
+                                n_real_unit = n_real / (n_real_mag + 1e-8)
+                                n_pre_mag = np.linalg.norm(n_pre, axis=-1, keepdims=True)
+                                n_pre_unit = n_pre / (n_pre_mag + 1e-8)
+                                
+                                cos_t = np.abs(np.sum(n_real_unit * n_pre_unit, axis=-1))
+                                cos_t = np.clip(cos_t, 0.0, 1.0)
+                                angles = np.arccos(cos_t) * (180.0 / np.pi)
+                                max_angle_err = np.max(angles)
+                                mean_angle_err_val = np.mean(angles)
+                            else:
+                                max_angle_err = 0.0
+                                mean_angle_err_val = 0.0
+                            
+                            # 计算 d 偏置参数绝对误差（仅对比置信度 > 0.8 的有效平面）
+                            if tri_plane_pre is not None and np.any(val_mask):
+                                d_real = tri_plane_real[:compare_len, 3][val_mask]
+                                d_pre = tri_plane_pre[:compare_len, 3][val_mask]
+                                d_diff = np.abs(d_real - d_pre)
+                                max_d_err = np.max(d_diff)
+                                mean_d_err = np.mean(d_diff)
+                            else:
+                                max_d_err = 0.0
+                                mean_d_err = 0.0
+                            
+                            print("="*60)
+                            print("🔍 [HYBRID DATA VALIDATION (双重数据校验)]")
+                            print(f"  文件名 / File ID: {filename}")
+                            print(f"  三角形数量 (实时/读取): {max_tri_num} / {len(tri_conf_pre)}")
+                            print(f"  置信度最大绝对误差: {np.max(conf_diff):.6f}")
+                            print(f"  置信度平均绝对误差: {np.mean(conf_diff):.6f}")
+                            if np.any(val_mask):
+                                print(f"  有效对比法线三角形数: {np.sum(val_mask)}")
+                                print(f"  法向量最大夹角偏差: {max_angle_err:.4f}°")
+                                print(f"  法向量平均夹角偏差: {mean_angle_err_val:.4f}°")
+                                if tri_plane_pre is not None:
+                                    print(f"  平面偏置 d 最大绝对误差: {max_d_err:.6f}")
+                                    print(f"  平面偏置 d 平均绝对误差: {mean_d_err:.6f}")
+                            else:
+                                print("  无足够有效法线进行对比(置信度均 <= 0.8)")
+                            print("="*60)
+
+                            # 🎯 用读取的离线预处理数据覆盖填充 Stage 1 尺寸的软置信度与法向量真值图
+                            planar_soft_conf_s1 = np.zeros_like(tri_id_curr, dtype=np.float32)
+                            valid_id_mask = (tri_id_curr >= 0) & (tri_id_curr < len(tri_conf_pre))
+                            planar_soft_conf_s1[valid_id_mask] = tri_conf_pre[tri_id_curr[valid_id_mask]]
+                            
+                            gt_normal_map_s1 = np.zeros(tri_id_curr.shape + (3,), dtype=np.float32)
+                            gt_normal_map_s1[valid_id_mask] = tri_normal_pre[tri_id_curr[valid_id_mask]]
+                            
+                            # 同时也用离线数据覆盖并重新生成 planar_soft_conf_s0
+                            planar_soft_conf_s0 = np.zeros_like(tri_id_curr_s0, dtype=np.float32)
+                            valid_id_mask_s0 = (tri_id_curr_s0 >= 0) & (tri_id_curr_s0 < len(tri_conf_pre))
+                            planar_soft_conf_s0[valid_id_mask_s0] = tri_conf_pre[tri_id_curr_s0[valid_id_mask_s0]]
+                        else:
+                            print("⚠️ Warning: sample 中未找到 'tri_conf_cleaned' 或 'tri_normal_cleaned'，将回退到实时计算。")
+                            # 填充得到 Stage 1 尺寸的软置信度真值图
+                            conf_values_s1 = np.array([tri_conf_dict.get(tid, 0.0) for tid in tri_id_curr.flat], dtype=np.float32)
+                            planar_soft_conf_s1 = conf_values_s1.reshape(tri_id_curr.shape)
+                            
+                            # 填充得到 Stage 1 尺寸的法向量真值图 (SVD 拟合)
+                            normal_values_s1 = np.array([gt_normal_dict.get(tid, [0.0, 0.0, 0.0]) for tid in tri_id_curr.flat], dtype=np.float32)
+                            gt_normal_map_s1 = normal_values_s1.reshape(tri_id_curr.shape + (3,))
+
+                        # 生成 Ground-Truth Planar Normal Map (normal_gt_s1.png)
+                        # 用户要求生成全部的平面的法向量，因此移除了原本 (planar_soft_conf_s1 > 0.80) 的优质平面置信度限制
+                        normal_gt_mask = np.linalg.norm(gt_normal_map_s1, axis=-1) > 0.1
+                        
+                        normal_gt_vis = np.zeros_like(gt_normal_map_s1, dtype=np.uint8)
+                        normal_gt_vis[normal_gt_mask] = ((gt_normal_map_s1[normal_gt_mask] + 1.0) / 2.0 * 255.0).astype(np.uint8)
+                        
+                        normal_gt_filename = os.path.join(args.outdir, filename.format('normal_gt_s1', '.png'))
+                        os.makedirs(os.path.dirname(normal_gt_filename), exist_ok=True)
+                        Image.fromarray(normal_gt_vis).save(normal_gt_filename)
+
+                        # 评估预测法向量与 SVD 真值法向量的角度偏差并生成 Normal Angular Deviation Heatmap (normal_diff_s1_dif.png)
+                        if 'normal_pro_pure' in outputs.get("output_plane", {}):
+                            pred_normal_s1_tensor = outputs["output_plane"]['normal_pro_pure'][b_idx]
+                            pred_normal_s1 = pred_normal_s1_tensor.detach().cpu().numpy() if isinstance(pred_normal_s1_tensor, torch.Tensor) else pred_normal_s1_tensor
+                            pred_normal_s1 = np.transpose(pred_normal_s1, (1, 2, 0)) # [H_s1, W_s1, 3]
+
+                            pred_norm_mag = np.linalg.norm(pred_normal_s1, axis=-1, keepdims=True)
+                            pred_normal_s1_unit = pred_normal_s1 / (pred_norm_mag + 1e-8)
+
+                            gt_norm_mag = np.linalg.norm(gt_normal_map_s1, axis=-1, keepdims=True)
+                            gt_normal_s1_unit = gt_normal_map_s1 / (gt_norm_mag + 1e-8)
+
+                            normal_eval_mask = (
+                                (planar_soft_conf_s1 > 0.80) & 
+                                (np.squeeze(gt_norm_mag) > 0.1) & 
+                                (depth_est > 0)
+                            )
+                            if depth_gt_np is not None:
+                                gt_depth_s1 = np.squeeze(depth_gt_np[b_idx])
+                                normal_eval_mask = normal_eval_mask & (gt_depth_s1 > 0)
+
+                            if normal_eval_mask.any():
+                                cos_theta = np.abs(np.sum(pred_normal_s1_unit * gt_normal_s1_unit, axis=-1))
+                                cos_theta = np.clip(cos_theta, 0.0, 1.0)
+                                angle_diff = np.arccos(cos_theta) * (180.0 / np.pi)
+                                mean_angle_err = np.mean(angle_diff[normal_eval_mask])
+                                print(f"👑 [SVD NORMAL EVAL] 优质平面法向量 MAE 夹角偏差: {mean_angle_err:.4f}° (评估有效像素数: {np.sum(normal_eval_mask)})")
+
+                                # 绘制夹角偏差热力图 (最大 15 度，背景黑色)
+                                plt.figure(figsize=(10, 8))
+                                angle_diff_masked = np.ma.masked_where(~normal_eval_mask, angle_diff)
+                                cmap_normal_diff = plt.get_cmap('jet')
+                                cmap_normal_diff.set_bad(color='black')
+
+                                im_normal_diff = plt.imshow(angle_diff_masked, cmap=cmap_normal_diff, vmin=0, vmax=15.0)
+                                cbar_normal_diff = plt.colorbar(im_normal_diff, fraction=0.046, pad=0.04)
+                                cbar_normal_diff.set_label('Angular Deviation (Degrees)', size=14)
+                                plt.title(f'Normal Angular Deviation (Conf > 0.8) MAE: {mean_angle_err:.4f}°', fontsize=14, fontweight='bold')
+                                plt.axis('off')
+                                
+                                normal_diff_filename = os.path.join(args.outdir, filename.format('normal_diff_s1', '_dif.png'))
+                                os.makedirs(os.path.dirname(normal_diff_filename), exist_ok=True)
+                                plt.savefig(normal_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                                plt.close()
+                            else:
+                                print("👑 [SVD NORMAL EVAL] 无足够优质平面像素以进行法向量夹角偏差评估")
+
                 # ==========================================
                 # 【深度图可视化】
                 # ==========================================
@@ -362,7 +819,7 @@ def save_depth():
                             depth_no_pro = depth_no_pro.detach().cpu().numpy()
                         depth_no_pro = np.squeeze(depth_no_pro)
 
-                        valid_no_pro = depth_no_pro > 0
+                        valid_no_pro = depth_no_pro > 0 
                         if valid_no_pro.any():
                             d_min_np = np.percentile(depth_no_pro[valid_no_pro], 1)
                             d_max_np = np.percentile(depth_no_pro[valid_no_pro], 99)
@@ -403,10 +860,16 @@ def save_depth():
                 Image.fromarray(normal_vis_rgb).save(normal_filename)
 
                 # ====================================================================
+                # 👑 【新增功能】评估预测法向量与 SVD 真值法向量的角度偏差 (MAE 角度)
+                # ====================================================================
+                # 预测法向量与 SVD 真值法向量的角度偏差评估以及偏差热力图绘制已在 SVD 拟合及置信度清洗阶段提前完成
+
+                # ====================================================================
                 # 提前提取平面置信度 (W_plane)，供平面 MAE 切分和最终保存使用
                 # ====================================================================
                 depth_est_sq = np.squeeze(depth_est)  # [H, W]
                 w_plane_sq = []
+                dev_gt = None  # 提前初始化，用于后续导出静态二值图
                 if 'W_plane_pixel' in outputs["output_plane"]:
                     w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
                     w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data,
@@ -440,11 +903,16 @@ def save_depth():
                         diff_map[mask_diff] = abs_error_array
                         mean_abs_error = np.mean(abs_error_array)
 
-                        # 过滤提取高不确定性平面区域 (W_plane > 0.80)
-                        mask_planar = mask_diff & (w_plane_sq > 0.80)
+                        # 🪐 锁定大平面固定指标 (使用 3D OLS 拟合的三角几何平面，实现 100% 对齐评测)
+                        if planar_soft_conf_s1 is not None:
+                            mask_planar = mask_diff & (planar_soft_conf_s1 > 0.80)
+                        else:
+                            # 兜底
+                            mask_planar = np.zeros_like(depth_est_sq, dtype=bool)
+
                         if mask_planar.any():
                             planar_mae = np.mean(np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar]))
-                            planar_text = f"\nFlat Region MAE (W>0.80): {planar_mae:.4f}m"
+                            planar_text = f"\nFlat Region MAE (GT Planar): {planar_mae:.4f}m"
                         else:
                             planar_mae = 0.0
                             planar_text = ""
@@ -469,16 +937,16 @@ def save_depth():
                         os.makedirs(os.path.dirname(diff_filename), exist_ok=True) # 🛡️ 刚性子目录防爆铁闸一
                         plt.savefig(diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                         plt.close()
-
+ 
                         # ── 图二：仅平面区域误差图（W_plane > 0.80，满足用户只展现平面 MAE 的渴望） ──
                         if mask_planar.any():
                             planar_err_array = np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar])
                             planar_diff_map = np.zeros_like(depth_est_sq)
                             planar_diff_map[mask_planar] = planar_err_array
-
+ 
                             # 误差上限用平面区域自己的 95 百分位，使得色标分布针对平面高分辨率拉伸，拒绝曲面大误差污染
-                            planar_diff_max = max(np.percentile(planar_err_array, 95), 0.1)
-
+                            planar_diff_max = error_num
+ 
                             plt.figure(figsize=(10, 8))
                             # 刚性隔离：将平面区域外（曲面、虚空、背景）全部标记为 True 实施严格黑色放逐
                             planar_map_masked = np.ma.masked_where(~mask_planar, planar_diff_map)
@@ -534,15 +1002,23 @@ def save_depth():
                             diff_map_no_pro[mask_diff_no_pro] = abs_error_array_no_pro
                             mean_abs_error_no_pro = np.mean(abs_error_array_no_pro)
 
-                            mask_planar_no_pro = mask_diff_no_pro & (w_before_sq > 0.80)
+                            if planar_soft_conf_s1 is not None:
+                                if planar_soft_conf_s1.shape != mask_diff_no_pro.shape:
+                                    planar_soft_conf_no_pro_resized = cv2.resize(planar_soft_conf_s1, (mask_diff_no_pro.shape[1], mask_diff_no_pro.shape[0]), interpolation=cv2.INTER_NEAREST)
+                                else:
+                                    planar_soft_conf_no_pro_resized = planar_soft_conf_s1
+                                mask_planar_no_pro = mask_diff_no_pro & (planar_soft_conf_no_pro_resized > 0.80)
+                            else:
+                                mask_planar_no_pro = mask_diff_no_pro & (w_before_sq > 0.80)
+
                             if mask_planar_no_pro.any():
                                 planar_mae_no_pro = np.mean(np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro]))
-                                planar_no_pro_text = f"\nFlat Region MAE (W_before>0.80): {planar_mae_no_pro:.4f}m"
+                                planar_no_pro_text = f"\nFlat Region MAE (GT Planar): {planar_mae_no_pro:.4f}m"
                             else:
                                 planar_mae_no_pro = 0.0
                                 planar_no_pro_text = ""
 
-                            diff_max_plot_no_pro = max(np.percentile(abs_error_array_no_pro, 95), 0.5)
+                            diff_max_plot_no_pro = error_num
                             plt.figure(figsize=(10, 8))
                             diff_map_masked_no_pro = np.ma.masked_where(~mask_diff_no_pro, diff_map_no_pro)
                             cmap_no_pro = plt.get_cmap('jet')
@@ -561,7 +1037,7 @@ def save_depth():
                             if mask_planar_no_pro.any():
                                 planar_diff_map_no_pro = np.zeros_like(depth_no_pro_sq)
                                 planar_diff_map_no_pro[mask_planar_no_pro] = np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro])
-                                planar_diff_max_no_pro = max(np.percentile(np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro]), 95), 0.1)
+                                planar_diff_max_no_pro = error_num
                                 plt.figure(figsize=(10, 8))
                                 planar_map_masked_no_pro = np.ma.masked_where(~mask_planar_no_pro, planar_diff_map_no_pro)
                                 cmap_planar_no_pro = plt.get_cmap('jet')
@@ -569,7 +1045,7 @@ def save_depth():
                                 im_planar_no_pro = plt.imshow(planar_map_masked_no_pro, cmap=cmap_planar_no_pro, vmin=0, vmax=planar_diff_max_no_pro)
                                 cbar_planar_no_pro = plt.colorbar(im_planar_no_pro, fraction=0.046, pad=0.04)
                                 cbar_planar_no_pro.set_label('Absolute Error (Meters)', size=14)
-                                plt.title(f'Flat Region No-Propagation MAE (W_before > 0.80): {planar_mae_no_pro:.4f}m\nMax Cutoff: {planar_diff_max_no_pro:.2f}m',
+                                plt.title(f'Flat Region No-Propagation MAE (GT Planar): {planar_mae_no_pro:.4f}m\nMax Cutoff: {planar_diff_max_no_pro:.2f}m',
                                           fontsize=13, fontweight='bold')
                                 plt.axis('off')
                                 planar_diff_filename_no_pro = diff_filename_no_pro.replace('_dif.png', '_dif_planar.png')
@@ -611,12 +1087,33 @@ def save_depth():
                     cv2.imwrite(conf_jet_filename, w_plane_color)
                     print(f"✅ 置信度图已成功写入: {conf_jet_filename}")
 
+                    # 🪐 👑 模仿预测平面置信度，导出 GT 软置信度的可视化图 (0为红，1为蓝)
+                    if planar_soft_conf_s1 is not None:
+                        gt_conf_filename = os.path.join(args.outdir, filename.format('soft_planar_gt_jet', '.png'))
+                        os.makedirs(os.path.dirname(gt_conf_filename), exist_ok=True)
+                        
+                        gt_conf_uint8 = (np.clip(planar_soft_conf_s1, 0.0, 1.0) * 255.0).astype(np.uint8)
+                        gt_conf_uint8_inv = 255 - gt_conf_uint8
+                        gt_conf_uint8_inv[~current_mask] = 0
+                        
+                        gt_conf_color = cv2.applyColorMap(gt_conf_uint8_inv, cv2.COLORMAP_JET)
+                        gt_conf_color[~current_mask] = 0
+                        
+                        cv2.imwrite(gt_conf_filename, gt_conf_color)
+                        print(f"✅ 软置信度真值图已成功写入: {gt_conf_filename}")
+
                     # =====================================================================
-                    # 👑 【新增对比实验硬核资产】：熔炼并导出 W > 0.80 的 0/1 刚性流形掩码二值图
+                    # 👑 【新增对比实验硬核资产】：熔炼并导出几何真平面掩码二值图
                     # =====================================================================
-                    # 机制精剖：将连续概率空间一刀切。大于0.80的黄金平面记为 255（纯白），其余及背景统统归 0（纯黑）
-                    binary_mask_np = np.zeros_like(w_plane_sq, dtype=np.uint8)
-                    binary_mask_np[(w_plane_sq > 0.80) & current_mask] = 255
+                    # 机制精剖：使用计算得到的 3D 几何真平面软置信度真值 (W_GT > 0.80)
+                    binary_mask_np = np.zeros_like(depth_est_sq, dtype=np.uint8)
+                    if planar_soft_conf_s1 is not None:
+                        binary_mask_np[(planar_soft_conf_s1 > 0.80) & current_mask] = 255
+                    else:
+                        if dev_gt is not None:
+                            binary_mask_np[(dev_gt < 0.15) & current_mask] = 255
+                        else:
+                            binary_mask_np[(w_plane_sq > 0.80) & current_mask] = 255
 
                     # 动态生成专属基准文件名，加上 _oracle_mask 后缀，防止混淆文件目录
                     oracle_mask_filename = os.path.join(args.outdir, filename.format('plane_mask_01', '_oracle_mask.png'))
@@ -683,14 +1180,25 @@ def save_depth():
                         diff_map_pixel[mask_diff_pixel] = abs_error_pixel
 
                         mean_error_pixel = np.mean(abs_error_pixel)
-                        max_plot_pixel = max(np.percentile(abs_error_pixel, 95), 0.5)
-
+                        max_plot_pixel = error_num
                         plt.figure(figsize=(10, 8))
+                        cmap = plt.get_cmap('jet')
                         im_pixel = plt.imshow(np.ma.masked_where(~mask_diff_pixel, diff_map_pixel), cmap=cmap, vmin=0,
                                               vmax=max_plot_pixel)
                         cbar_pixel = plt.colorbar(im_pixel, fraction=0.046, pad=0.04)
                         cbar_pixel.set_label('Absolute Error (Meters)', size=14)
 
+                        # 🪐 Stage 0 大平面测试同样使用 3D OLS 拟合的三角几何平面，实现 100% 对齐评测
+                        if planar_soft_conf_s0 is not None:
+                            if planar_soft_conf_s0.shape != mask_diff_pixel.shape:
+                                planar_soft_conf_pixel_resized = cv2.resize(planar_soft_conf_s0, (mask_diff_pixel.shape[1], mask_diff_pixel.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            else:
+                                planar_soft_conf_pixel_resized = planar_soft_conf_s0
+                            mask_planar_s0 = mask_diff_pixel & (planar_soft_conf_pixel_resized > 0.80)
+                        else:
+                            # 兜底
+                            mask_planar_s0 = np.zeros_like(depth_pixel_curr, dtype=bool)
+                        
                         plt.title(
                             f'Baseline (Pixel-wise) MAE: {mean_error_pixel:.4f}m\nMax Cutoff: {max_plot_pixel:.2f}m',
                             fontsize=14, fontweight='bold')
@@ -735,18 +1243,26 @@ def save_depth():
 
                         mean_abs_error_s0 = np.mean(abs_error_array_s0)
 
-                        # 计算 Stage 0 阶段的纯平面区域 MAE
-                        w_plane_sq_s0 = cv2.resize(w_plane_sq, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
-                                                   interpolation=cv2.INTER_LINEAR)
-                        mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.80)
+                        # 计算 Stage 0 阶段的纯平面区域 MAE，使用静态几何平面
+                        if planar_soft_conf_s0 is not None:
+                            if planar_soft_conf_s0.shape != mask_diff_s0.shape:
+                                planar_soft_conf_s0_resized = cv2.resize(planar_soft_conf_s0, (mask_diff_s0.shape[1], mask_diff_s0.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            else:
+                                planar_soft_conf_s0_resized = planar_soft_conf_s0
+                            mask_planar_s0 = mask_diff_s0 & (planar_soft_conf_s0_resized > 0.80)
+                        else:
+                            w_plane_sq_s0 = cv2.resize(w_plane_sq, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
+                                                       interpolation=cv2.INTER_LINEAR)
+                            mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.80)
+
                         if mask_planar_s0.any():
                             planar_mae_s0 = np.mean(
                                 np.abs(depth_est_s0_sq[mask_planar_s0] - gt_curr_s0[mask_planar_s0]))
-                            planar_text_s0 = f"\nFlat Region MAE (W>0.80): {planar_mae_s0:.4f}m"
+                            planar_text_s0 = f"\nFlat Region MAE (GT Planar): {planar_mae_s0:.4f}m"
                         else:
                             planar_text_s0 = ""
 
-                        diff_max_plot_s0 = max(np.percentile(abs_error_array_s0, 95), 0.5)
+                        diff_max_plot_s0 = error_num
 
                         plt.figure(figsize=(10, 8))
                         diff_map_masked_s0 = np.ma.masked_where(~mask_diff_s0, diff_map_s0)
@@ -766,6 +1282,8 @@ def save_depth():
                         os.makedirs(os.path.dirname(diff_filename_s0), exist_ok=True)
                         plt.savefig(diff_filename_s0, dpi=150, bbox_inches='tight', pad_inches=0.1)
                         plt.close()
+
+                        # SVD 拟合实验与降级处理已在 Stage 1 各种图生成前提前执行完成，此处跳过以避免重复计算
 
                         # ====================================================================
                         # 🎯 【新增功能】Stage 0 (Refined) 密集深度图黑白灰度图可视化

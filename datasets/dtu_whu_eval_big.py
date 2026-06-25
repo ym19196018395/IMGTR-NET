@@ -181,6 +181,12 @@ class MVSDataset(Dataset):
         # 这里计算的是当前视图的最大有效深度，用于后续可能的归一化或范围设定
         depth_max = depth_hr.max()
 
+        # --- 🚨 新增：根据目标 img_wh 将深度图与掩码缩放到一致尺寸 ---
+        h_target, w_target = self.img_wh[1], self.img_wh[0]
+        if depth_hr.shape != (h_target, w_target):
+            depth_hr = cv2.resize(depth_hr, (w_target, h_target), interpolation=cv2.INTER_NEAREST)
+            mask_hr = cv2.resize(mask_hr, (w_target, h_target), interpolation=cv2.INTER_NEAREST)
+
         # ------------------------------------------------------------------
         # 以下部分保持你原有的逻辑不变，进行多尺度下采样
         # ------------------------------------------------------------------
@@ -286,6 +292,31 @@ class MVSDataset(Dataset):
 
                 cdt_data = get_cdt_datas(triangulation_filename, H=H, W=W)
 
+                # --- 🚨 新增：读取离线超轻量 npz 几何特征并进行一维极速判定与降级 ---
+                npz_path = os.path.join(self.datapath, self.mode, "Images", scan, "triangulation", f"geom_svd_{file_id}.npz")
+                if os.path.exists(npz_path):
+                    npz_data = np.load(npz_path)
+                    tri_conf = npz_data['tri_initial_conf'].copy()
+                    tri_err95 = npz_data['tri_svd_err95']
+                    
+                    # 极速一维判定与降级
+                    degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
+                    tri_conf[degrade_mask] = 0.75
+                    
+                    # 兼容新老版 npz (保存 tri_svd_plane 或 tri_svd_normal)
+                    if 'tri_svd_plane' in npz_data:
+                        tri_plane = npz_data['tri_svd_plane'].copy()
+                    else:
+                        tri_normal = npz_data['tri_svd_normal']
+                        tri_plane = np.zeros((len(tri_normal), 4), dtype=np.float32)
+                        tri_plane[:, :3] = tri_normal
+                    
+                    tri_conf_cleaned = tri_conf
+                    tri_normal_cleaned = tri_plane[:, :3] # 全部保留，不因置信度抹零
+                    tri_plane_cleaned = tri_plane
+                else:
+                    raise FileNotFoundError(f"🚨 [HYBRID ERROR] 未找到离线预处理几何文件: {npz_path}。请先运行 preprocess_whu_mvs.py 生成该文件！")
+
             intrinsics[0] *= self.img_wh[0] / original_w
             intrinsics[1] *= self.img_wh[1] / original_h
 
@@ -377,6 +408,9 @@ class MVSDataset(Dataset):
                 "filename": scan +'/{}/' + '{}'.format(file_id) + "{}",
                 "vertexs": vertexs,  # ndarray (Nv, ..)
                 "lines": lines,  # ndarray (Nl, ..)
-                "triangles": triangles  # list of ndarrays
+                "triangles": triangles,  # list of ndarrays
+                "tri_conf_cleaned": tri_conf_cleaned,
+                "tri_normal_cleaned": tri_normal_cleaned,
+                "tri_plane_cleaned": tri_plane_cleaned
                 }
 

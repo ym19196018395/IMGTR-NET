@@ -506,7 +506,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         return final_planes,W_plane_tri_learn
 
     def compute_continuity_loss(self, planes, neighbor_indices, edge_probs,aligned_midpoints_norm, intrinsics,
-                                H, W,depth_min,depth_max):
+                                H, W,depth_min,depth_max, W_plane_tri=None):
         """
            基于逆深度的 C0 连续性损失 (防坍缩修正版)
 
@@ -612,8 +612,24 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # 这样算出来的 relative_error (一般在 0.01~0.1 级别)
         # 乘上 10 之后，能落在 0.1~1.0 之间，与 depth_loss 匹配
         continuity_scale = 10.0
-        weighted_error = relative_error * gate * continuity_scale
 
+        # 🪐 引入置信度引导的动态连续性增强 (P0 修复量纲版)
+        if W_plane_tri is not None:
+            # 直接使用原生未极化置信度
+            W_plane_pure = W_plane_tri.squeeze(-1).detach()
+            W_i = W_plane_pure.unsqueeze(2)
+            batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
+            W_j = W_plane_pure[batch_idx, neighbor_indices]
+            # 采用 min 门控，只有双侧都是高置信度时才实施强连续性约束
+            W_edge_plane = torch.min(W_i, W_j)
+            plane_boost_ratio = 2.0
+            dynamic_scale = continuity_scale * (1.0 + plane_boost_ratio * W_edge_plane)
+        else:
+            dynamic_scale = continuity_scale
+
+        weighted_error = relative_error * gate * dynamic_scale
+
+        # 🚨 P0 核心修复：分母只由 gate 决定，去掉 dynamic_scale，使 scale 真正生效而不被稀释！
         weight_sum = gate.sum().clamp(min=1.0)
         continuity_loss = weighted_error.sum() / weight_sum
 
@@ -907,9 +923,25 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             W_edge_confidence = torch.min(W_i, W_j)  # [B, N, 3]
 
             # 5. 纯净的三维张量空间点乘对撞：[B, N, 3] * [B, N, 3]，量纲完美契合
-            W_final = W_final * W_edge_confidence
+            W_final = W_ij * area_weights.unsqueeze(2)
+        if W_plane_tri is not None:
+            # 彻底开除极化操作，直接使用原生未极化的连续置信度 W_plane_tri 且强制 .detach()
+            W_plane_pure = W_plane_tri.squeeze(-1).detach()  # [B, N]
+            W_i = W_plane_pure.unsqueeze(2)  # [B, N, 1]
+            batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
+            W_j = W_plane_pure[batch_idx, neighbor_indices]  # [B, N, 3]
 
-        # 将每个三角形的归一化面积权重乘上去！大面片将产生极高的 Loss 压迫感！
+            # 1. 提取基础木桶约束以保护好平面
+            W_edge_min = torch.min(W_i, W_j)  # [B, N, 3]
+
+            # 2. 👑 Base + Boost min 黄金公式：0.3 保底维系曲面 TV 渐变，其余 0.7 弹性留给大平墙
+            base_smooth = 0.3
+            W_gating = base_smooth + (1.0 - base_smooth) * W_edge_min  # [B, N, 3]
+
+            # 叠乘门控
+            W_final = W_final * W_gating
+
+        # 物理距离 + 角度惩罚
         weighted_energy = W_final * E_geom
 
         weight_sum = (W_ij * area_weights.unsqueeze(2)).sum().clamp(min=1e-6)
@@ -1265,7 +1297,7 @@ class PlanePatchMatchModule(nn.Module):
         # 物理因果：在这里对置信度降下全管线统一的 SmoothStep 极化法案！
         # 设定上界 theta_high = 0.80（刚性严苛对齐，深度误差需锁定在 1.20 米内）。
         # 强行注入 .detach() 锁定，阻断下游光滑性损失（L_smoothness）逆向洗劫置信度更新头。
-        th_low, th_high = 0.05, 0.80
+        th_low, th_high = 0.05, 0.70
         W_pure = W_plane_tri.detach().squeeze(-1)                       # 刚性挤压退化的 [B, N, 1] 至 [B, N]
         x_norm = torch.clamp((W_pure - th_low) / (th_high - th_low + 1e-8), 0.0, 1.0)
 
@@ -1285,7 +1317,8 @@ class PlanePatchMatchModule(nn.Module):
                 aligned_midpoints_norm=aligned_midpoints_norm,
                 intrinsics=ref_intrinsics,
                 H=H, W=W,
-                depth_min=min(depth_min), depth_max=max(depth_max))
+                depth_min=min(depth_min), depth_max=max(depth_max),
+                W_plane_tri=W_plane_tri.detach()) # 🚨 传入原生未极化的 W_plane_tri
 
         # 计算光滑性损失
         smoothness_loss = 0.0
@@ -1312,7 +1345,7 @@ class PlanePatchMatchModule(nn.Module):
                 pixel_counts=pixel_counts_tensor,  # 每个三角形的大小
                 intrinsics=ref_intrinsics,  # 相机内参 [B, 3, 3]
                 ref_feature=ref_feature.detach(),  # 原生特征图 [B, C, H, W]
-                W_plane_tri=W_plane_tri_polarized.detach(),
+                W_plane_tri=W_plane_tri.detach(),  # 🚨 传入原生未极化的 W_plane_tri
                 H=H, W=W,
                 sigma_F=0.4,  # 可调：0.5 是 L2 归一化特征推荐值
                 lambda_ang=5.0  # 可调：法向平滑的相对强度
