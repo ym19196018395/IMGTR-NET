@@ -175,12 +175,29 @@ def main():
         print(f"\nProcessing scan: {scan}")
         scan_dir = os.path.join(args.datapath, args.mode, "Images", scan)
         list_txt_path = os.path.join(scan_dir, "list.txt")
-        if not os.path.exists(list_txt_path):
-            print(f"Warning: list.txt not found in {scan_dir}, skipping.")
-            continue
+        
+        file_ids = []
+        if os.path.exists(list_txt_path):
+            with open(list_txt_path, 'r') as f:
+                file_ids = [line.strip().split('.')[0] for line in f.readlines() if line.strip()]
+        else:
+            # 自动容错自愈方案：扫描 urd 目录下的所有图片
+            urd_dir = os.path.join(scan_dir, "urd")
+            if os.path.exists(urd_dir):
+                file_ids = [f.split('.')[0] for f in os.listdir(urd_dir) if f.lower().endswith('.png')]
+                file_ids = sorted(list(set(file_ids)))
+                print(f" ⚠️ Note: list.txt not found in {scan_dir}. Automatically detected {len(file_ids)} views from 'urd' directory.")
+            else:
+                # 兼容普通 WHU 格式，如果无 urd 目录，扫描子视角 1 目录下的图片
+                sub_dir_1 = os.path.join(scan_dir, "1")
+                if os.path.exists(sub_dir_1):
+                    file_ids = [f.split('.')[0] for f in os.listdir(sub_dir_1) if f.lower().endswith('.png')]
+                    file_ids = sorted(list(set(file_ids)))
+                    print(f" ⚠️ Note: list.txt not found in {scan_dir}. Automatically detected {len(file_ids)} views from subdirectory '1'.")
 
-        with open(list_txt_path, 'r') as f:
-            file_ids = [line.strip().split('.')[0] for line in f.readlines() if line.strip()]
+        if len(file_ids) == 0:
+            print(f" Warning: No view IDs could be resolved for {scan_dir}, skipping.")
+            continue
 
         for file_idx, file_id in enumerate(file_ids):
             # 定义输入文件路径
@@ -192,6 +209,11 @@ def main():
             # 定义输出文件路径
             out_dir = os.path.join(args.datapath, args.mode, "Images", scan, "triangulation")
             out_filename = os.path.join(out_dir, f"geom_svd_{file_id}.npz")
+
+            if os.path.exists(out_filename) and os.path.getsize(out_filename) > 0:
+                print(f" [{file_idx+1}/{len(file_ids)}] View {file_id} already processed. Skipping.")
+                total_processed += 1
+                continue
 
             print(f" [{file_idx+1}/{len(file_ids)}] Processing view {file_id} ...", end="", flush=True)
 

@@ -93,7 +93,7 @@ torch.cuda.manual_seed(args.seed)
 
 if args.mode == "train":
     if not os.path.isdir(args.logdir):
-        os.mkdir(args.logdir)
+        os.makedirs(args.logdir, exist_ok=True)
 
     current_time_str = str(datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     print("current time", current_time_str)
@@ -422,14 +422,18 @@ def compute_stage1_flat_region_mae_tensors(outputs, pixel_depth_s1, depth_gt_s1,
     """
     # 1. 建立高鲁棒性字典探针，封杀 KeyError
     output_plane_dict = outputs.get("output_plane", {})
-    if 'W_plane_pixel' in output_plane_dict:
+    # 优先采用高精度离线置信度真值用于评估，若限制缺失则退回预测值
+    if 'W_plane_gt_pixel' in output_plane_dict:
+        w_plane_pixel = output_plane_dict['W_plane_gt_pixel']
+    elif 'W_plane_pixel' in output_plane_dict:
         w_plane_pixel = output_plane_dict['W_plane_pixel']
-        if w_plane_pixel.shape[2:] != depth_gt_s1.shape[2:]:
-            w_plane_pixel = F.interpolate(
-                w_plane_pixel, size=depth_gt_s1.shape[2:], mode='bilinear', align_corners=True
-            )
     else:
         w_plane_pixel = torch.zeros_like(depth_gt_s1)
+
+    if w_plane_pixel.shape[2:] != depth_gt_s1.shape[2:]:
+        w_plane_pixel = F.interpolate(
+            w_plane_pixel.float(), size=depth_gt_s1.shape[2:], mode='nearest'
+        )
 
     # 2. 密集拓扑有效合规检测
     tri_id_map = output_plane_dict.get('tri_id_map', None)
@@ -576,7 +580,14 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     valid_mask_s0 = (outputs["output_plane"]['tri_id_map_stage0'] >= 0).float().unsqueeze(dim=1)
     mask['stage_1']=valid_mask_s1
     mask['stage_0'] = valid_mask_s0
-    loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)  # 深度损失
+    loss_depth = compute_heteroscedastic_depth_loss(
+        depth_patchmatch=depth_patchmatch,
+        refined_depth=depth_est,
+        depth_gt=depth_gt,
+        mask=mask,
+        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
+        gamma=1.5
+    )  # 深度损失
 
     # ====================================================
     # 2. 边预测头的混合监督 Loss
@@ -639,17 +650,15 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 平面置信度
     loss_plane_s1, W_GT_pixel = compute_confidence_supervision_loss(
         pixel_depth_pred=depth_patchmatch['stage_1'][-1].detach(),
-        pixel_depth_gt=depth_gt['stage_0'],  # 高清深度真值
-        pixel_normal_pred=outputs["output_plane"]["normal_pro_pure"],
-        tri_id_map=outputs["output_plane"]['tri_id_map_stage0'],  # 高清 tri_id_map
+        pixel_depth_gt=depth_gt['stage_1'],
+        pixel_normal_pred=outputs["output_plane"]['normal_pro_pure'],
+        tri_id_map=outputs["output_plane"]['tri_id_map'],
         W_pred=outputs["output_plane"]["W_plane_tri"],
         progress=progress,
         depth_range=(sample_cuda["depth_min"], sample_cuda["depth_max"]),
-        valid_mask=None,
-        intrinsics=ref_intrinsics_s0,  # 高清相机内参
-        pixel_counts=None,
-        pixel_normal_gt=gt_normals_math,  # 高清法向量真值
-        tri_id_map_s1=outputs["output_plane"]['tri_id_map']  # 传入 Stage 1 的 tri_id_map，用于生成用于可视化显示的高清置信度真值
+        valid_mask=valid_mask_s1,
+        intrinsics=ref_intrinsics,
+        tri_conf_gt=sample_cuda["tri_conf_cleaned"]
     )
     outputs["output_plane"]["W_plane_gt_pixel"] = W_GT_pixel
 
@@ -657,7 +666,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     tri_id_map = outputs["output_plane"].get('tri_id_map', None)
     if tri_id_map is not None and "tri_conf_cleaned" in sample_cuda:
         B, H_s1, W_s1 = tri_id_map.shape
-        device = tri_id_map.device
+        tri_device = tri_id_map.device
         planar_soft_conf_s1_list = []
         gt_normal_map_s1_list = []
         
@@ -666,10 +675,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             tri_normal_b = sample_cuda['tri_normal_cleaned'][b] # [N_tri, 3]
             tri_id_map_b = tri_id_map[b]                        # [H_s1, W_s1]
             
-            dummy_conf = torch.cat([tri_conf_b, torch.tensor([0.0], device=device)], dim=0)
-            dummy_normal = torch.cat([tri_normal_b, torch.tensor([[0.0, 0.0, 0.0]], device=device)], dim=0)
+            dummy_conf = torch.cat([tri_conf_b, torch.tensor([0.0], device=tri_device)], dim=0)
+            dummy_normal = torch.cat([tri_normal_b, torch.tensor([[0.0, 0.0, 0.0]], device=tri_device)], dim=0)
             
-            safe_idx = torch.where(tri_id_map_b >= 0, tri_id_map_b, torch.tensor(tri_conf_b.shape[0], device=device).long())
+            safe_idx = torch.where(tri_id_map_b >= 0, tri_id_map_b, torch.tensor(tri_conf_b.shape[0], device=tri_device).long())
             
             planar_soft_conf_s1_b = dummy_conf[safe_idx]  # [H_s1, W_s1]
             gt_normal_map_s1_b = dummy_normal[safe_idx]    # [H_s1, W_s1, 3]
@@ -913,9 +922,13 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             tri_processed.append((v_ids, l_ids, pts))
         triangles_batch.append(tri_processed)
 
-    # ym-modify 重写了一下对于cdt—data数据进行了一个跳过
-    skip = ["vertexs", "lines", "triangles"]
+    # ym-modify 重写了一下对于cdt—data数据进行了一个跳过，同时也跳过超轻量几何变长列表的直接转换
+    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
+
+    # 手动转换并移动到 GPU
+    sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
+    sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
@@ -940,6 +953,36 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]
 
+    # --- 🚨 新增：基于预处理 npz 数据，在线极速查表映射 Stage 1 真值置信度与法线 ---
+    tri_id_map = outputs["output_plane"].get('tri_id_map', None)
+    if tri_id_map is not None and "tri_conf_cleaned" in sample_cuda:
+        B, H_s1, W_s1 = tri_id_map.shape
+        tri_device = tri_id_map.device
+        planar_soft_conf_s1_list = []
+        gt_normal_map_s1_list = []
+        
+        for b in range(B):
+            tri_conf_b = sample_cuda['tri_conf_cleaned'][b]     # [N_tri]
+            tri_normal_b = sample_cuda['tri_normal_cleaned'][b] # [N_tri, 3]
+            tri_id_map_b = tri_id_map[b]                        # [H_s1, W_s1]
+            
+            dummy_conf = torch.cat([tri_conf_b, torch.tensor([0.0], device=tri_device)], dim=0)
+            dummy_normal = torch.cat([tri_normal_b, torch.tensor([[0.0, 0.0, 0.0]], device=tri_device)], dim=0)
+            
+            safe_idx = torch.where(tri_id_map_b >= 0, tri_id_map_b, torch.tensor(tri_conf_b.shape[0], device=tri_device).long())
+            
+            planar_soft_conf_s1_b = dummy_conf[safe_idx]  # [H_s1, W_s1]
+            gt_normal_map_s1_b = dummy_normal[safe_idx]    # [H_s1, W_s1, 3]
+            
+            planar_soft_conf_s1_list.append(planar_soft_conf_s1_b)
+            gt_normal_map_s1_list.append(gt_normal_map_s1_b)
+            
+        planar_soft_conf_s1 = torch.stack(planar_soft_conf_s1_list, dim=0).unsqueeze(1) # [B, 1, H_s1, W_s1]
+        gt_normal_map_s1 = torch.stack(gt_normal_map_s1_list, dim=0) # [B, H_s1, W_s1, 3]
+        
+        outputs["output_plane"]["W_plane_gt_pixel"] = planar_soft_conf_s1
+        outputs["output_plane"]["gt_normal_map_s1"] = gt_normal_map_s1
+
     # ====================================================
     # 3. 损失计算 (同步使用新的 Edge Loss 和 Normal Loss)
     # ====================================================
@@ -948,7 +991,14 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     mask['stage_1']=valid_mask_s1
     mask['stage_0'] = valid_mask_s0
 
-    loss_depth = model_loss(depth_patchmatch, depth_est, depth_gt, mask)
+    loss_depth = compute_heteroscedastic_depth_loss(
+        depth_patchmatch=depth_patchmatch,
+        refined_depth=depth_est,
+        depth_gt=depth_gt,
+        mask=mask,
+        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
+        gamma=1.5
+    )
 
     intrinsics_s1 = torch.unbind(sample_cuda["intrinsics_mats"]['stage_1'].float(), 1)
     ref_intrinsics = intrinsics_s1[0]
@@ -1034,7 +1084,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     image_outputs = {}
 
     pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
-    planar_mae_val, planar_err_masked, _ , _ = compute_stage1_flat_region_mae_tensors(
+    planar_mae_val, _ , planar_err_masked , _ = compute_stage1_flat_region_mae_tensors(
         outputs, pixel_depth_s1, depth_gt['stage_1'], device
     )
 
@@ -1073,7 +1123,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'],
             "ref_img_edge_alpha_pre": image_outputs_pre["ref_img_edge_alpha"],
             "ref_img_edge_alpha_gt": image_outputs_gt["ref_img_edge_alpha"],
-            "物理平面置信度_W_plane_传播后": w_plane_tb_tensor,
+            # "物理平面置信度_W_plane_传播后": w_plane_tb_tensor,
             "stage1_planar_error_map": planar_err_masked,
         }
         image_outputs.update(w_plane_views)
@@ -1133,7 +1183,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
 if __name__ == '__main__':
     if args.mode == "train":
-        # train()
+        train()
         # 如果用户请求，在训练结束后启动大图评估（使用最新保存的 checkpoint）
         if args.run_big_eval:
             # 训练结束后先释放训练过程中占用的 GPU 内存，避免子进程启动时 OOM

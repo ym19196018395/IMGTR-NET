@@ -419,9 +419,8 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
     W_plane_pixel = W_plane_pixel.detach()
 
     # =====================================================================
-    # 2. 🚀 空间流形消毒与低通钝化 (熨平晶格多视图匹配的微观量化锯齿)
+    # 2. 🚀 空间流形消毒与低通钝化
     # =====================================================================
-
     Z_pixel_clean = torch.nan_to_num(Z_pixel, nan=0.0, posinf=0.0, neginf=0.0)
     Z_smoothed = F.avg_pool2d(Z_pixel_clean, kernel_size=3, stride=1, padding=1)
 
@@ -465,7 +464,6 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
     # =====================================================================
     # 7. 🎯【核心重构点】拓扑边界查表隔离锁 (彻底放逐分段常数带来的接缝断层悬崖)
     # =====================================================================
-    # 【🎯 修正点二：显式转型为 Float32，破除 Int64 张量在低版本 PyTorch F.pad 算子里缺失特化模板的技术债】
     tri_id_float = tri_id_map.float()
     tri_id_shift_x = F.pad(tri_id_float[:, :, :, 1:], (0, 1, 0, 0), mode='replicate')
     tri_id_shift_y = F.pad(tri_id_float[:, :, 1:, :], (0, 0, 0, 1), mode='replicate')
@@ -481,7 +479,6 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
     # 排除差分边界，同时通过按位与非（& ~is_boundary）从源头上干净、彻底地剥离接缝毒素像素
     final_valid = edge_mask & (~is_boundary)
 
-    # 【🎯 修正点四：对 3D 掩码强行注入 unsqueeze(1) 锁定轴心，封杀隐式右对齐广播炸出的维度断层】
     if valid_mask is not None:
         if valid_mask.dim() == 3:
             valid_mask = valid_mask.unsqueeze(1)
@@ -489,7 +486,7 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
 
     relevant_loss = gated_loss_map[final_valid]
 
-    # 无效区域自卫保底（当全图被完全裁切放逐时的极值自防卫，防止分母归零炸出空均值 NaN）
+    # 无效区域自卫保底
     if relevant_loss.numel() == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
@@ -498,21 +495,19 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
 
 def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_normal_pred, tri_id_map, W_pred, progress,
                                         depth_range=None, valid_mask=None, eps=1e-7, intrinsics=None, pixel_counts=None,
-                                        pixel_normal_gt=None, tri_id_map_s1=None):
+                                        tri_conf_gt=None):
     """
-    【三位一体协同校准·完全体】平面置信度回归损失函数
+    【首席审判者·动态重构自愈完全体·几何辅助版】不确定性软标签回归损失函数
     
-    1. 静态真值在线解构 (W_GT_static):
-       - GPU 并行版 OLS 拟合残差估计：基于 GT 深度和 GT 法线计算每个三角形内点到拟合平面的平均正交距离。
-       - 悬边噪点 Dropout：通过深度突变差分与三角形边界膨胀求交，剔除边界 1-2 像素的悬空污染。
-       - 极小三角形深度标准差门控：在 N < 15 时，若标准差 std(Z) < 0.03m 则直接设为 1.0 置信度，否则为 0.0。
-    2. 区间忽略与双峰损失加权:
-       - Margin-free Interval Loss: 对于 W_GT 在 [0.3, 0.7] 的区域，残差在 0.2 以内免于惩罚。
-       - Double-Peak Gradient Gating: 乘上 V字型权重 4.0 * (W_GT - 0.5)^2，熔断中间过渡带梯度。
-    3. 各项异性非对称 Huber 惩罚:
-       - 预测高于真值(虚报) 乘以 k_fp = 2.0，预测低于真值(漏报) 乘以 k_fn = 0.5。
-    4. 功率降档补偿:
-       - 全局乘以 1.8 因子补偿双峰调制带来的数值功率降档。
+    1. 动态真值主轨回归 (W_GT_dynamic)：
+       - 投影深度误差正交清洗：使用预测法线与视线射线的余弦因子，将绝对深度差映射为视点不变的表面正交距离。
+       - Cauchy 映射：将三角形平均正交误差 E_tri 转换为动态置信度真值，随前向重建精度实时协变。
+       - 纯 L1 损失监督主干，消除量纲炸弹与对抗梯度。
+    2. 静态几何特定区间辅助监督 (L_aux)：
+       - 对 tri_conf_gt (W_GT_static) 极值区进行区间锁定。
+       - 在 >= 0.8 (绝对大平面) 区，惩罚 W_pred < 0.8 的部分；
+       - 在 <= 0.2 (绝对曲折/噪点) 且点数 >= 3 区，惩罚 W_pred > 0.2 的部分；
+       - 彻底放过 0.2 ~ 0.8 灰区，解除光度-几何冲突，大图置信度强力去噪。
     """
     device = pixel_depth_pred.device
     B, _, H, W = pixel_depth_pred.shape
@@ -528,145 +523,13 @@ def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_
     if pixel_normal_pred.shape[1] != 3 and pixel_normal_pred.shape[-1] == 3:
         pixel_normal_pred = pixel_normal_pred.permute(0, 3, 1, 2)
 
-    # 获得 GT 深度的 H, W 尺寸 (在 Stage 0 下计算)
-    H_gt, W_gt = pixel_depth_gt.shape[-2], pixel_depth_gt.shape[-1]
-
     if tri_id_map.dim() == 3:
         tri_id_map = tri_id_map.unsqueeze(1)
     elif tri_id_map.shape[-1] == 1 and tri_id_map.dim() == 4:
         tri_id_map = tri_id_map.permute(0, 3, 1, 2)
 
     # =====================================================================
-    # 2. 🚀【悬边噪点 Dropout 机制】
-    # =====================================================================
-    # 计算深度突变以识别深度断裂线（突变阈值 0.25米）
-    dx = torch.abs(pixel_depth_gt[:, :, :, 1:] - pixel_depth_gt[:, :, :, :-1])
-    dy = torch.abs(pixel_depth_gt[:, :, 1:, :] - pixel_depth_gt[:, :, :-1, :])
-    dx = F.pad(dx, (0, 1, 0, 0), mode='replicate')
-    dy = F.pad(dy, (0, 0, 0, 1), mode='replicate')
-    depth_mutant = (dx > 0.25) | (dy > 0.25)
-
-    # 计算三角形 ID 的分界线（边界线）
-    tri_id_float = tri_id_map.float()
-    dtri_x = tri_id_float[:, :, :, 1:] != tri_id_float[:, :, :, :-1]
-    dtri_y = tri_id_float[:, :, 1:, :] != tri_id_float[:, :, :-1, :]
-    dtri_x = F.pad(dtri_x, (0, 1, 0, 0), mode='constant', value=False)
-    dtri_y = F.pad(dtri_y, (0, 0, 0, 1), mode='constant', value=False)
-    tri_boundary = dtri_x | dtri_y
-    
-    # 膨胀边界，使用 3x3 max_pool2d
-    tri_boundary_expanded = F.max_pool2d(tri_boundary.float(), kernel_size=3, stride=1, padding=1) > 0.5
-    
-    # 悬边噪点掩码
-    discard_mask = depth_mutant & tri_boundary_expanded
-
-    # =====================================================================
-    # 3. 🛡️ 边界过滤与有效掩码构建
-    # =====================================================================
-    edge_mask = torch.ones_like(pixel_depth_gt, dtype=torch.bool)
-    edge_mask[:, :, :, -1] = False
-    edge_mask[:, :, -1, :] = False
-
-    tri_id_shift_x = F.pad(tri_id_float[:, :, :, 1:], (0, 1, 0, 0), mode='replicate')
-    tri_id_shift_y = F.pad(tri_id_float[:, :, 1:, :], (0, 0, 0, 1), mode='replicate')
-    is_mesh_boundary = (tri_id_float != tri_id_shift_x) | (tri_id_float != tri_id_shift_y)
-
-    pixel_valid_mask = (pixel_depth_gt > 0.0) & (~torch.isnan(pixel_depth_gt)) \
-                       & edge_mask & (~is_mesh_boundary) & (~discard_mask)
-                       
-    if valid_mask is not None:
-        if valid_mask.dim() == 3: 
-            valid_mask = valid_mask.unsqueeze(1)
-        # 仅在分辨率大小一致时应用外部 valid_mask
-        if valid_mask.shape[-2] == H_gt and valid_mask.shape[-1] == W_gt:
-            pixel_valid_mask = pixel_valid_mask & (valid_mask > 0.5)
-
-    # =====================================================================
-    # 4. 🚀【3D 解析空间正交投影】
-    # =====================================================================
-    y, x = torch.meshgrid(
-        torch.arange(H_gt, device=device),
-        torch.arange(W_gt, device=device),
-        indexing='ij',
-    )
-    coords = torch.stack([x, y, torch.ones_like(x)], dim=0).float().to(device)  # [3, H_gt, W_gt]
-    coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 3, H_gt, W_gt]
-
-    if intrinsics is not None:
-        inv_k = torch.linalg.inv(intrinsics.float())
-        flat_coords = coords.view(B, 3, -1)
-        rays_cam = torch.bmm(inv_k, flat_coords).view(B, 3, H_gt, W_gt)
-    else:
-        focal = float(max(H_gt, W_gt))
-        cx, cy = (W_gt - 1) * 0.5, (H_gt - 1) * 0.5
-        rays_cam = torch.stack([(coords[:, 0] - cx) / focal, (coords[:, 1] - cy) / focal, torch.ones_like(coords[:, 0])], dim=1)
-
-    # 3D 点云
-    pts_3d = rays_cam * pixel_depth_gt  # [B, 3, H_gt, W_gt]
-
-    # 获取物理 GT 法向量进行拟合
-    if pixel_normal_gt is None:
-        # 在线计算 GT 法向量进行兜底
-        P_right = F.pad(pts_3d[:, :, :, 1:], (0, 1, 0, 0), mode='replicate')
-        P_down = F.pad(pts_3d[:, :, 1:, :], (0, 0, 0, 1), mode='replicate')
-        v1 = P_right - pts_3d
-        v2 = P_down - pts_3d
-        n_gt_raw = torch.cross(v1, v2, dim=1)
-        pixel_normal_gt = F.normalize(n_gt_raw, p=2, dim=1)
-    else:
-        if pixel_normal_gt.shape[1] != 3 and pixel_normal_gt.shape[-1] == 3:
-            pixel_normal_gt = pixel_normal_gt.permute(0, 3, 1, 2)
-        pixel_normal_gt = F.normalize(pixel_normal_gt, p=2, dim=1)
-
-    # =====================================================================
-    # 5. 🎯【GPU 高性能归约统计】
-    # =====================================================================
-    flat_tri_ids = tri_id_map.view(B, -1).long()
-    flat_mask = pixel_valid_mask.view(B, -1).float()
-
-    is_bg_pixel = (flat_tri_ids < 0)
-    flat_tri_ids = torch.where(is_bg_pixel, torch.zeros_like(flat_tri_ids), flat_tri_ids)
-    flat_mask = flat_mask * (~is_bg_pixel).float()
-
-    flat_pts = pts_3d.view(B, 3, -1)
-    flat_normals = pixel_normal_gt.view(B, 3, -1)
-
-    tri_pts_sum = torch.zeros(B, 3, num_triangles, device=device)
-    tri_normal_sum = torch.zeros(B, 3, num_triangles, device=device)
-    tri_z_sum = torch.zeros(B, num_triangles, device=device)
-    tri_z2_sum = torch.zeros(B, num_triangles, device=device)
-    tri_count = torch.zeros(B, num_triangles, device=device)
-
-    expanded_index = flat_tri_ids.unsqueeze(1).expand(-1, 3, -1)
-    tri_pts_sum.scatter_add_(dim=2, index=expanded_index, src=flat_pts * flat_mask.unsqueeze(1))
-    tri_normal_sum.scatter_add_(dim=2, index=expanded_index, src=flat_normals * flat_mask.unsqueeze(1))
-    tri_z_sum.scatter_add_(dim=1, index=flat_tri_ids, src=flat_pts[:, 2, :] * flat_mask)
-    tri_z2_sum.scatter_add_(dim=1, index=flat_tri_ids, src=(flat_pts[:, 2, :] ** 2) * flat_mask)
-    tri_count.scatter_add_(dim=1, index=flat_tri_ids, src=flat_mask)
-
-    # 计算重心和平均法向
-    centroid = tri_pts_sum / (tri_count.unsqueeze(1) + eps)
-    n_avg = F.normalize(tri_normal_sum, p=2, dim=1)
-
-    # 映射回像素空间计算正交距离
-    expanded_flat_tri_ids = flat_tri_ids.unsqueeze(1).expand(-1, 3, -1)
-    flat_centroid = torch.gather(centroid, dim=2, index=expanded_flat_tri_ids)
-    flat_n_avg = torch.gather(n_avg, dim=2, index=expanded_flat_tri_ids)
-    flat_dist = torch.abs(torch.sum((flat_pts - flat_centroid) * flat_n_avg, dim=1))  # [B, HW]
-
-    # 三角形绝对正交残差
-    tri_error_sum = torch.zeros(B, num_triangles, device=device)
-    tri_error_sum.scatter_add_(dim=1, index=flat_tri_ids, src=flat_dist * flat_mask)
-    E_tri = tri_error_sum / (tri_count + eps)
-
-    # 深度标准差 (Z-std)
-    mean_z = tri_z_sum / (tri_count + eps)
-    mean_z2 = tri_z2_sum / (tri_count + eps)
-    z_var = torch.clamp(mean_z2 - mean_z ** 2, min=0.0)
-    z_std = torch.sqrt(z_var + eps)
-
-    # =====================================================================
-    # 6. 🎯【静态置信度真值生成机制】
+    # 2. 复用刚性深度范围并注入课程学习进度
     # =====================================================================
     if depth_range is not None:
         min_d, max_d = depth_range
@@ -676,78 +539,200 @@ def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_
     else:
         span = 400.0
 
+    # 课程学习温标 Schedules
     sigma_max = span * 0.015
     sigma_min = span * 0.0065
     prog_val = max(0.0, min(float(progress), 1.0))
-    adaptive_sigma = max(sigma_max * (1.0 - prog_val) + sigma_min * prog_val, 0.1)
-
-    scale_compensator = 1.0 + 1.5 * torch.exp(-tri_count / 30.0)
-    sigma_adapted = adaptive_sigma * scale_compensator
-    conf_large = 1.0 / (1.0 + (E_tri / sigma_adapted) ** 2)
-
-    # 极小面片采用深度标准差门控 (小于 3 厘米视为微观平面)
-    conf_small = torch.where(z_std < 0.03, torch.ones_like(E_tri), torch.zeros_like(E_tri))
-    
-    # 恢复原分辨率 Stage 0 的点数带宽，大中三角形起算点恢复为 15
-    W_GT_static = torch.where(tri_count >= 15, conf_large, conf_small)
-    # 点数不足 4 个的超碎面不参与损失计算 (设为 0)
-    W_GT_static = torch.where(tri_count >= 4, W_GT_static, torch.zeros_like(W_GT_static))
-    W_GT_static = W_GT_static.unsqueeze(-1).detach()  # [B, num_triangles, 1]
+    adaptive_sigma = sigma_max * (1.0 - prog_val) + sigma_min * prog_val
+    adaptive_sigma = max(adaptive_sigma, 0.1)
 
     # =====================================================================
-    # 7. 🔥【三位一体协同损失与非对称惩罚】
+    # 3. 🚀【3D 解析空间正交清洗：利用外层传入解析法线直接通流】
     # =====================================================================
-    diff = W_pred - W_GT_static
-    abs_diff = torch.abs(diff)
-
-    # 7.a 区间忽略 (Margin-free Interval Loss)
-    gray_mask = (W_GT_static >= 0.3) & (W_GT_static <= 0.7)
-    abs_diff_adjusted = torch.where(gray_mask, torch.clamp(abs_diff - 0.2, min=0.0), abs_diff)
-    diff_adjusted = torch.sign(diff) * abs_diff_adjusted
-
-    # 7.b Huber 损失计算
-    loss_huber = torch.where(
-        torch.abs(diff_adjusted) < 0.1,
-        0.5 * (diff_adjusted ** 2) / 0.1,
-        torch.abs(diff_adjusted) - 0.05
+    # 3.a 构造纯净相机晶格位置矩阵
+    y, x = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij',
     )
+    coords = torch.stack([x, y, torch.ones_like(x)], dim=0).float().to(device)  # [3, H, W]
+    coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 3, H, W]
 
-    # 7.c 双峰梯度调制
-    w_loss = 4.0 * ((W_GT_static - 0.5) ** 2)
-
-    # 7.d 各项异性非对称权重 (虚报惩罚 2.0，漏报折算为 0.5)
-    asym_weight = torch.where(diff_adjusted > 0, torch.tensor(2.0, device=device), torch.tensor(0.5, device=device))
-    loss_conf_per_tri = loss_huber * asym_weight * w_loss
-
-    # =====================================================================
-    # 8. 🛡️【有效掩码与量纲功率补偿】
-    # =====================================================================
-    # 高清分辨率下参与监督的三角形有效像素门控设为 >= 4
-    valid_tri_mask = (tri_count >= 4).unsqueeze(-1)
-    loss_valid = loss_conf_per_tri[valid_tri_mask]
-    
-    if loss_valid.numel() == 0:
-        loss_final = torch.tensor(0.0, device=device, requires_grad=True)
+    # 3.b 提取物理视锥射线 field 形态
+    if intrinsics is not None:
+        inv_k = torch.linalg.inv(intrinsics.float())
+        flat_coords = coords.view(B, 3, -1)
+        rays_cam = torch.bmm(inv_k, flat_coords).view(B, 3, H, W)
     else:
-        loss_final = loss_valid.mean() * 1.8
+        focal = float(max(H, W))
+        cx, cy = (W - 1) * 0.5, (H - 1) * 0.5
+        rays_cam = torch.stack([(coords[:, 0] - cx) / focal, (coords[:, 1] - cy) / focal, torch.ones_like(coords[:, 0])], dim=1)
+
+    # 归一化提取单位视线射线总线 rays_unit
+    rays_unit = F.normalize(rays_cam, p=2, dim=1)  # [B, 3, H, W]
+
+    # 3.c 刚性对齐预测单位法向量
+    N_pred = F.normalize(pixel_normal_pred, p=2, dim=1)  # [B, 3, H, W]
+
+    # 3.d 计算流形正交投影余弦因子 cos_theta = |n_pred · r_unit|
+    cos_theta = torch.abs(torch.sum(N_pred * rays_unit, dim=1, keepdim=True))  # [B, 1, H, W]
+    cos_theta = torch.clamp(cos_theta, min=0.1, max=1.0)
+
+    # 将射线深度绝对差值点乘余弦，还原为表面正交距离
+    pixel_err_map = torch.abs(pixel_depth_pred - pixel_depth_gt) * cos_theta
 
     # =====================================================================
-    # 9. 🎨【还原像素空间置信度真值用于 TensorBoard】
+    # 4. 🔥【拓扑双重边界隔离锁机制维系】
     # =====================================================================
-    # 优先采用传入的 1/2 分辨率的 tri_id_map_s1 进行反投影，以便在 TensorBoard 完美显示
-    target_tri_id_map = tri_id_map_s1 if tri_id_map_s1 is not None else tri_id_map
-    if target_tri_id_map.dim() == 3:
-        target_tri_id_map = target_tri_id_map.unsqueeze(1)
-    elif target_tri_id_map.shape[-1] == 1 and target_tri_id_map.dim() == 4:
-        target_tri_id_map = target_tri_id_map.permute(0, 3, 1, 2)
-        
-    B_out, _, H_out, W_out = target_tri_id_map.shape
-    tri_id_map_sq = target_tri_id_map.squeeze(1)
-    tri_id_flat_dense = tri_id_map_sq.view(B_out, -1, 1)
+    edge_mask = torch.ones_like(pixel_depth_pred, dtype=torch.bool)
+    edge_mask[:, :, :, -1] = False
+    edge_mask[:, :, -1, :] = False
+
+    tri_id_float = tri_id_map.float()
+    tri_id_shift_x = F.pad(tri_id_float[:, :, :, 1:], (0, 1, 0, 0), mode='replicate')
+    tri_id_shift_y = F.pad(tri_id_float[:, :, 1:, :], (0, 0, 0, 1), mode='replicate')
+    is_mesh_boundary = (tri_id_float != tri_id_shift_x) | (tri_id_float != tri_id_shift_y)
+
+    pixel_valid_mask = (pixel_depth_gt > 0.0) & (~torch.isnan(pixel_depth_gt)) \
+                       & (~torch.isnan(pixel_err_map)) & edge_mask & (~is_mesh_boundary)
+                       
+    if valid_mask is not None:
+        if valid_mask.dim() == 3: 
+            valid_mask = valid_mask.unsqueeze(1)
+        if valid_mask.shape[-2] == H and valid_mask.shape[-1] == W:
+            pixel_valid_mask = pixel_valid_mask & (valid_mask > 0.5)
+
+    # =====================================================================
+    # 5. 🎯【拓扑内切锁】高性能并行 scatter_add_ 归约
+    # =====================================================================
+    flat_tri_ids = tri_id_map.view(B, -1).long()
+    flat_errors = pixel_err_map.view(B, -1)
+    flat_mask = pixel_valid_mask.view(B, -1).float()
+
+    is_bg_pixel = (flat_tri_ids < 0)
+    flat_tri_ids = torch.where(is_bg_pixel, torch.zeros_like(flat_tri_ids), flat_tri_ids)
+    flat_mask = flat_mask * (~is_bg_pixel).float()
+
+    tri_error_sum = torch.zeros(B, num_triangles, device=device)
+    tri_pixel_count = torch.zeros(B, num_triangles, device=device)
+
+    tri_error_sum.scatter_add_(dim=1, index=flat_tri_ids, src=flat_errors * flat_mask)
+    tri_pixel_count.scatter_add_(dim=1, index=flat_tri_ids, src=flat_mask)
+
+    E_tri = tri_error_sum / (tri_pixel_count + eps)
+
+    # =====================================================================
+    # 6. 相对误差 Cauchy 映射与单向凸空间回归 (动态真值主轨)
+    # =====================================================================
+    W_GT_dynamic = 1.0 / (1.0 + (E_tri / adaptive_sigma) ** 2)
+    W_GT_dynamic = torch.where(tri_pixel_count > 0, W_GT_dynamic, torch.zeros_like(W_GT_dynamic))
+    W_GT_dynamic = W_GT_dynamic.unsqueeze(-1)  # [B, N, 1]
+    
+    # 动态 L1 主损失
+    loss_conf = F.l1_loss(W_pred, W_GT_dynamic.detach(), reduction='mean')  
+
+    # =====================================================================
+    # 7. 👑【静态几何特定区间辅助监督】(Hinge 极值锚定)
+    # =====================================================================
+    loss_aux = torch.tensor(0.0, device=device)
+    W_GT_static = None
+    
+    if tri_conf_gt is not None:
+        if isinstance(tri_conf_gt, list):
+            padded_list = []
+            for b in range(B):
+                conf_tensor = tri_conf_gt[b].float().to(device)
+                N_b = conf_tensor.shape[0]
+                if N_b < num_triangles:
+                    padded = F.pad(conf_tensor, (0, num_triangles - N_b), mode='constant', value=0.0)
+                elif N_b > num_triangles:
+                    padded = conf_tensor[:num_triangles]
+                else:
+                    padded = conf_tensor
+                padded_list.append(padded)
+            W_GT_static = torch.stack(padded_list, dim=0).unsqueeze(-1)  # [B, num_triangles, 1]
+        else:
+            W_GT_static = tri_conf_gt.float().to(device)
+            if W_GT_static.dim() == 2:
+                W_GT_static = W_GT_static.unsqueeze(-1)
+                
+    if W_GT_static is not None:
+        # 轨 1：几何真平坦区 (W_GT_static >= 0.8) 监督 W_pred 至少为 0.8
+        mask_plane = (W_GT_static >= 0.8) & (tri_pixel_count.unsqueeze(-1) >= 3)
+        if mask_plane.any():
+            loss_plane_aux = torch.clamp(0.8 - W_pred[mask_plane], min=0.0).mean()
+            loss_aux = loss_aux + loss_plane_aux
+            
+        # 轨 2：几何真曲折区 (W_GT_static <= 0.2) 监督 W_pred 至多为 0.2
+        mask_curved = (W_GT_static <= 0.2) & (tri_pixel_count.unsqueeze(-1) >= 3)
+        if mask_curved.any():
+            loss_curved_aux = torch.clamp(W_pred[mask_curved] - 0.2, min=0.0).mean()
+            loss_aux = loss_aux + loss_curved_aux
+            
+    # 结合辅助损失
+    loss_final = loss_conf + loss_aux
+
+    # 还原像素空间置信度真值用于 TensorBoard
+    tri_id_flat_dense = tri_id_map.squeeze(1).view(B, -1, 1)
     valid_mask_tri = tri_id_flat_dense >= 0
     safe_index_dense = torch.where(valid_mask_tri, tri_id_flat_dense, torch.zeros_like(tri_id_flat_dense))
-    dense_flat = torch.gather(W_GT_static, dim=1, index=safe_index_dense.long())
+    dense_flat = torch.gather(W_GT_dynamic, dim=1, index=safe_index_dense.long())
     dense_flat = torch.where(valid_mask_tri, dense_flat, torch.zeros_like(dense_flat))
-    W_GT_pixel = dense_flat.permute(0, 2, 1).view(B_out, 1, H_out, W_out)
+    W_GT_pixel = dense_flat.permute(0, 2, 1).view(B, 1, H, W)
 
     return loss_final, W_GT_pixel
+
+
+def compute_heteroscedastic_depth_loss(depth_patchmatch, refined_depth, depth_gt, mask, 
+                                       W_plane_pixel=None, gamma=1.5, threshold_low=0.2, threshold_high=0.8):
+    """
+    【特异性异方差加权】深度重构损失函数 (修正版方案 B)
+    仅针对 Stage 1 的最终平面级深度预测（depth_patchmatch['stage_1'][1]）进行置信度加权，
+    其余所有阶段、所有像素级深度图均保持原版 Smooth L1 损失计算。
+    """
+    loss = 0.0
+    stage = 4
+    device = depth_gt['stage_1'].device
+
+    for l in range(1, stage):
+        depth_gt_l = depth_gt[f'stage_{l}']
+        mask_l = mask[f'stage_{l}'] > 0.5  # [B, 1, H_l, W_l]
+        
+        depth_patchmatch_l = depth_patchmatch[f'stage_{l}']
+        for i in range(len(depth_patchmatch_l)):
+            depth1 = depth_patchmatch_l[i]
+            depth2 = depth_gt_l
+            
+            # 🎯 仅在 Stage 1 的最终平面重建结果 (i == 1) 实施异方差加权
+            if l == 1 and i == 1 and W_plane_pixel is not None:
+                pixel_loss = F.smooth_l1_loss(depth1, depth2, reduction='none') # [B, 1, H_s1, W_s1]
+                
+                # 对齐置信度图分辨率并强制进行梯度阻断双保险
+                W_val = W_plane_pixel.detach()
+                if W_val.shape[2:] != pixel_loss.shape[2:]:
+                    W_aligned = F.interpolate(W_val, size=pixel_loss.shape[2:], mode='bilinear', align_corners=True).detach()
+                else:
+                    W_aligned = W_val.detach()
+                
+                # SmoothStep 极化映射：保底降低至 0.3，最大增强为 0.3 + gamma
+                x = torch.clamp((W_aligned - threshold_low) / (threshold_high - threshold_low + 1e-8), 0.0, 1.0)
+                smooth_weight = 3.0 * (x ** 2) - 2.0 * (x ** 3)
+                pixel_weight = 0.3 + gamma * smooth_weight
+                
+                weighted_loss = pixel_loss * pixel_weight
+                loss = loss + weighted_loss[mask_l].mean()
+            else:
+                # 其余阶段及 Stage 1 初始像素级深度完全保持原版
+                loss = loss + F.smooth_l1_loss(depth1[mask_l], depth2[mask_l], reduction='mean')
+
+    # Stage 0 级 Refine 深度损失保持原版
+    l = 0
+    depth_refined_l = refined_depth[f'stage_{l}']
+    depth_gt_l = depth_gt[f'stage_{l}']
+    mask_l = mask[f'stage_{l}'] > 0.5
+
+    depth1 = depth_refined_l[mask_l]
+    depth2 = depth_gt_l[mask_l]
+    loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
+
+    return loss

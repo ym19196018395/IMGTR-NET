@@ -214,17 +214,17 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         nn.init.zeros_(self.self_gate_net_n[2].weight)
 
         # 4. 【精准修改点：矩阵扩容】深度传播专属门控 (GNN_Z): 全量多模态特征总线接入
-        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) = 2H + 7
+        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
         self.gate_net_z = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 7, hidden_dim),  # 👈 扩容为 2H + 7
+            nn.Linear(hidden_dim * 2 + 9, hidden_dim),  # 👈 从 2H + 7 扩容为 2H + 9
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
 
         # 5. 【精准修改点：矩阵扩容】法向传播专属门控 (GNN_N): 全量多模态特征总线接入
-        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) = 2H + 7
+        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
         self.gate_net_n = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 7, hidden_dim),  # 👈 扩容为 2H + 7
+            nn.Linear(hidden_dim * 2 + 9, hidden_dim),  # 👈 从 2H + 7 扩容为 2H + 9
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
@@ -238,9 +238,9 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         )
 
         # 7. 【修复记忆断流：矩阵扩容】可学习内生置信度刷新头 (Confidence Predict Head)
-        # 输入特征完美解锁: init_hidden(H维) + current_costs(1维) + delta_cost(1维) + 上一步W_plane_tri先验(1维) = H + 3
+        # 输入特征完美解锁: init_hidden(H维) + current_costs(1维) + delta_cost(1维) + 上一步W_plane_tri先验(1维) + W_raw_anchor(1维) = H + 4
         self.confidence_predict_head = nn.Sequential(
-            nn.Linear(hidden_dim + 3, hidden_dim // 2),  # 👈 从 hidden_dim + 2 扩容为 + 3
+            nn.Linear(hidden_dim + 4, hidden_dim // 2),  # 👈 扩容为 + 4，支持物理锚点并网
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -336,18 +336,30 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             if W_plane_tri.dim() == 2:
                 W_plane_tri = W_plane_tri.unsqueeze(-1)  # 强制升维至 [B, N, 1]
                 
-            # 串联宏观先验特征、实时匹配代价、以及收敛速度探测器 delta_cost
-            # 此时特征量纲严格对齐 [B, N, H + 3]，绝不引爆一丁点 Linear 矩阵维度冲突！
-            W_update_input = torch.cat([init_hidden, current_costs, delta_cost, W_plane_tri], dim=-1)
+            # 物理锚点维度对齐与保底防御
+            if W_raw_anchor is not None:
+                if W_raw_anchor.dim() == 2:
+                    W_raw_anchor_in = W_raw_anchor.unsqueeze(-1)
+                else:
+                    W_raw_anchor_in = W_raw_anchor
+            else:
+                W_raw_anchor_in = torch.ones_like(W_plane_tri)
+
+            # 串联宏观先验特征、实时匹配代价、收敛速度探测器、上一步W_plane_tri先验、以及物理冷启动初始置信度
+            # 此时特征量纲严格对齐 [B, N, H + 4]，完美接入扩容后的 Linear 矩阵！
+            # 💡 【核心阻断：阻断梯度倒流】使用 init_hidden.detach() 切断置信度 Loss 对前向平面参数的扭曲反噬
+            W_update_input = torch.cat([init_hidden.detach(), current_costs, delta_cost, W_plane_tri, W_raw_anchor_in], dim=-1)
             W_plane_tri_raw = self.confidence_predict_head(W_update_input)
 
-            # 借助不确定性回归约束，值域刚性锁定
-            W_plane_tri_learn = torch.clamp(torch.sigmoid(W_plane_tri_raw), min=1e-6, max=1.0)  # 🧾 【Learn轨】
+            # 🎯 【残差修正模式】：以上一轮置信度为基准，神经网络只学习 [-0.3, 0.3] 内的修正量，实现时序累加
+            delta_W = torch.tanh(W_plane_tri_raw) * 0.3
+            W_plane_tri_learn = torch.clamp(W_plane_tri + delta_W, min=1e-6, max=1.0)  # 🧾 【Learn轨】
             W_plane_tri_reg = W_plane_tri_learn.detach()  # 🛡️ 【Reg轨】
   
         # =====================================================================
         # 4. 双重完全解耦门控计算 (自卫分配与邻居流形熔断)
         # =====================================================================
+        # 还原 self_gate_input 维度 (依然是 hidden_dim + 1)，不改网络结构
         self_gate_input = torch.cat([init_hidden, current_costs], dim=-1)
 
         # 4.a 拆分为两个独立的自身 Logit 预测通路
@@ -362,21 +374,27 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
         self_hidden_expand = init_hidden.unsqueeze(2).expand(-1, -1, 3, -1)
 
+        # 提取自身置信度与邻居置信度做门控输入
+        W_self_expand = W_plane_tri_reg.unsqueeze(2).expand(-1, -1, 3, -1)
+        neighbor_W_conf = W_plane_tri_reg[batch_idx, neighbor_indices]
+
         # 4.b 深度通道邻居 Logits 预测
-        # 将 [隐特征、完整的 4维 plane_diff、断裂概率、邻居代价、高频视觉距离] 无损打包
-        # 形状完全契合扩容后的 [B, N, 3, 2H + 7]
+        # 将 [隐特征、完整的 4维 plane_diff、断裂概率、邻居代价、高频视觉距离、自身置信度、邻居置信度] 无损打包
+        # 形状完全契合扩容后的 [B, N, 3, 2H + 9]
         gate_input_z = torch.cat([
             self_hidden_expand, neighbor_hidden,
-            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist
+            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
+            W_self_expand, neighbor_W_conf
         ], dim=-1)
         neighbor_logits_z = self.gate_net_z(gate_input_z)  # [B, N, 3, 1]
 
         # 4.c 🔥 【精准更替：满血版法向门控输入】
         # 让法向流和深度流享有完全同等的“知情权”，同样通过全模态总线过滤边缘与曲面拉扯
-        # 形状完全契合扩容后的 [B, N, 3, 2H + 7]
+        # 形状完全契合扩容后的 [B, N, 3, 2H + 9]
         gate_input_n = torch.cat([
             self_hidden_expand, neighbor_hidden,
-            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist
+            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
+            W_self_expand, neighbor_W_conf
         ], dim=-1)
         neighbor_logits_n = self.gate_net_n(gate_input_n)  # [B, N, 3, 1]
 
