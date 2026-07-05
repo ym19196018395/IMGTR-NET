@@ -1066,6 +1066,8 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
                     'edges_midpoints': 边对应的中点已经归一化 List[B] of [E, 2]
                     'tri_pixel_counts_list':每个三角形的数量 # List[B] of [N_tri]
                     'tri_id_map_stage0': [B, H, W] 密集三角形索引图 (值域 0~N-1, -1为无效)
+                    'edges_midpoints': edges_midpoints_list, # List[B] of [E, 2]
+                    'edges_endpoints': edges_endpoints_list,  # List[B] of [E, 2, 2]
                 }
     """
 
@@ -1403,28 +1405,28 @@ def build_neighbor_indices(tri_infos, max_tri_num, device, return_batched=True):
 
 def convert_edge_features_to_tri_format(edge_alphas_list, tri_infos, max_tri_num, device):
     """
-    将边级别的特征 (alphas 和 midpoints) 转换为三角形级别的格式 [B, N_max, 3, ...]
+    将边级别的特征 (alphas, midpoints, endpoints) 转换为三角形级别的格式 [B, N_max, 3, ...]
     Args:
         edge_alphas_list: list[B], 每个元素是 [E_b] (EdgeHead输出)
-        tri_infos: 包含 tri_edge_ids_list 和 edges_midpoints 的字典
+        tri_infos: 包含 tri_edge_ids_list, edges_midpoints 和 edges_endpoints 的字典
         max_tri_num: int, 最大三角形数量（用于Padding）
         device: 计算设备
 
     Returns:
         edge_probs: Tensor [B, max_tri_num, 3]
         aligned_midpoints_norm: Tensor [B, max_tri_num, 3, 2] (归一化到 [-1, 1] 的边中点)
+        aligned_endpoints_norm: Tensor [B, max_tri_num, 3, 2, 2] (归一化到 [-1, 1] 的边端点)
     """
     tri_edge_ids_list = tri_infos[0]['tri_edge_ids_list']
-    edges_midpoints_list = tri_infos[0]['edges_midpoints']  # 你之前新增的归一化中点列表
+    edges_midpoints_list = tri_infos[0]['edges_midpoints']  # 归一化中点列表
+    edges_endpoints_list = tri_infos[0].get('edges_endpoints', None)  # 归一化端点列表
     batch_num_tri = tri_infos[0]['batch_num_tri']
     B = len(edge_alphas_list)
 
     # 1. 初始化返回容器
-    # edge_probs 初始化为 1.0（默认阻断，安全垫底）
     edge_probs = torch.ones((B, max_tri_num, 3), dtype=torch.float32, device=device)
-
-    # aligned_midpoints_norm 初始化为 0.0 (中心点，实际上无效边不会产生 loss，所以填什么都行)
     aligned_midpoints_norm = torch.zeros((B, max_tri_num, 3, 2), dtype=torch.float32, device=device)
+    aligned_endpoints_norm = torch.zeros((B, max_tri_num, 3, 2, 2), dtype=torch.float32, device=device)
 
     total_invalid = 0
 
@@ -1444,19 +1446,24 @@ def convert_edge_features_to_tri_format(edge_alphas_list, tri_infos, max_tri_num
         num_invalid = invalid_mask.sum().item()
         if num_invalid > 0:
             total_invalid += num_invalid
-            # print(f"⚠️ Batch {b}: {num_invalid}/{tri_edge_ids.numel()} edge IDs invalid")
 
-        # === Padding Trick (为 -1 的无效边准备垫片) ===
-        # 1. 垫概率: 末尾追加 1.0 (代表断裂)
+        # === Padding Trick ===
+        # 1. 垫概率
         padded_alphas = torch.cat([edge_alphas, torch.tensor([1.0], dtype=edge_alphas.dtype, device=device)])
 
-        # 2. 垫中点: 末尾追加 [0.0, 0.0]
+        # 2. 垫中点
         padded_midpoints = torch.cat(
             [edge_midpoints, torch.tensor([[0.0, 0.0]], dtype=edge_midpoints.dtype, device=device)], dim=0)
 
+        # 3. 垫端点
+        if edges_endpoints_list is not None:
+            edge_endpoints = edges_endpoints_list[b].to(device)  # [E_b, 2, 2]
+            padded_endpoints = torch.cat(
+                [edge_endpoints, torch.zeros((1, 2, 2), dtype=edge_endpoints.dtype, device=device)], dim=0)
+        else:
+            padded_endpoints = torch.zeros((E_max + 1, 2, 2), dtype=torch.float32, device=device)
+
         # === 安全映射 ===
-        # 将无效的 id (-1 或 越界) 映射为最后一行的索引 (即垫片的位置)
-        # 注意：这里我们使用 E_max 作为垫片的索引，因为 padded 数组的长度是 E_max + 1
         safe_edge_ids = torch.where(
             ~invalid_mask,
             tri_edge_ids,
@@ -1464,18 +1471,14 @@ def convert_edge_features_to_tri_format(edge_alphas_list, tri_infos, max_tri_num
         )
 
         # === 同步提取 (Gather) ===
-        # 提取概率 -> [N_tri, 3]
-        gathered_probs = padded_alphas[safe_edge_ids]
-        edge_probs[b, :N_tri, :] = gathered_probs
-
-        # 提取中点 -> [N_tri, 3, 2]
-        gathered_midpoints = padded_midpoints[safe_edge_ids]
-        aligned_midpoints_norm[b, :N_tri, :, :] = gathered_midpoints
+        edge_probs[b, :N_tri, :] = padded_alphas[safe_edge_ids]
+        aligned_midpoints_norm[b, :N_tri, :, :] = padded_midpoints[safe_edge_ids]
+        aligned_endpoints_norm[b, :N_tri, :, :, :] = padded_endpoints[safe_edge_ids]
 
     if total_invalid > 0:
         print(f"📊 Total invalid edge IDs mapped to safe padding across all batches: {total_invalid}")
 
-    return edge_probs, aligned_midpoints_norm
+    return edge_probs, aligned_midpoints_norm, aligned_endpoints_norm
 
 # --------------------------------------------
 # 通用采样函数：对三角形的 (质心 + 3个顶点) 进行采样并取平均
@@ -1511,7 +1514,7 @@ def _sample_map(map_tensor, centers, vertices):
 
 
 def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, device='cpu', overlay_alpha=0.7,
-                                 line_thickness=2):
+                                 line_thickness=2, force_color=None):
     """
     基于真实边像素(edges_pixels)生成断裂预测热力图。(修复版)
     """
@@ -1599,6 +1602,9 @@ def generate_edge_alpha_overlays(ref_imgs, edge_alphas_list, edges_pixels_list, 
             prob = np.clip(prob, 0.0, 1.0)
             color_idx = int(prob * 255)
             color = colormap_lut[color_idx].tolist()  # (B, G, R)
+            
+            if force_color is not None:
+                color = force_color  # 覆盖颜色
 
             # 1. 转为 numpy float
             pts_norm = np.array(pixels, dtype=np.float32)

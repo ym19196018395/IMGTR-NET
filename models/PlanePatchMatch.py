@@ -251,7 +251,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs, rays_centroids, depth_max,prev_costs,W_plane_tri,
-                pixel_counts=None, ref_feature=None, centroids_norm=None, temperature=0.2, W_raw_anchor=None):
+                pixel_counts=None, ref_feature=None, centroids_norm=None, temperature=0.2, 
+                W_raw_anchor=None, cross_costs=None):
         """
         前向双解耦核心计算图流动
         Args:
@@ -313,7 +314,13 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
         neighbor_hidden = init_hidden[batch_idx, neighbor_indices]  # [B, N, 3, H]
         neighbor_scaled_planes = scaled_planes[batch_idx, neighbor_indices]  # [B, N, 3, 4]
-        neighbor_costs = current_costs[batch_idx, neighbor_indices]  # [B, N, 3, 1]
+        
+        # [修改点]：如果提供了 cross_costs，则使用真实的客场代价！
+        if cross_costs is not None:
+            neighbor_costs = cross_costs.unsqueeze(-1) # [B, N, 3, 1]
+        else:
+            neighbor_costs = current_costs[batch_idx, neighbor_indices]  # [B, N, 3, 1]
+
 
         self_scaled_expand = scaled_planes.unsqueeze(2)  # [B, N, 1, 4]
         plane_diff = neighbor_scaled_planes - self_scaled_expand  # [B, N, 3, 4]
@@ -962,7 +969,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # 物理距离 + 角度惩罚
         weighted_energy = W_final * E_geom
 
-        weight_sum = (W_ij * area_weights.unsqueeze(2)).sum().clamp(min=1e-6)
+        weight_sum = W_final.sum().clamp(min=1e-6)
         L_smooth = weighted_energy.sum() / weight_sum
 
         # --- 诊断打印 ---
@@ -1102,6 +1109,7 @@ class PlanePatchMatchModule(nn.Module):
         self.fitter = fitter_module
         # 动态实例化 Visualizer 以适应当前 H, W
         visualizer = PlaneVisualizer(H, W, device)
+        
         # ==========================================
         # 1. 数据准备 (Data Preparation)
         # ==========================================
@@ -1176,10 +1184,14 @@ class PlanePatchMatchModule(nn.Module):
         pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map, H, W)
 
         # 3.2 运行端到端可微重采样，解算出全假设、全像素的匹配代价特征图 -> [B, H, W, K]
-        pixel_costs = self.compute_costs(
+        pixel_costs, pixel_costs_raw, cost_variance = self.compute_costs(
             ref_feature, src_features, ref_proj, src_projs,
-            pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics
+            pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics,
+            is_debug_diag=True
         )
+        self.pixel_costs_raw = pixel_costs_raw
+        self.cost_variance = cost_variance
+        
         # 聚合为三角形代价 [B, N_tri, 1]
         tri_costs_volume = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
 
@@ -1250,11 +1262,32 @@ class PlanePatchMatchModule(nn.Module):
             )
 
             # 转换为三角形级别格式 [B, N_max, 3]
-            edge_probs_tensor, aligned_midpoints_norm = convert_edge_features_to_tri_format(
+            edge_probs_tensor, aligned_midpoints_norm, aligned_endpoints_norm = convert_edge_features_to_tri_format(
                     edge_alpha, tri_infos, max_tri_num, device)
 
             # 取消第一轮断流冷启动：每一轮都使用当前 W_plane_tri 参与置信度门控更新。
             W_gating_input = W_plane_tri
+
+            # ------ 【新增：Cross-Cost 零成本验证逻辑 (全量像素评估版)】 ------
+            # 1. 提取邻居平面
+            _B, _N, _ = current_planes.shape
+            _batch_idx = torch.arange(_B, device=device).view(_B, 1, 1).expand(-1, _N, 3)
+            neighbor_planes = current_planes[_batch_idx, neighbor_indices_batched] # [B, N, 3, 4]
+            
+            # 2. 将邻居平面广播到密集像素阵列 [B, H, W, 3, 4]
+            pixel_hypotheses_cross = self.map_tri_to_pixel(neighbor_planes, tri_id_map, H, W)
+            
+            # 3. 运行端到端光度代价计算 (客场验证) - 🛡️ 必须加上 no_grad 防止 OOM！
+            with torch.no_grad():
+                cross_costs_pixel = self.compute_costs(
+                    ref_feature, src_features, ref_proj, src_projs,
+                    pixel_hypotheses_cross, view_weights=view_weights, ref_intrinsic=ref_intrinsics,
+                    is_debug_diag=False
+                ) # [B, H, W, 3]
+            
+            # 4. 聚合并提纯到面片维度 [B, N, 3]
+            cross_costs_flat = self.aggregate_costs_per_triangle(cross_costs_pixel, tri_id_map, max_tri_num)
+            # ----------------------------------------------------
 
             # 5.1 ym-modify 传播：全新双解耦网络，完美注入 W_plane_tr，在传播中不断更新w_plane
             new_planes,W_plane_tri_learn = self.propagator(
@@ -1270,7 +1303,8 @@ class PlanePatchMatchModule(nn.Module):
                 centroids_norm=centroids_norm,
                 pixel_counts=pixel_counts_tensor,
                 temperature=current_temp,  # 可根据当前训练的 Epoch 动态退火压低
-                W_raw_anchor=W_raw_anchor  # 刚性投递，防止置信度头多轮迭代后神经失忆
+                W_raw_anchor=W_raw_anchor,  # 刚性投递，防止置信度头多轮迭代后神经失忆
+                cross_costs=cross_costs_flat # 传入 Cross-Cost
             )
 
             # 将本轮的代价封存，作为下一轮的“历史代价”
@@ -1467,7 +1501,7 @@ class PlanePatchMatchModule(nn.Module):
         return pixel_hypotheses
 
     def compute_costs(self, ref_feature, src_features, ref_proj, src_projs, current_hypotheses, view_weights,
-                      ref_intrinsic,is_debug=True):
+                      ref_intrinsic, is_debug=True, is_debug_diag=False):
         """
         计算代价体积 (Cost Volume)
         Args:
@@ -1512,6 +1546,7 @@ class PlanePatchMatchModule(nn.Module):
         # 🔥 修复 1：准备累加特征，而不是累加分数
         similarity_sum = 0.0
         weight_sum = 0.0
+        view_scores = []
 
         # 遍历所有源视图
         for i, (src_feat, src_proj) in enumerate(zip(src_features, src_projs)):
@@ -1561,6 +1596,9 @@ class PlanePatchMatchModule(nn.Module):
             # Similarity: [B*K, G, H, W]
             similarity = (warped_src_norm * ref_feat_norm).mean(dim=2)
 
+            # 收集每个视角的分数并分组求平均，形状为 [B*K, 1, H, W]
+            view_scores.append(similarity.mean(dim=1, keepdim=True))
+
             del warped_src, warped_src_grouped, warped_src_norm, ref_feat_norm  # 释放显存
 
             # =========================================================
@@ -1595,6 +1633,19 @@ class PlanePatchMatchModule(nn.Module):
 
         # 还原形状 [B*K, 1, H, W] -> [B, K, H, W] -> [B, H, W, K]
         total_cost = cost_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+        if is_debug_diag:
+            # 1. 未加权的平均代价：[B*K, Nview-1, H, W] -> mean -> [B*K, 1, H, W]
+            all_scores = torch.cat(view_scores, dim=1)
+            raw_score = all_scores.mean(dim=1, keepdim=True)
+            raw_cost_fused = -raw_score
+            raw_cost = raw_cost_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+            # 2. 各视图相似度的方差 (无偏估计)：[B*K, 1, H, W] -> 还原形状 [B, H, W, K]
+            variance_fused = all_scores.var(dim=1, keepdim=True, unbiased=False)
+            cost_variance = variance_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+            return total_cost, raw_cost, cost_variance
 
         return total_cost
 

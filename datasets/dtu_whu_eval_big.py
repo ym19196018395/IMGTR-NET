@@ -8,6 +8,10 @@ import cv2
 
 from datasets.triangulation import get_cdt_datas
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from eval_config import GT_PLANAR_CONF_THRESHOLD, GT_PLANAR_ERR95_THRESHOLD
 
 class MVSDataset(Dataset):
     def __init__(self, datapath, listfile, mode, nviews, img_wh=(1600, 1600), **kwargs):
@@ -300,8 +304,8 @@ class MVSDataset(Dataset):
                     tri_err95 = npz_data['tri_svd_err95']
                     
                     # 极速一维判定与降级
-                    degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
-                    tri_conf[degrade_mask] = 0.75
+                    degrade_mask = (tri_conf > GT_PLANAR_CONF_THRESHOLD) & (tri_err95 > GT_PLANAR_ERR95_THRESHOLD)
+                    tri_conf[degrade_mask] = GT_PLANAR_CONF_THRESHOLD
                     
                     # 兼容新老版 npz (保存 tri_svd_plane 或 tri_svd_normal)
                     if 'tri_svd_plane' in npz_data:

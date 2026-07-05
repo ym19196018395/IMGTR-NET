@@ -540,17 +540,18 @@ class PatchmatchNet(nn.Module):
 
                 #===================对stage1 进行planepatchmatch===========================
 
+                # 1. 运行原 Stage 1 的标准像素级 PatchMatch 获取更精细的 1/2 深度图与视图权重
+                depth_pm, score, view_weights = getattr(self, f'patchmatch_{l}')(
+                    ref_feature[f'stage_{l}'], src_features_l,
+                    ref_proj, src_projs,
+                    depth_min, depth_max, depth=depth, img=getattr(self, f'imgs_{l}_ref'), view_weights=view_weights
+                )
+
                 # 根据stage2粗深度图来拟合stage1的法向量和深度图
                 tri_infos = []
-                depth_stage2_raw = depth_patchmatch['stage_2'][-1]
 
-                # 利用 Stage 1 的高频图像特征，进行保边平滑上采样
-                depth_stage1_init = self.stage1_refine(
-                    ref_feature=ref_feature[f'stage_{l}'],  # [B, 16, H/2, W/2]
-                    depth_0=depth_stage2_raw,  # [B, 1, H/4, W/4]
-                    depth_min=depth_min,
-                    depth_max=depth_max
-                )
+                # 不经过双边残差网络上采样，直接使用 Stage 1 PatchMatch 的输出深度图
+                depth_stage1_init = depth_pm[-1]
 
                 # 获得stage1的长和宽
                 _, _, height, width = depth_stage1_init.size()
@@ -640,6 +641,24 @@ class PatchmatchNet(nn.Module):
                 output_plane['W_plane_pixel_init'] = W_plane_pixel_init
                 output_plane['W_plane_tri'] = W_plane_tri
                 output_plane['W_plane_tri_init'] = W_plane_tri_init
+                
+                # 计算用于光度 Ambiguity 诊断的 pixel_cost_min 和 view_weights_mean
+                # pixel_costs 形状为 [B, H, W, K], 在 K 维度取 min 得到最匹配代价并升维
+                pixel_cost_min = torch.min(pixel_costs, dim=3)[0].unsqueeze(1) # [B, 1, H, W]
+                # view_weights 形状为 [B, Nview-1, H, W], 在视角维度求均值并升维
+                view_weights_mean = torch.mean(view_weights, dim=1, keepdim=True) # [B, 1, H, W]
+
+                output_plane['pixel_cost_min'] = pixel_cost_min
+                output_plane['view_weights_mean'] = view_weights_mean
+
+                # 读取并塞入未加权代价与方差图
+                pixel_costs_raw = getattr(self.plane_patchmatch_agent, 'pixel_costs_raw', None)
+                cost_variance = getattr(self.plane_patchmatch_agent, 'cost_variance', None)
+                if pixel_costs_raw is not None:
+                    output_plane['pixel_cost_min_raw'] = pixel_costs_raw.permute(0, 3, 1, 2)  # [B, 1, H, W]
+                if cost_variance is not None:
+                    output_plane['cost_variance'] = cost_variance.permute(0, 3, 1, 2)  # [B, 1, H, W]
+                output_plane['view_weights_mean'] = view_weights_mean
 
                 # 取法向量
                 # tri_normals = before_guess_planes[..., :3]  # 形状变为 [B, N_tri, 3]
@@ -700,6 +719,10 @@ class PatchmatchNet(nn.Module):
         # 以及完好无损的 Z_base, N_base 和像素级无泄漏死区遮罩 M_gating_s0
         refined_depth['stage_0'] = Z_final
         output_plane['final_normal'] = N_final
+        
+        # 👑 架构师诊断探测针：向外输送 Stage 1 的特征网络张量，用于外围可视化纯净 DoH
+        output_plane['ref_feature_s1'] = ref_feature['stage_1'].detach()
+        
         del depth, ref_feature, src_features
 
         if self.training:

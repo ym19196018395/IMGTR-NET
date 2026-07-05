@@ -1,4 +1,8 @@
 import argparse
+
+from eval_config import GT_PLANAR_CONF_THRESHOLD, PRED_PLANAR_CONF_THRESHOLD
+
+
 import os
 
 from matplotlib import pyplot as plt
@@ -33,6 +37,125 @@ import resource
 import platform
 
 error_num=0.2
+
+def visualize_diagnostic_maps(outdir, filename, pixel_cost_min, view_weights_mean, pixel_cost_min_raw, cost_variance, W_plane_pixel, depth_gt, depth_est_2d):
+    """
+    自愈可视化诊断工具：生成并保存已加权/未加权代价图、视角方差图以及带符号误差图（Signed Error Map）。
+    """
+    # 延迟加载防止主线程开销
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def make_2d_or_rgb(arr):
+        if arr is None:
+            return None
+        arr_s = np.squeeze(arr)
+        if arr_s.ndim == 3:
+            # 如果第一维是通道维，且大小不等于后两维（通道数较小）
+            if arr_s.shape[0] < arr_s.shape[1] and arr_s.shape[0] < arr_s.shape[2]:
+                arr_s = np.min(arr_s, axis=0)
+            # 如果最后一维是通道维，且大小不是 3 或 4
+            elif arr_s.shape[2] != 3 and arr_s.shape[2] != 4:
+                if arr_s.shape[2] == 1:
+                    arr_s = arr_s[:, :, 0]
+                else:
+                    arr_s = np.min(arr_s, axis=2)
+        return arr_s
+
+    # 0. 准备黄金平面观测范围：直接以映射完的离线真值平面置信度大于 0.80 的区域为掩码，
+    w_s = make_2d_or_rgb(W_plane_pixel)
+    gt_s = make_2d_or_rgb(depth_gt)
+    
+    if w_s is not None:
+        flat_mask = (w_s > GT_PLANAR_CONF_THRESHOLD)
+        if gt_s is not None:
+            flat_mask = flat_mask & (gt_s > 0.0)
+    else:
+        flat_mask = None
+
+    # 对比度自适应拉伸并在 RGB 三通道层面物理抹黑背景的函数
+    def stretch_and_blacken_bg(arr, mask, cmap_name='jet'):
+        if arr is None:
+            return None
+        arr_s = make_2d_or_rgb(arr)
+        
+        # 1. 仅在 mask 平面内部进行 Min-Max 对比度自适应拉伸
+        if mask is not None and mask.shape == arr_s.shape:
+            flat_vals = arr_s[mask]
+            if flat_vals.size > 10:
+                min_v = np.min(flat_vals)
+                max_v = np.max(flat_vals)
+                # 线性映射到 [0.0, 1.0]
+                stretched = (arr_s - min_v) / (max_v - min_v + 1e-8)
+                stretched = np.clip(stretched, 0.0, 1.0)
+            else:
+                stretched = np.zeros_like(arr_s)
+        else:
+            stretched = (arr_s - arr_s.min()) / (arr_s.max() - arr_s.min() + 1e-8)
+            stretched = np.clip(stretched, 0.0, 1.0)
+            
+        # 2. 将拉伸后的 2D 矩阵通过 Colormap 转换为 RGB 图像 (数据范围 0.0~1.0)
+        cmap = plt.get_cmap(cmap_name)
+        rgb_img = cmap(stretched)[..., :3] # 去掉 Alpha 得到 [H, W, 3]
+        
+        # 3. 对非掩码背景像素，在三通道上直接赋予 [0.0, 0.0, 0.0] 物理置黑
+        if mask is not None:
+            rgb_img[~mask] = 0.0
+            
+        return rgb_img
+
+    # 1. 可视化最小匹配代价图 (已加权，平地局部对比度自适应拉伸)
+    if pixel_cost_min is not None:
+        cost_rgb = stretch_and_blacken_bg(pixel_cost_min, flat_mask, cmap_name='jet')
+        cost_img_filename = os.path.join(outdir, filename.format('diagnostic_cost_s1', '.png'))
+        os.makedirs(os.path.dirname(cost_img_filename), exist_ok=True)
+        plt.imsave(cost_img_filename, cost_rgb)
+
+    # 2. 可视化多视平均可见性权重图 (平地局部遮挡)
+    if view_weights_mean is not None:
+        weights_rgb = stretch_and_blacken_bg(view_weights_mean, flat_mask, cmap_name='gray')
+        weights_img_filename = os.path.join(outdir, filename.format('diagnostic_view_weights_s1', '.png'))
+        os.makedirs(os.path.dirname(weights_img_filename), exist_ok=True)
+        plt.imsave(weights_img_filename, weights_rgb)
+
+    # 3. 可视化未加权匹配代价图 (Raw Cost, 平地局部对比度自适应拉伸)
+    if pixel_cost_min_raw is not None:
+        raw_rgb = stretch_and_blacken_bg(pixel_cost_min_raw, flat_mask, cmap_name='jet')
+        raw_img_filename = os.path.join(outdir, filename.format('diagnostic_cost_raw_s1', '.png'))
+        os.makedirs(os.path.dirname(raw_img_filename), exist_ok=True)
+        plt.imsave(raw_img_filename, raw_rgb)
+
+    # 4. 可视化视角相似度方差图 (Variance Map, 平地局部对比度自适应拉伸)
+    if cost_variance is not None:
+        var_rgb = stretch_and_blacken_bg(cost_variance, flat_mask, cmap_name='jet')
+        var_img_filename = os.path.join(outdir, filename.format('diagnostic_cost_variance_s1', '.png'))
+        os.makedirs(os.path.dirname(var_img_filename), exist_ok=True)
+        plt.imsave(var_img_filename, var_rgb)
+
+    # 5. 可视化带符号重建误差图 (Signed Error Map: pred - gt, [-0.20m, +0.20m] 绝对对称映射)
+    if depth_est_2d is not None and depth_gt is not None:
+        est_s = make_2d_or_rgb(depth_est_2d)
+        gt_s = make_2d_or_rgb(depth_gt)
+        if est_s is not None and gt_s is not None and est_s.shape == gt_s.shape:
+            # 计算 Signed Error: pred - gt
+            signed_err = est_s - gt_s
+            # 物理截断范围对称锁定在 [-0.20m, +0.20m]
+            v_max = 0.20
+            # 对称归一化到 [0.0, 1.0]，使 0 误差严格对齐 0.5 (纯白色)
+            stretched_err = (signed_err + v_max) / (2.0 * v_max)
+            stretched_err = np.clip(stretched_err, 0.0, 1.0)
+            
+            # 使用 RdBu_r 发散型色表 (正值红色，负值蓝色，零值白色)
+            cmap_div = plt.get_cmap('RdBu_r')
+            rgb_err = cmap_div(stretched_err)[..., :3]
+            
+            # 非平面区（~flat_mask）强行赋予 [0.0, 0.0, 0.0] 物理置黑
+            if flat_mask is not None and flat_mask.shape == rgb_err.shape[:2]:
+                rgb_err[~flat_mask] = 0.0
+                
+            err_img_filename = os.path.join(outdir, filename.format('diagnostic_signed_error_s1', '.png'))
+            os.makedirs(os.path.dirname(err_img_filename), exist_ok=True)
+            plt.imsave(err_img_filename, rgb_err)
 
 # if platform.system() == 'Linux':
 #     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -381,13 +504,72 @@ def save_depth():
             # 4. 映射到 0-255 uint8
             res_img_uint8 = (res_np * 255.0).clip(0, 255).astype(np.uint8)
 
-            # 5. 保存图片
+            # 5. 保存图片   
             # 构造文件名，例如保存为 edge_overlay.png
             filename=sample["filename"][0]
             save_path = os.path.join(args.outdir, filename.format('edge_overlay', '.png'))
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
             Image.fromarray(res_img_uint8).save(save_path)
+
+            # ====================================================================
+            # 👑 架构师新增：使用特征网络 (FeatureNet) 提取的深度特征来诊断 DoH
+            # ====================================================================
+            import matplotlib.pyplot as plt
+            ref_feat_s1 = outputs["output_plane"]["ref_feature_s1"] # [B, C, H1, W1]
+            
+            # 1. 弃用图像灰度，改用特征网络多通道能量的平方和，代表局部高维几何响应强度
+            feat_energy = (ref_feat_s1 ** 2).sum(dim=1, keepdim=True) # [B, 1, H1, W1]
+            
+            # 2. 计算二阶差分 (Hessian 矩阵元素)
+            f_xx = F.pad(feat_energy[..., 2:] - 2*feat_energy[..., 1:-1] + feat_energy[..., :-2], (1, 1, 0, 0), 'replicate')
+            f_yy = F.pad(feat_energy[..., 2:, :] - 2*feat_energy[..., 1:-1, :] + feat_energy[..., :-2, :], (0, 0, 1, 1), 'replicate')
+            
+            # 交叉二阶导数的纯中心差分公式：(f(x+1,y+1) - f(x-1,y+1) - f(x+1,y-1) + f(x-1,y-1))/4
+            f_xy_raw = (feat_energy[..., 2:, 2:] - feat_energy[..., 2:, :-2] - feat_energy[..., :-2, 2:] + feat_energy[..., :-2, :-2]) / 4.0
+            f_xy = F.pad(f_xy_raw, (1, 1, 1, 1), 'replicate')
+            
+            # 3. 计算 DoH 行列式并截断负值（马鞍点）
+            doh_map = (f_xx * f_yy - f_xy**2).clamp(min=0.0)
+            
+            # 解决高频噪声爆点导致的黑洞效应：不用 max，用 98% 分位数截断长尾
+            doh_flat = doh_map.view(-1)
+            p98 = torch.quantile(doh_flat.float(), 0.98).item()
+            p98 = max(p98, 1e-6) # 保底防止除零
+            doh_norm = (doh_map / p98).clamp(max=1.0)  # [B, 1, H1, W1]
+
+            # 4. 可视化：将其转换为热力图 Tensor
+            doh_np = doh_norm[0, 0].detach().cpu().numpy()
+            doh_rgb = plt.get_cmap('jet')(doh_np)[..., :3]  # [H1, W1, 3]
+            doh_rgb_tensor_s1 = torch.from_numpy(doh_rgb).permute(2, 0, 1).unsqueeze(0).to(device).float() # [B, 3, H1, W1]
+
+            # 🚀 几何对齐校正：网格坐标已被上采样至 Stage 0 (H*2, W*2)，因此将热力图插值对齐
+            doh_rgb_tensor_s0 = F.interpolate(doh_rgb_tensor_s1, scale_factor=2.0, mode='bilinear', align_corners=False)
+
+            # 🚀 架构师新增：保存纯净的 DoH 热力图 (无网格线干扰)，以判断特征点是否在三角形内部！
+            doh_pure_np = np.transpose(doh_rgb_tensor_s0[0].detach().cpu().numpy(), (1, 2, 0))
+            doh_pure_uint8 = (doh_pure_np * 255.0).clip(0, 255).astype(np.uint8)
+            doh_pure_save_path = os.path.join(args.outdir, filename.format('diagnostic_doh_pure', '.png'))
+            os.makedirs(os.path.dirname(doh_pure_save_path), exist_ok=True)
+            Image.fromarray(doh_pure_uint8).save(doh_pure_save_path)
+
+            # 5. 叠加网格边缘 (强制使用绿色 [0, 255, 0])
+            doh_edge_overlays = generate_edge_alpha_overlays(
+                ref_imgs=doh_rgb_tensor_s0,
+                edge_alphas_list=outputs["edge_alphas"],
+                edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
+                device=device, overlay_alpha=0.6, line_thickness=1,
+                force_color=[0, 255, 0]
+            )
+
+            # 6. 保存带有网格覆盖的 DoH 诊断图
+            doh_res_tensor = doh_edge_overlays["ref_img_edge_alpha"][0]
+            doh_res_np = np.transpose(doh_res_tensor.detach().cpu().numpy(), (1, 2, 0))
+            doh_res_uint8 = (doh_res_np * 255.0).clip(0, 255).astype(np.uint8)
+            doh_save_path = os.path.join(args.outdir, filename.format('diagnostic_doh_edge', '.png'))
+            os.makedirs(os.path.dirname(doh_save_path), exist_ok=True)
+            Image.fromarray(doh_res_uint8).save(doh_save_path)
+            # ====================================================================
 
             outputs = tensor2numpy(outputs)
             del sample_cuda
@@ -432,6 +614,8 @@ def save_depth():
 
                 # 去除多余的维度
                 depth_est = np.squeeze(depth_est)
+
+
 
                 # ====================================================================
                 # 👑 【新增静态软平面真值】：计算 Stage 0 物理平面软置信度，并利用拓扑对齐到 Stage 1
@@ -483,7 +667,83 @@ def save_depth():
                     print("⚠️ Warning: sample 中未找到 'tri_conf_cleaned' 或 'tri_normal_cleaned'，且在线计算已移除，无法获取平面参数。")
 
                 # 生成 Ground-Truth Planar Normal Map (normal_gt_s1.png)
-                # 用户要求生成全部的平面的法向量，因此移除了原本 (planar_soft_conf_s1 > 0.80) 的优质平面置信度限制
+                # 用户要求生成全部的平面的法向量，因此移除了原本 (planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD) 的优质平面置信度限制
+                
+                # ====================================================================
+                # 👑 【自愈改造·光度 Ambiguity 可视化与 Pearson 诊断】并网
+                # ====================================================================
+                if planar_soft_conf_s1 is not None:
+                    pixel_cost_val = outputs["output_plane"]["pixel_cost_min"][b_idx] if "pixel_cost_min" in outputs["output_plane"] else None
+                    view_weights_val = outputs["output_plane"]["view_weights_mean"][b_idx] if "view_weights_mean" in outputs["output_plane"] else None
+                    pixel_cost_raw_val = outputs["output_plane"]["pixel_cost_min_raw"][b_idx] if "pixel_cost_min_raw" in outputs["output_plane"] else None
+                    cost_variance_val = outputs["output_plane"]["cost_variance"][b_idx] if "cost_variance" in outputs["output_plane"] else None
+
+                    visualize_diagnostic_maps(
+                        outdir=args.outdir,
+                        filename=filename,
+                        pixel_cost_min=pixel_cost_val.detach().cpu().numpy().squeeze() if hasattr(pixel_cost_val, 'detach') else (pixel_cost_val.squeeze() if pixel_cost_val is not None else None),
+                        view_weights_mean=view_weights_val.detach().cpu().numpy().squeeze() if hasattr(view_weights_val, 'detach') else (view_weights_val.squeeze() if view_weights_val is not None else None),
+                        pixel_cost_min_raw=pixel_cost_raw_val.detach().cpu().numpy().squeeze() if hasattr(pixel_cost_raw_val, 'detach') else (pixel_cost_raw_val.squeeze() if pixel_cost_raw_val is not None else None),
+                        cost_variance=cost_variance_val.detach().cpu().numpy().squeeze() if hasattr(cost_variance_val, 'detach') else (cost_variance_val.squeeze() if cost_variance_val is not None else None),
+                        W_plane_pixel=planar_soft_conf_s1,  # 🎯 物理核心：以映射完的离线真值平面置信度为唯一平面界定标准
+                        depth_gt=depth_gt_np[b_idx] if depth_gt_np is not None else None,
+                        depth_est_2d=depth_est
+                    )
+
+                    # 在线计算基于离线真值平面置信度过滤的 3 个 Pearson 相关系数
+                    with torch.no_grad():
+                        if pixel_cost_val is not None and depth_gt_np is not None:
+                            depth_error = np.abs(depth_est - np.squeeze(depth_gt_np[b_idx]))
+                            
+                            cost_min_b = np.squeeze(pixel_cost_val.detach().cpu().numpy() if hasattr(pixel_cost_val, 'detach') else pixel_cost_val.squeeze())
+                            gt_depth_b = np.squeeze(depth_gt_np[b_idx])
+                            
+                            # 建立平面真值置信度（> PLANAR_CONF_THRESHOLD）且含有深度 GT 的掩码
+                            flat_mask = (planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD) & (gt_depth_b > 0.0)
+                            
+                            cost_flat = cost_min_b[flat_mask]
+                            error_flat = depth_error[flat_mask]
+                            
+                            if cost_flat.size > 50:
+                                correlation = np.corrcoef(cost_flat.reshape(-1), error_flat.reshape(-1))[0, 1]
+                                
+                                # 未加权 Pearson 相关系数
+                                raw_corr = 0.0
+                                if pixel_cost_raw_val is not None:
+                                    raw_np = np.squeeze(pixel_cost_raw_val.detach().cpu().numpy() if hasattr(pixel_cost_raw_val, 'detach') else pixel_cost_raw_val.squeeze())
+                                    if raw_np.ndim == 3 and raw_np.shape[0] < raw_np.shape[1]:
+                                        raw_np = np.min(raw_np, axis=0)
+                                    raw_flat = raw_np[flat_mask]
+                                    raw_corr = np.corrcoef(raw_flat.reshape(-1), error_flat.reshape(-1))[0, 1]
+                                
+                                # 视角方差 Pearson 相关系数
+                                var_corr = 0.0
+                                if cost_variance_val is not None:
+                                    var_np = np.squeeze(cost_variance_val.detach().cpu().numpy() if hasattr(cost_variance_val, 'detach') else cost_variance_val.squeeze())
+                                    if var_np.ndim == 3 and var_np.shape[0] < var_np.shape[1]:
+                                        var_np = np.min(var_np, axis=0)
+                                    var_flat = var_np[flat_mask]
+                                    var_corr = np.corrcoef(var_flat.reshape(-1), error_flat.reshape(-1))[0, 1]
+                                
+                                # 👑 计算 Signed Error 的空间分布特征与高误差区正负占比
+                                signed_error_flat = (depth_est - gt_depth_b)[flat_mask]
+                                signed_error_mean = np.mean(signed_error_flat)
+                                
+                                # 统计高误差区 (abs_error > 0.10m) 内部的正负一致性
+                                high_err_mask = np.abs(signed_error_flat) > 0.10
+                                high_err_flat = signed_error_flat[high_err_mask]
+                                positive_ratio = 0.0
+                                if high_err_flat.size > 0:
+                                    positive_ratio = np.sum(high_err_flat > 0) / high_err_flat.size
+
+                                clean_filename = filename.format('', '').replace('/', '_').replace('\\', '_')
+                                print(f"\n==================================================================================")
+                                print(f"👑 ==> [Pearson - {clean_filename}] Weighted Cost-Error Corr: {correlation:.4f}")
+                                print(f"👑 ==> [Pearson - {clean_filename}] Raw Cost-Error Corr: {raw_corr:.4f}")
+                                print(f"👑 ==> [Pearson - {clean_filename}] Variance Cost-Error Corr: {var_corr:.4f}")
+                                print(f"👑 ==> [Signed Error Stats - {clean_filename}] Flat Region Mean Error: {signed_error_mean:.4f}m")
+                                print(f"👑 ==> [Signed Error Stats - {clean_filename}] High Error (>0.1m) Positive Ratio: {positive_ratio*100:.2f}% (0% or 100% means Systematic Bias)")
+                                print(f"==================================================================================\n")
                 if gt_normal_map_s1 is not None:
                     normal_gt_mask = np.linalg.norm(gt_normal_map_s1, axis=-1) > 0.1
                     normal_gt_vis = np.zeros_like(gt_normal_map_s1, dtype=np.uint8)
@@ -506,7 +766,7 @@ def save_depth():
                     gt_normal_s1_unit = gt_normal_map_s1 / (gt_norm_mag + 1e-8)
 
                     normal_eval_mask = (
-                        (planar_soft_conf_s1 > 0.80) & 
+                        (planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD) & 
                         (np.squeeze(gt_norm_mag) > 0.1) & 
                         (depth_est > 0)
                     )
@@ -664,7 +924,7 @@ def save_depth():
 
                         # 🪐 锁定大平面固定指标 (使用 3D OLS 拟合的三角几何平面，实现 100% 对齐评测)
                         if planar_soft_conf_s1 is not None:
-                            mask_planar = mask_diff & (planar_soft_conf_s1 > 0.80)
+                            mask_planar = mask_diff & (planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD)
                         else:
                             # 兜底
                             mask_planar = np.zeros_like(depth_est_sq, dtype=bool)
@@ -677,7 +937,7 @@ def save_depth():
                             planar_text = ""
 
                         # ── 图一：全局误差图（基于 replace 防爆设计） ────────────────────────
-                        diff_max_plot = max(np.percentile(abs_error_array, 95), 0.5)
+                        diff_max_plot = error_num
                         
                         plt.figure(figsize=(10, 8))
                         diff_map_masked = np.ma.masked_where(~mask_diff, diff_map)
@@ -697,7 +957,7 @@ def save_depth():
                         plt.savefig(diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                         plt.close()
  
-                        # ── 图二：仅平面区域误差图（W_plane > 0.80，满足用户只展现平面 MAE 的渴望） ──
+                        # ── 图二：仅平面区域误差图（W_plane > GT_PLANAR_CONF_THRESHOLD，满足用户只展现平面 MAE 的渴望） ──
                         if mask_planar.any():
                             planar_err_array = np.abs(depth_est_sq[mask_planar] - gt_curr[mask_planar])
                             planar_diff_map = np.zeros_like(depth_est_sq)
@@ -717,7 +977,7 @@ def save_depth():
                             cbar2.set_label('Absolute Error (Meters)', size=14)
                             
                             plt.title(
-                                f'Flat Region MAE (W_plane > 0.80): {planar_mae:.4f}m'
+                                f'Flat Region MAE (W_plane > {GT_PLANAR_CONF_THRESHOLD}): {planar_mae:.4f}m'
                                 f'\nMax Cutoff: {planar_diff_max:.2f}m'
                                 f'  |  Flat pixels: {mask_planar.sum()} / {mask_diff.sum()}',
                                 fontsize=13, fontweight='bold'
@@ -730,6 +990,39 @@ def save_depth():
                             os.makedirs(os.path.dirname(planar_diff_filename), exist_ok=True) # 🛡️ 刚性子目录防爆铁闸二
                             
                             plt.savefig(planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                            plt.close()
+
+                        # ── 图三：预测的平面区域误差图（Pred Planar W_plane > GT_PLANAR_CONF_THRESHOLD） ──
+                        mask_pred_planar = mask_diff & (w_plane_sq > GT_PLANAR_CONF_THRESHOLD)
+                        if mask_pred_planar.any():
+                            pred_planar_err_array = np.abs(depth_est_sq[mask_pred_planar] - gt_curr[mask_pred_planar])
+                            pred_planar_diff_map = np.zeros_like(depth_est_sq)
+                            pred_planar_diff_map[mask_pred_planar] = pred_planar_err_array
+                            
+                            pred_planar_mae = np.mean(pred_planar_err_array)
+                            pred_planar_diff_max = error_num
+
+                            plt.figure(figsize=(10, 8))
+                            pred_planar_map_masked = np.ma.masked_where(~mask_pred_planar, pred_planar_diff_map)
+                            cmap_pred_planar = plt.get_cmap('jet')
+                            cmap_pred_planar.set_bad(color='black')
+                            
+                            im3 = plt.imshow(pred_planar_map_masked, cmap=cmap_pred_planar, vmin=0, vmax=pred_planar_diff_max)
+                            cbar3 = plt.colorbar(im3, fraction=0.046, pad=0.04)
+                            cbar3.set_label('Absolute Error (Meters)', size=14)
+                            
+                            plt.title(
+                                f'Pred Flat Region MAE (Pred W_plane > {PRED_PLANAR_CONF_THRESHOLD}): {pred_planar_mae:.4f}m'
+                                f'\nMax Cutoff: {pred_planar_diff_max:.2f}m'
+                                f'  |  Pred Flat pixels: {mask_pred_planar.sum()} / {mask_diff.sum()}',
+                                fontsize=13, fontweight='bold'
+                            )
+                            plt.axis('off')
+                            
+                            pred_planar_diff_filename = diff_filename.replace('_dif.png', '_dif_pred_planar.png')
+                            os.makedirs(os.path.dirname(pred_planar_diff_filename), exist_ok=True)
+                            
+                            plt.savefig(pred_planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                             plt.close()
 
                     # ====================================================================
@@ -766,9 +1059,9 @@ def save_depth():
                                     planar_soft_conf_no_pro_resized = cv2.resize(planar_soft_conf_s1, (mask_diff_no_pro.shape[1], mask_diff_no_pro.shape[0]), interpolation=cv2.INTER_NEAREST)
                                 else:
                                     planar_soft_conf_no_pro_resized = planar_soft_conf_s1
-                                mask_planar_no_pro = mask_diff_no_pro & (planar_soft_conf_no_pro_resized > 0.80)
+                                mask_planar_no_pro = mask_diff_no_pro & (planar_soft_conf_no_pro_resized > GT_PLANAR_CONF_THRESHOLD)
                             else:
-                                mask_planar_no_pro = mask_diff_no_pro & (w_before_sq > 0.80)
+                                mask_planar_no_pro = mask_diff_no_pro & (w_before_sq > GT_PLANAR_CONF_THRESHOLD)
 
                             if mask_planar_no_pro.any():
                                 planar_mae_no_pro = np.mean(np.abs(depth_no_pro_sq[mask_planar_no_pro] - gt_no_pro[mask_planar_no_pro]))
@@ -811,6 +1104,79 @@ def save_depth():
                                 os.makedirs(os.path.dirname(planar_diff_filename_no_pro), exist_ok=True)
                                 plt.savefig(planar_diff_filename_no_pro, dpi=150, bbox_inches='tight', pad_inches=0.1)
                                 plt.close()
+
+                    # ====================================================================
+                    # 👑 【自愈改造·误差相变诊断】生成传播前、传播后的 signed_error 及其差值图
+                    # ====================================================================
+                    if 'depth_no_pro' in outputs.get("output_plane", {}):
+                        # 获取公共有效且为平面区域的掩码
+                        if planar_soft_conf_s1 is not None:
+                            mask_signed = mask_diff & mask_diff_no_pro & (planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD)
+                        else:
+                            mask_signed = mask_diff & mask_diff_no_pro & (w_plane_sq > GT_PLANAR_CONF_THRESHOLD)
+                        if mask_signed.any():
+                            # 1. 计算 signed_error (预测 - 真值)
+                            signed_err_before = np.zeros_like(depth_no_pro_sq)
+                            signed_err_before[mask_signed] = depth_no_pro_sq[mask_signed] - gt_no_pro[mask_signed]
+
+                            signed_err_after = np.zeros_like(depth_est_sq)
+                            signed_err_after[mask_signed] = depth_est_sq[mask_signed] - gt_curr[mask_signed]
+
+                            signed_err_diff = np.zeros_like(depth_est_sq)
+                            signed_err_diff[mask_signed] = signed_err_after[mask_signed] - signed_err_before[mask_signed]
+
+                            # 2. 确定可视化最大/最小对称截断边界
+                            limit_before = np.percentile(np.abs(signed_err_before[mask_signed]), 95)
+                            limit_after = np.percentile(np.abs(signed_err_after[mask_signed]), 95)
+                            v_limit = max(limit_before, limit_after, 0.2)
+
+                            # 定义一个专门的 signed_error 可视化辅助函数
+                            def save_signed_error_map(err_map, mask, save_path, title_text, val_lim):
+                                plt.figure(figsize=(10, 8))
+                                err_masked = np.ma.masked_where(~mask, err_map)
+                                cmap_bwr = plt.get_cmap('bwr')
+                                cmap_bwr.set_bad(color='black')  # 无效区域和背景全涂黑
+                                
+                                im_se = plt.imshow(err_masked, cmap=cmap_bwr, vmin=-val_lim, vmax=val_lim)
+                                cbar_se = plt.colorbar(im_se, fraction=0.046, pad=0.04)
+                                cbar_se.set_label('Signed Error (Meters)', size=14)
+                                plt.title(title_text, fontsize=14, fontweight='bold')
+                                plt.axis('off')
+                                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                                plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                                plt.close()
+
+                            # 3. 保存三张 signed_error 诊断图
+                            # 图 1：传播前 signed_error
+                            before_se_filename = os.path.join(args.outdir, filename.format('depth_diff_s1_noprop_signed_error', '.png'))
+                            save_signed_error_map(
+                                err_map=signed_err_before,
+                                mask=mask_signed,
+                                save_path=before_se_filename,
+                                title_text=f'Signed Error Before Propagation (SVD Init)\n(Range: -{v_limit:.2f}m to {v_limit:.2f}m)',
+                                val_lim=v_limit
+                            )
+
+                            # 图 2：传播后 signed_error
+                            after_se_filename = os.path.join(args.outdir, filename.format('diagnostic_signed_error_s1', '.png'))
+                            save_signed_error_map(
+                                err_map=signed_err_after,
+                                mask=mask_signed,
+                                save_path=after_se_filename,
+                                title_text=f'Signed Error After Propagation (GNN Refined)\n(Range: -{v_limit:.2f}m to {v_limit:.2f}m)',
+                                val_lim=v_limit
+                            )
+
+                            # 图 3：两者差值 (After - Before)
+                            limit_diff = max(np.percentile(np.abs(signed_err_diff[mask_signed]), 95), 0.1)
+                            diff_se_filename = os.path.join(args.outdir, filename.format('signed_error_diff_s1', '.png'))
+                            save_signed_error_map(
+                                err_map=signed_err_diff,
+                                mask=mask_signed,
+                                save_path=diff_se_filename,
+                                title_text=f'Signed Error Difference (After - Before)\n(Range: -{limit_diff:.2f}m to {limit_diff:.2f}m)',
+                                val_lim=limit_diff
+                            )
 
                 # ====================================================================
                 # 🚨 4. 生成平面置信度 (W_plane) 大图 (用于论文展示)
@@ -864,19 +1230,28 @@ def save_depth():
                     # =====================================================================
                     # 👑 【新增对比实验硬核资产】：熔炼并导出几何真平面掩码二值图
                     # =====================================================================
-                    # 机制精剖：使用计算得到的 3D 几何真平面软置信度真值 (W_GT > 0.80)
+                    # 机制精剖：使用计算得到的 3D 几何真平面软置信度真值 (W_GT > PLANAR_CONF_THRESHOLD)
                     binary_mask_np = np.zeros_like(depth_est_sq, dtype=np.uint8)
                     if planar_soft_conf_s1 is not None:
-                        binary_mask_np[(planar_soft_conf_s1 > 0.80) & current_mask] = 255
+                        binary_mask_np[(planar_soft_conf_s1 > GT_PLANAR_CONF_THRESHOLD) & current_mask] = 255
                     else:
                         if dev_gt is not None:
                             binary_mask_np[(dev_gt < 0.15) & current_mask] = 255
                         else:
-                            binary_mask_np[(w_plane_sq > 0.80) & current_mask] = 255
+                            binary_mask_np[(w_plane_sq > GT_PLANAR_CONF_THRESHOLD) & current_mask] = 255
 
                     # 动态生成专属基准文件名，加上 _oracle_mask 后缀，防止混淆文件目录
                     oracle_mask_filename = os.path.join(args.outdir, filename.format('plane_mask_01', '_oracle_mask.png'))
                     os.makedirs(os.path.dirname(oracle_mask_filename), exist_ok=True)
+                    cv2.imwrite(oracle_mask_filename, binary_mask_np)
+                    
+                    # 👑 新增：预测的平面掩码二值图 (Prediction W_plane > PRED_PLANAR_CONF_THRESHOLD)
+                    pred_binary_mask_np = np.zeros_like(depth_est_sq, dtype=np.uint8)
+                    pred_binary_mask_np[(w_plane_sq > PRED_PLANAR_CONF_THRESHOLD) & current_mask] = 255
+                    pred_mask_filename = os.path.join(args.outdir, filename.format('pred_plane_mask_01', '_pred_mask.png'))
+                    os.makedirs(os.path.dirname(pred_mask_filename), exist_ok=True)
+                    cv2.imwrite(pred_mask_filename, pred_binary_mask_np)
+                    print(f"✅ 预测平面置信度(>0.8)二值图已成功写入: {pred_mask_filename}")
                     
                     # 写入单通道灰度/二值图磁盘
                     cv2.imwrite(oracle_mask_filename, binary_mask_np)
@@ -949,13 +1324,13 @@ def save_depth():
 
                         # 🪐 详解 s1 与 s0 掩码对齐 (由架构师根据您的指正优化)：
                         # 因为 depth_pixel_curr 是 Stage 1 尺寸的深度，因此这里采用 Stage 1 平面置信度地图 (planar_soft_conf_s1) 进行对齐判断。
-                        # 若其形状与当前差异图不一致，使用最近邻插值缩放，提取出置信度 > 0.80 且有有效深度的像素作为 Stage 1 优质平面掩码 (mask_planar_s1)。
+                        # 若其形状与当前差异图不一致，使用最近邻插值缩放，提取出置信度 > PLANAR_CONF_THRESHOLD 且有有效深度的像素作为 Stage 1 优质平面掩码 (mask_planar_s1)。
                         if planar_soft_conf_s1 is not None:
                             if planar_soft_conf_s1.shape != mask_diff_pixel.shape:
                                 planar_soft_conf_pixel_resized = cv2.resize(planar_soft_conf_s1, (mask_diff_pixel.shape[1], mask_diff_pixel.shape[0]), interpolation=cv2.INTER_NEAREST)
                             else:
                                 planar_soft_conf_pixel_resized = planar_soft_conf_s1
-                            mask_planar_s1 = mask_diff_pixel & (planar_soft_conf_pixel_resized > 0.80)
+                            mask_planar_s1 = mask_diff_pixel & (planar_soft_conf_pixel_resized > GT_PLANAR_CONF_THRESHOLD)
                         else:
                             # 兜底
                             mask_planar_s1 = np.zeros_like(depth_pixel_curr, dtype=bool)
@@ -1035,11 +1410,11 @@ def save_depth():
                                 planar_soft_conf_s0_resized = cv2.resize(planar_soft_conf_s0, (mask_diff_s0.shape[1], mask_diff_s0.shape[0]), interpolation=cv2.INTER_NEAREST)
                             else:
                                 planar_soft_conf_s0_resized = planar_soft_conf_s0
-                            mask_planar_s0 = mask_diff_s0 & (planar_soft_conf_s0_resized > 0.80)
+                            mask_planar_s0 = mask_diff_s0 & (planar_soft_conf_s0_resized > GT_PLANAR_CONF_THRESHOLD)
                         else:
                             w_plane_sq_s0 = cv2.resize(w_plane_sq, (depth_est_s0_sq.shape[1], depth_est_s0_sq.shape[0]),
                                                        interpolation=cv2.INTER_LINEAR)
-                            mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > 0.80)
+                            mask_planar_s0 = mask_diff_s0 & (w_plane_sq_s0 > GT_PLANAR_CONF_THRESHOLD)
 
                         if mask_planar_s0.any():
                             planar_mae_s0 = np.mean(
