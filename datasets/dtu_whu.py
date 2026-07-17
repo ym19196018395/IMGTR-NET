@@ -297,6 +297,9 @@ class MVSDataset(Dataset):
                     degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
                     tri_conf[degrade_mask] = 0.75
                     
+                    # --- NEW LOGIC: Offline physical planar mask ---
+                    is_gt_planar = (tri_conf > 0.60) & (tri_err95 < 0.08)
+                    
                     # 兼容新老版 npz (保存 tri_svd_plane 或 tri_svd_normal)
                     if 'tri_svd_plane' in npz_data:
                         tri_plane = npz_data['tri_svd_plane'].copy()
@@ -406,7 +409,8 @@ class MVSDataset(Dataset):
                 "triangles": triangles,  # list of ndarrays
                 "tri_conf_cleaned": tri_conf_cleaned,
                 "tri_normal_cleaned": tri_normal_cleaned,
-                "tri_plane_cleaned": tri_plane_cleaned
+                "tri_plane_cleaned": tri_plane_cleaned,
+                "is_gt_planar": is_gt_planar
                 }
 
 
@@ -417,7 +421,7 @@ def collate_keep_list(batch):
     out = {}
     keys = batch[0].keys()
     for k in keys:
-        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned']:
+        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned', 'is_gt_planar']:
             out[k] = [b[k] for b in batch]
         else:
             out[k] = default_collate([b[k] for b in batch])

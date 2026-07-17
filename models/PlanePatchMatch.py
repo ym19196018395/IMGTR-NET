@@ -195,7 +195,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # 3. 🎯 核心升级：自身权重门控解耦拆分为双通道，彻底隔离 Z 与 N 的语义干扰
+        # 3. 🎯 自身权重门控解耦拆分为双通道，彻底隔离 Z 与 N 的语义干扰
+        # self_gate_input = hidden + current_costs = H + 1
         self.self_gate_net_z = nn.Sequential(
             nn.Linear(hidden_dim + 1, hidden_dim // 2),
             nn.ReLU(),
@@ -213,18 +214,18 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         nn.init.constant_(self.self_gate_net_n[2].bias, 2.0)
         nn.init.zeros_(self.self_gate_net_n[2].weight)
 
-        # 4. 【精准修改点：矩阵扩容】深度传播专属门控 (GNN_Z): 全量多模态特征总线接入
-        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
+        # 4. 深度传播专属门控 (GNN_Z)
+        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
         self.gate_net_z = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 9, hidden_dim),  # 👈 从 2H + 7 扩容为 2H + 9
+            nn.Linear(hidden_dim * 2 + 9, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
 
-        # 5. 【精准修改点：矩阵扩容】法向传播专属门控 (GNN_N): 全量多模态特征总线接入
-        # 输入维度完美解锁: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
+        # 5. 法向传播专属门控 (GNN_N)
+        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
         self.gate_net_n = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 9, hidden_dim),  # 👈 从 2H + 7 扩容为 2H + 9
+            nn.Linear(hidden_dim * 2 + 9, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
@@ -237,10 +238,10 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             nn.Linear(hidden_dim, 1)  # 输出解耦的绝对尺度位移 delta_Z
         )
 
-        # 7. 【修复记忆断流：矩阵扩容】可学习内生置信度刷新头 (Confidence Predict Head)
-        # 输入特征完美解锁: init_hidden(H维) + current_costs(1维) + delta_cost(1维) + 上一步W_plane_tri先验(1维) + W_raw_anchor(1维) = H + 4
+        # 7. 【修复记忆断流：矩阵还原】可学习内生置信度刷新头 (Confidence Predict Head)
+        # 输入特征完美解锁: init_hidden(H维) + current_costs(1) + delta_cost(1) + W_plane_tri(1) + W_raw_anchor(1) + normalized_slope(1) + surface_var(1) + max_intra_feat_var(1) = H + 7
         self.confidence_predict_head = nn.Sequential(
-            nn.Linear(hidden_dim + 4, hidden_dim // 2),  # 👈 扩容为 + 4，支持物理锚点并网
+            nn.Linear(hidden_dim + 7, hidden_dim // 2),  # 👈 加回 max_intra_feat_var 
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -251,8 +252,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs, rays_centroids, depth_max,prev_costs,W_plane_tri,
-                pixel_counts=None, ref_feature=None, centroids_norm=None, temperature=0.2, 
-                W_raw_anchor=None, cross_costs=None):
+                pixel_counts=None, ref_feature=None, centroids_norm=None, midpoints_norm=None, temperature=0.2, 
+                W_raw_anchor=None, cross_costs=None, normalized_slope=None, surface_var=None):
         """
         前向双解耦核心计算图流动
         Args:
@@ -296,6 +297,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # 2. 图像特征感知采样 (采样中心高频梯度)
         # =====================================================================
         feat_dist = torch.zeros((B, N, 3, 1), device=device)
+        max_intra_feat_var = torch.zeros((B, N, 1), device=device)
         if ref_feature is not None and centroids_norm is not None:
             grid = centroids_norm.view(B, N, 1, 2)
             F_curr = F.grid_sample(ref_feature, grid, mode='bilinear', align_corners=True).squeeze(-1).permute(0, 2, 1)
@@ -306,6 +308,29 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             F_curr_exp = F_curr.unsqueeze(2)
             feat_dist = ((F_curr_exp - F_neighbor) ** 2).sum(dim=-1, keepdim=True)  # [B, N, 3, 1]
 
+            # =====================================================================
+            # 2.5 提取三角形内部特征边缘跳变散度 (Cross-Star Feature Probe)
+            # =====================================================================
+            if midpoints_norm is not None:
+                grid_mid = midpoints_norm.view(B, N * 3, 1, 2)
+                F_edges = F.grid_sample(ref_feature, grid_mid, mode='bilinear', align_corners=True).squeeze(-1).permute(0, 2, 1)
+                F_edges = F.normalize(F_edges, p=2, dim=-1)
+                F_edges = F_edges.view(B, N, 3, -1)  # [B, N, 3, C]
+                F_center = F_curr_exp.expand(-1, -1, 3, -1)  # [B, N, 3, C]
+                
+                edge_diffs = ((F_edges - F_center) ** 2).sum(dim=-1)  # [B, N, 3]
+
+                # =====================================================================
+                # 【升级：EdgeHead感知容错】
+                # 原版 max 会被断裂边的特征污染拉高，误判边界三角形为坏平面。
+                # 改用 edge_prob 加权：断裂概率高的边（edge_prob≈1）权重趋近于 0，
+                # 这样断裂边的特征差异几乎不影响最终的 intra_feat_var。
+                # 感受野污染效应（RF bleeding）同样被抑制：断裂边中点被 EdgeHead 识别，
+                # 其权重降低，不会枪毙整个三角形的置信度。
+                # =====================================================================
+                intra_weights = (1.0 - edge_probs).clamp(min=0.05)  # [B, N, 3]，高断裂概率边 → 低权重
+                weighted_diffs = edge_diffs * intra_weights          # [B, N, 3]
+                max_intra_feat_var, _ = weighted_diffs.max(dim=-1, keepdim=True)  # [B, N, 1]
 
         # =====================================================================
         # 3. 收集图网络邻居异构上下文
@@ -352,10 +377,21 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             else:
                 W_raw_anchor_in = torch.ones_like(W_plane_tri)
 
-            # 串联宏观先验特征、实时匹配代价、收敛速度探测器、上一步W_plane_tri先验、以及物理冷启动初始置信度
-            # 此时特征量纲严格对齐 [B, N, H + 4]，完美接入扩容后的 Linear 矩阵！
-            # 💡 【核心阻断：阻断梯度倒流】使用 init_hidden.detach() 切断置信度 Loss 对前向平面参数的扭曲反噬
-            W_update_input = torch.cat([init_hidden.detach(), current_costs, delta_cost, W_plane_tri, W_raw_anchor_in], dim=-1)
+            # 物理防伪特征对齐与保底防御
+            if normalized_slope is None:
+                normalized_slope_in = torch.zeros_like(W_plane_tri)
+            else:
+                normalized_slope_in = normalized_slope.unsqueeze(-1) if normalized_slope.dim() == 2 else normalized_slope
+                
+            if surface_var is None:
+                surface_var_in = torch.zeros_like(W_plane_tri)
+            else:
+                surface_var_in = surface_var.unsqueeze(-1) if surface_var.dim() == 2 else surface_var
+
+            # 串联宏观先验特征、实时匹配代价、收敛速度探测器、物理先验W、绝对几何防伪特征以及内部特征跳变散度
+            # 此时特征量纲严格对齐 [B, N, H + 7]
+            # 💡 【核心阻断：阻断梯度倒流】使用 init_hidden.detach() 和 max_intra_feat_var.detach() 切断置信度 Loss 对前向平面参数/FeatureNet的扭曲反噬
+            W_update_input = torch.cat([init_hidden.detach(), current_costs, delta_cost, W_plane_tri, W_raw_anchor_in, normalized_slope_in, surface_var_in, max_intra_feat_var.detach()], dim=-1)
             W_plane_tri_raw = self.confidence_predict_head(W_update_input)
 
             # 🎯 【残差修正模式】：以上一轮置信度为基准，神经网络只学习 [-0.3, 0.3] 内的修正量，实现时序累加
@@ -366,7 +402,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # =====================================================================
         # 4. 双重完全解耦门控计算 (自卫分配与邻居流形熔断)
         # =====================================================================
-        # 还原 self_gate_input 维度 (依然是 hidden_dim + 1)，不改网络结构
+        # self_gate_input 只用原始隐特征和代价，不加 max_intra_feat_var（内部特征跳变是置信度信号，不是传播 logit 信号）
         self_gate_input = torch.cat([init_hidden, current_costs], dim=-1)
 
         # 4.a 拆分为两个独立的自身 Logit 预测通路
@@ -386,8 +422,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         neighbor_W_conf = W_plane_tri_reg[batch_idx, neighbor_indices]
 
         # 4.b 深度通道邻居 Logits 预测
-        # 将 [隐特征、完整的 4维 plane_diff、断裂概率、邻居代价、高频视觉距离、自身置信度、邻居置信度] 无损打包
-        # 形状完全契合扩容后的 [B, N, 3, 2H + 9]
+        # max_intra_feat_var 不属于传播 logit（物理上无意义），只保留标准特征总线
+        # 形状完全契合 [B, N, 3, 2H + 9]
         gate_input_z = torch.cat([
             self_hidden_expand, neighbor_hidden,
             plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
@@ -397,7 +433,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
 
         # 4.c 🔥 【精准更替：满血版法向门控输入】
         # 让法向流和深度流享有完全同等的“知情权”，同样通过全模态总线过滤边缘与曲面拉扯
-        # 形状完全契合扩容后的 [B, N, 3, 2H + 9]
+        # 形状完全契合扩容后的 [B, N, 3, 2H + 10]
         gate_input_n = torch.cat([
             self_hidden_expand, neighbor_hidden,
             plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
@@ -1163,7 +1199,8 @@ class PlanePatchMatchModule(nn.Module):
         # 2. 拟合与生成 (Fitting & Generation)，根据stage2预测深度来拟合生成假设平面
         # ==========================================
 
-        hypotheses,surface_var = self.fitter.get_plane_hypotheses(
+        # 提取 hypotheses(平面参数), surface_var(混沌度), normalized_slope(悬崖绝对斜率)
+        hypotheses, surface_var, normalized_slope = self.fitter.get_plane_hypotheses(
             depth_stage2=depth_stage1,
             tri_id_map=tri_id_map,
             intrinsics_s1=ref_intrinsics,
@@ -1301,10 +1338,13 @@ class PlanePatchMatchModule(nn.Module):
                 prev_costs=prev_costs,
                 W_plane_tri=W_gating_input,
                 centroids_norm=centroids_norm,
+                midpoints_norm=aligned_midpoints_norm,  # 传入边缘中点用于 Cross-Star 探针
                 pixel_counts=pixel_counts_tensor,
                 temperature=current_temp,  # 可根据当前训练的 Epoch 动态退火压低
                 W_raw_anchor=W_raw_anchor,  # 刚性投递，防止置信度头多轮迭代后神经失忆
-                cross_costs=cross_costs_flat # 传入 Cross-Cost
+                cross_costs=cross_costs_flat, # 传入 Cross-Cost
+                normalized_slope=normalized_slope,  # 传入绝对斜率特征 (对抗悬崖错分面)
+                surface_var=surface_var             # 传入表面粗糙度 (对抗树木与噪声)
             )
 
             # 将本轮的代价封存，作为下一轮的“历史代价”
@@ -2108,6 +2148,15 @@ class DensePlaneFitter(nn.Module)   :
         centroids_wls = torch.nan_to_num(sum_P_wls / counts_for_cov.clamp(min=1e-6).unsqueeze(1), nan=0.0)
         centroids_wls = torch.where(valid_fit_mask.unsqueeze(1), centroids_wls, centroids_ols)
 
+        # 提取核心几何防伪特征：三角形内部深度的真实绝对标准差 z_std
+        mean_z_wls = centroids_wls[:, 2]
+        var_z = (sum_zz_wls / counts_for_cov.clamp(min=1e-6)) - (mean_z_wls ** 2)
+        z_std_out = torch.sqrt(var_z.clamp(min=1e-6)).float()
+        
+        # 🎯 物理学防伪升级：计算无尺度绝对斜率 normalized_slope = z_std / sqrt(pixel_count)
+        # 此特征严格对齐大屋顶与悬崖面，是极佳的一维线性可分流形
+        normalized_slope = z_std_out / torch.sqrt(counts_for_cov.clamp(min=1.0)).float()
+
         # 严格同构去中心化协方差改正
         sum_PPt_ols = torch.stack([
             sum_xx_ols, sum_xy_ols, sum_xz_ols,
@@ -2286,7 +2335,7 @@ class DensePlaneFitter(nn.Module)   :
 
         return hypotheses_pool.view(
             B, max_num_triangles, K, 4
-        ), surface_variation_out.view(B, max_num_triangles)
+        ), surface_variation_out.view(B, max_num_triangles), normalized_slope.view(B, max_num_triangles)
 
     def get_plane_hypotheses(self, depth_stage2, tri_id_map, intrinsics_s1, max_num_triangles):
         return self._get_plane_hypotheses_multi(depth_stage2, tri_id_map, intrinsics_s1, max_num_triangles)

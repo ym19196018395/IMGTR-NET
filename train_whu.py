@@ -453,8 +453,15 @@ def compute_stage1_flat_region_mae_tensors(outputs, pixel_depth_s1, depth_gt_s1,
 
     if mask_planar.any():
         planar_mae_val = err_map_dense[mask_planar].mean()
+        if 'depth_stage1_pixels' in output_plane_dict:
+            depth_pixels = output_plane_dict['depth_stage1_pixels']
+            err_map_pixel = torch.abs(depth_pixels - depth_gt_s1)
+            pixel_mae_val = err_map_pixel[mask_planar].mean()
+        else:
+            pixel_mae_val = torch.tensor(0.0, device=device)
     else:
         planar_mae_val = torch.tensor(0.0, device=device)
+        pixel_mae_val = torch.tensor(0.0, device=device)
 
     # =====================================================================
     # 👑 【核心修改点一】：单通道深度差值等比例放大（解救纯黑）
@@ -481,7 +488,7 @@ def compute_stage1_flat_region_mae_tensors(outputs, pixel_depth_s1, depth_gt_s1,
     
     # 其余区域（无效全黑背景）自动保持默认的零值纯黑色 [0, 0, 0]
 
-    return planar_mae_val, planar_err_vis, planar_color_vis, mask_planar
+    return planar_mae_val, pixel_mae_val, planar_err_vis, planar_color_vis, mask_planar
 
 
 def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
@@ -510,12 +517,14 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过，同时也跳过超轻量几何变长列表的直接转换
-    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned"]
+    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
     # 手动转换并移动到 GPU
     sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
     sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
+    if 'is_gt_planar' in sample:
+        sample_cuda['is_gt_planar'] = [torch.from_numpy(v).to(device).bool() for v in sample['is_gt_planar']]
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
@@ -530,7 +539,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_s = 1.0
     # max_lambda_c = 0.0
     # max_lambda_s = 0.0
-    max_lambda_n_1 = 0.0 # 法向 Loss 的量级通常较大，0.1 到 0.5 之间调节
+    max_lambda_n_1 = 1.0 # 建议设为 1.0，因为 (1-cos) 均值通常在 0.1 左右，乘 1.0 恰好贡献 0.1 总 Loss
     max_lambda_n_0 = 0.0
     max_lambda_cost=0.2
     weight_alpha = 1.0
@@ -547,7 +556,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 3. 法向约束 (晚启动，晚满载，早退坡)：
     # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
-    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.3, 0.5, 0.55, max_lambda_n_1, end_ratio=0.05)
+    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.0, 0.5, 0.55, max_lambda_n_1, end_ratio=0.05)
 
     # 4. cost约束
     lambda_cost = get_smooth_weight_with_decay(progress, 0.0, 0.1, 0.6, max_lambda_cost, end_ratio=0.5)
@@ -586,6 +595,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         depth_gt=depth_gt,
         mask=mask,
         W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
+        is_planar_s0=outputs["output_plane"].get("is_planar_s0", None),    # Stage 0 硬路由屏蔽掩码
         gamma=1.5
     )  # 深度损失
 
@@ -658,7 +668,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         depth_range=(sample_cuda["depth_min"], sample_cuda["depth_max"]),
         valid_mask=valid_mask_s1,
         intrinsics=ref_intrinsics,
-        tri_conf_gt=sample_cuda["tri_conf_cleaned"]
+        tri_conf_gt=sample_cuda["tri_conf_cleaned"],
+        is_gt_planar=sample_cuda.get("is_gt_planar", None)
     )
     outputs["output_plane"]["W_plane_gt_pixel"] = W_GT_pixel
 
@@ -671,7 +682,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         gt_normal_map_s1_list = []
         
         for b in range(B):
-            tri_conf_b = sample_cuda['tri_conf_cleaned'][b]     # [N_tri]
+            # 将 bool 掩码转为 float (True变为1.0, False变为0.0)，映射到 TensorBoard
+            tri_conf_b = sample_cuda['is_gt_planar'][b].float()     # [N_tri]
             tri_normal_b = sample_cuda['tri_normal_cleaned'][b] # [N_tri, 3]
             tri_id_map_b = tri_id_map[b]                        # [H_s1, W_s1]
             
@@ -699,16 +711,19 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # ====================================================
 
     # 计算法向量损失 stage1
-    # normal_loss_s1 = compute_normal_cosine_loss(final_planes=outputs["output_plane"]["final_plane"],
-    #                                          tri_id_map=outputs["output_plane"]['tri_id_map'],
-    #                                          gt_normals_math_s0=gt_normals_math,
-    #                                          depth_stage_1=depth_gt['stage_1'],
-    #                                          )
+    normal_loss_s1 = torch.tensor(0.0, device=device)
+    if "is_gt_planar" in sample_cuda and "tri_normal_cleaned" in sample_cuda:
+        pixel_counts = outputs["output_plane"]["pixel_counts"] # [B, N_tri]
+        
+        normal_loss_s1 = compute_normal_gt_loss(
+            n_pred=outputs["output_plane"]["final_plane"][..., :3],
+            n_gt=sample_cuda["tri_normal_cleaned"],
+            is_gt_planar=sample_cuda["is_gt_planar"],
+            pixel_counts=pixel_counts,
+            min_pixels=3
+        )
+        
     normal_loss_s0 = 0.0
-    # stage0
-    # normal_loss_s0 = compute_normal_cosine_loss_s0(N_pred=outputs["output_plane"]["final_normal"],
-    #                                                N_gt=gt_normals_math,
-    #                                                valid_mask=valid_mask_s0)
 
     # 计算 Cost Margin Loss
     cost_margin_loss = compute_pixel_cost_margin_loss(
@@ -731,7 +746,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     continuity_loss = outputs["continuity_loss"] * lambda_c
     smoothness_loss = outputs["smoothness_loss"] * lambda_s
-    normal_loss = normal_loss_s0 * max_lambda_n_0
+    normal_loss = (normal_loss_s1 * lambda_n_1) + (normal_loss_s0 * max_lambda_n_0)
 
     # DNC 损失
     loss_dnc_s1 = loss_dnc_s1 * lambda_dnc_s1
@@ -759,10 +774,16 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                       "loss_dnc_s1":loss_dnc_s1
                       }
 
+        # 记录到 scalar_outputs 以便主循环写入 Tensorboard
+    if isinstance(normal_loss_s1, torch.Tensor):
+        scalar_outputs["loss_normal_gt_s1"] = (normal_loss_s1 * lambda_n_1).item()
+    else:
+        scalar_outputs["loss_normal_gt_s1"] = 0.0
+
     image_outputs = {}
 
     pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
-    planar_mae_val, _ , planar_err_masked , _= compute_stage1_flat_region_mae_tensors(
+    planar_mae_val, pixel_mae_val, _ , planar_err_masked , _= compute_stage1_flat_region_mae_tensors(
         outputs, pixel_depth_s1, depth_gt['stage_1'], device
     )
 
@@ -844,7 +865,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'] ,
             # 新增：边预测头预测值和真值
             "ref_img_edge_alpha_pre": ref_img_edge_alpha_pre,
-            "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt
+            "ref_img_edge_alpha_gt": ref_img_edge_alpha_gt,
+            "stage0预测截断平面区域": outputs["output_plane"].get("is_planar_s0", torch.zeros_like(depth_patchmatch['stage_1'][-1])).float()
         }
 
         # image_outputs["errormap_refined_stage_0"] = (depth_est['stage_0'] - depth_gt['stage_0']).abs() * mask['stage_0']
@@ -877,6 +899,23 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
+    
+    if "is_planar_s0" in outputs["output_plane"]:
+        is_planar_s0 = outputs["output_plane"]["is_planar_s0"]
+        mask_s0 = mask['stage_0'] > 0.5
+        scalar_outputs["stage0_planar_mae"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage0_curved_mae"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+        
+        # 👑 新增诊断指标：分析 Stage 1 原始像素深度 (depth_patchmatch['stage_1'][0]) 与传播深度 ([-1]) 在两区的表现
+        # 先将 1/2 分辨率的深度图双线性上采样到 Stage 0 以对齐掩码
+        depth_s1_pixel_up = F.interpolate(depth_patchmatch['stage_1'][0], size=depth_gt['stage_0'].shape[2:], mode='bilinear', align_corners=False)
+        depth_s1_prop_up = F.interpolate(depth_patchmatch['stage_1'][-1], size=depth_gt['stage_0'].shape[2:], mode='bilinear', align_corners=False)
+        
+        scalar_outputs["stage1_pixel_planar_mae"] = AbsDepthError_metrics(depth_s1_pixel_up, depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage1_pixel_curved_mae"] = AbsDepthError_metrics(depth_s1_pixel_up, depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+        scalar_outputs["stage1_prop_planar_mae"] = AbsDepthError_metrics(depth_s1_prop_up, depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage1_prop_curved_mae"] = AbsDepthError_metrics(depth_s1_prop_up, depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+
     scalar_outputs["abs_depth_error_patchmatch_stage_3"] = AbsDepthError_metrics(depth_patchmatch['stage_3'][-1],
                                                                                  depth_gt['stage_3'],
                                                                                  mask['stage_3'] > 0.5)
@@ -899,6 +938,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
     scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
+    scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 
@@ -997,6 +1037,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
         depth_gt=depth_gt,
         mask=mask,
         W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
+        is_planar_s0=outputs["output_plane"].get("is_planar_s0", None),    # Stage 0 硬路由屏蔽掩码
         gamma=1.5
     )
 
@@ -1084,7 +1125,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     image_outputs = {}
 
     pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
-    planar_mae_val, _ , planar_err_masked , _ = compute_stage1_flat_region_mae_tensors(
+    planar_mae_val, pixel_mae_val, _ , planar_err_masked , _ = compute_stage1_flat_region_mae_tensors(
         outputs, pixel_depth_s1, depth_gt['stage_1'], device
     )
 
@@ -1125,6 +1166,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             "ref_img_edge_alpha_gt": image_outputs_gt["ref_img_edge_alpha"],
             # "物理平面置信度_W_plane_传播后": w_plane_tb_tensor,
             "stage1_planar_error_map": planar_err_masked,
+            "stage0预测截断平面区域": outputs["output_plane"].get("is_planar_s0", torch.zeros_like(depth_patchmatch['stage_1'][-1])).float()
         }
         image_outputs.update(w_plane_views)
 
@@ -1155,6 +1197,22 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
     scalar_outputs["abs_depth_error_refined_stage_0"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'],
                                                                               mask['stage_0'] > 0.5)
+    
+    if "is_planar_s0" in outputs["output_plane"]:
+        is_planar_s0 = outputs["output_plane"]["is_planar_s0"]
+        mask_s0 = mask['stage_0'] > 0.5
+        scalar_outputs["stage0_planar_mae"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage0_curved_mae"] = AbsDepthError_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+        
+        # 👑 新增诊断指标：分析 Stage 1 原始像素深度 (depth_patchmatch['stage_1'][0]) 与传播深度 ([-1]) 在两区的表现
+        depth_s1_pixel_up = F.interpolate(depth_patchmatch['stage_1'][0], size=depth_gt['stage_0'].shape[2:], mode='bilinear', align_corners=False)
+        depth_s1_prop_up = F.interpolate(depth_patchmatch['stage_1'][-1], size=depth_gt['stage_0'].shape[2:], mode='bilinear', align_corners=False)
+        
+        scalar_outputs["stage1_pixel_planar_mae"] = AbsDepthError_metrics(depth_s1_pixel_up, depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage1_pixel_curved_mae"] = AbsDepthError_metrics(depth_s1_pixel_up, depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+        scalar_outputs["stage1_prop_planar_mae"] = AbsDepthError_metrics(depth_s1_prop_up, depth_gt['stage_0'], mask_s0 & is_planar_s0)
+        scalar_outputs["stage1_prop_curved_mae"] = AbsDepthError_metrics(depth_s1_prop_up, depth_gt['stage_0'], mask_s0 & (~is_planar_s0))
+
     scalar_outputs["abs_depth_error_patchmatch_stage_3"] = AbsDepthError_metrics(depth_patchmatch['stage_3'][-1],
                                                                                  depth_gt['stage_3'],
                                                                                  mask['stage_3'] > 0.5)
@@ -1177,6 +1235,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
     scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
+    scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 

@@ -992,8 +992,8 @@ def save_depth():
                             plt.savefig(planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                             plt.close()
 
-                        # ── 图三：预测的平面区域误差图（Pred Planar W_plane > GT_PLANAR_CONF_THRESHOLD） ──
-                        mask_pred_planar = mask_diff & (w_plane_sq > GT_PLANAR_CONF_THRESHOLD)
+                        # ── 图三：预测的平面区域误差图（Pred Planar W_plane > PRED_PLANAR_CONF_THRESHOLD） ──
+                        mask_pred_planar = mask_diff & (w_plane_sq > PRED_PLANAR_CONF_THRESHOLD)
                         if mask_pred_planar.any():
                             pred_planar_err_array = np.abs(depth_est_sq[mask_pred_planar] - gt_curr[mask_pred_planar])
                             pred_planar_diff_map = np.zeros_like(depth_est_sq)
@@ -1251,7 +1251,7 @@ def save_depth():
                     pred_mask_filename = os.path.join(args.outdir, filename.format('pred_plane_mask_01', '_pred_mask.png'))
                     os.makedirs(os.path.dirname(pred_mask_filename), exist_ok=True)
                     cv2.imwrite(pred_mask_filename, pred_binary_mask_np)
-                    print(f"✅ 预测平面置信度(>0.8)二值图已成功写入: {pred_mask_filename}")
+                    print(f"✅ 预测平面置信度(>{PRED_PLANAR_CONF_THRESHOLD})二值图已成功写入: {pred_mask_filename}")
                     
                     # 写入单通道灰度/二值图磁盘
                     cv2.imwrite(oracle_mask_filename, binary_mask_np)

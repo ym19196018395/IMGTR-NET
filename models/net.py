@@ -2,7 +2,7 @@ from typing import List, Tuple, Dict
 
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 from .PlanePatchMatch import *
-from utils import batch_convert_to_tri_infos_new,build_neighbor_indices,map_tri_to_pixel_single
+from utils import batch_convert_to_tri_infos_new,build_neighbor_indices,map_tri_to_pixel_single,compute_normal_map_torch
 from .feature_map import *
 import torch
 import torch.nn as nn
@@ -270,23 +270,28 @@ class Stage0RefinementNet_V2(nn.Module):
         # =====================================================================
         # 5. 轰出残差！
         # =====================================================================
+        PLANAR_THRESHOLD = 0.8  # 硬路由阈值
+        is_planar = (W_plane_s0 > PLANAR_THRESHOLD).detach()  # [B, 1, H0, W0]
+
         res = self.refine(cnn_input)
 
-        # [通道 0]: 深度残差; [通道 1, 2]: UV 切空间残差 (利用 tanh 软着陆)
+        # [通道 0]: 深度残差;
         delta_z_raw = res[:, 0:1, :, :]
-        delta_uv = torch.tanh(res[:, 1:3, :, :])
-        # todo:深度比例看看是否要改，并且要好好理解一些数学公式
+
         # 7. 相对深度比例钳制 (Relative Depth Percentage Clamping)
         gamma_pct = 0.12
-        delta_z_clamped = Z_hybrid.detach() * gamma_pct * torch.tanh(delta_z_raw)
+        delta_z_B = Z_pixel_s0_safe * gamma_pct * torch.tanh(delta_z_raw)
+        Z_branch_B = Z_pixel_s0_safe + delta_z_B
 
-        # 8. 逆向门控应用：深度场合成
-        Z_final = Z_hybrid + (M_gating_s0 * valid_mask_s0.float() * delta_z_clamped)
+        # 8. 硬路由应用：深度场合成
+        Z_final = torch.where(is_planar, Z_base_safe, Z_branch_B)
 
-        # 9. 切空间法向合成 (内置了 M_gating 和 安全步长 0.1)
-        N_final = self.apply_safe_tangent_refinement(N_base.detach(), delta_uv, M_gating_s0)
+        # 9. 切空间法向合成 (解耦物理法向)
+        N_analytic = N_base.detach()
+        N_screenspace, _ = compute_normal_map_torch(Z_branch_B.detach(), intrinsics_s0, mask=None, smooth=True)
+        N_final = torch.where(is_planar.repeat(1, 3, 1, 1), N_analytic, N_screenspace)
 
-        return res, Z_final, N_final, M_gating_s0, valid_mask_s0
+        return res, Z_final, N_final, is_planar, valid_mask_s0
 
     def apply_safe_tangent_refinement(self,N_base: torch.Tensor, delta_uv: torch.Tensor,
                                       M_gating: torch.Tensor) -> torch.Tensor:
@@ -704,7 +709,7 @@ class PatchmatchNet(nn.Module):
         # depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
 
         # 传入你已经在信心模块里用多项式算好的稀疏 output_plane['M_gating_tri']
-        res, Z_final, N_final, M_gating_s0, valid_mask_s0 = self.stage0_refiner(
+        res, Z_final, N_final, is_planar_s0, valid_mask_s0 = self.stage0_refiner(
             feat_s0=ref_feature['stage_0'],
             final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
             tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
@@ -719,6 +724,7 @@ class PatchmatchNet(nn.Module):
         # 以及完好无损的 Z_base, N_base 和像素级无泄漏死区遮罩 M_gating_s0
         refined_depth['stage_0'] = Z_final
         output_plane['final_normal'] = N_final
+        output_plane['is_planar_s0'] = is_planar_s0
         
         # 👑 架构师诊断探测针：向外输送 Stage 1 的特征网络张量，用于外围可视化纯净 DoH
         output_plane['ref_feature_s1'] = ref_feature['stage_1'].detach()
