@@ -239,12 +239,29 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         )
 
         # 7. 【修复记忆断流：矩阵还原】可学习内生置信度刷新头 (Confidence Predict Head)
-        # 输入特征完美解锁: init_hidden(H维) + current_costs(1) + delta_cost(1) + W_plane_tri(1) + W_raw_anchor(1) + normalized_slope(1) + surface_var(1) + max_intra_feat_var(1) = H + 7
+        # 提取 4 点特征的深度表征 (4 * feature_dim -> D=16)
+        D = 16
+        self.intra_feat_encoder = nn.Sequential(
+            nn.Linear(4 * feature_dim, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, D)
+        )
+        
+        # 输入特征解锁: init_hidden(H维) + current_costs(1) + delta_cost(1) + W_plane_tri(1) + W_raw_anchor(1) + normalized_slope(1) + surface_var(1) + intra_feat_embed(D) = H + 6 + D
         self.confidence_predict_head = nn.Sequential(
-            nn.Linear(hidden_dim + 7, hidden_dim // 2),  # 👈 加回 max_intra_feat_var 
+            nn.Linear(hidden_dim + 6 + D, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
+
+        # 8. Exp-5: Z残差头并联的切空间法向微调头 (Normal Residual Head)
+        self.normal_head = nn.Sequential(
+            nn.Linear(head_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2)  # 输出切空间位移 (δu, δv)
+        )
+        nn.init.constant_(self.normal_head[2].bias, 0.0)
+        nn.init.normal_(self.normal_head[2].weight, mean=0.0, std=0.01)
 
         self.feat_dropout = nn.Dropout(p=0.15)
         nn.init.constant_(self.plane_head[2].bias, 0.0)
@@ -297,7 +314,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # 2. 图像特征感知采样 (采样中心高频梯度)
         # =====================================================================
         feat_dist = torch.zeros((B, N, 3, 1), device=device)
-        max_intra_feat_var = torch.zeros((B, N, 1), device=device)
+        intra_feat_embed = torch.zeros((B, N, 16), device=device)
         if ref_feature is not None and centroids_norm is not None:
             grid = centroids_norm.view(B, N, 1, 2)
             F_curr = F.grid_sample(ref_feature, grid, mode='bilinear', align_corners=True).squeeze(-1).permute(0, 2, 1)
@@ -316,21 +333,14 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
                 F_edges = F.grid_sample(ref_feature, grid_mid, mode='bilinear', align_corners=True).squeeze(-1).permute(0, 2, 1)
                 F_edges = F.normalize(F_edges, p=2, dim=-1)
                 F_edges = F_edges.view(B, N, 3, -1)  # [B, N, 3, C]
-                F_center = F_curr_exp.expand(-1, -1, 3, -1)  # [B, N, 3, C]
+                F_center_feat = F_curr.detach()                         # [B, N, C]
+                F_edge_mean = F_edges.mean(dim=2).detach()              # [B, N, C]
+                F_edge_max = F_edges.max(dim=2).values.detach()         # [B, N, C]
+                F_edge_diff_max = (F_edges - F_center_feat.unsqueeze(2)).abs().max(dim=2).values.detach()  # [B, N, C]
                 
-                edge_diffs = ((F_edges - F_center) ** 2).sum(dim=-1)  # [B, N, 3]
-
-                # =====================================================================
-                # 【升级：EdgeHead感知容错】
-                # 原版 max 会被断裂边的特征污染拉高，误判边界三角形为坏平面。
-                # 改用 edge_prob 加权：断裂概率高的边（edge_prob≈1）权重趋近于 0，
-                # 这样断裂边的特征差异几乎不影响最终的 intra_feat_var。
-                # 感受野污染效应（RF bleeding）同样被抑制：断裂边中点被 EdgeHead 识别，
-                # 其权重降低，不会枪毙整个三角形的置信度。
-                # =====================================================================
-                intra_weights = (1.0 - edge_probs).clamp(min=0.05)  # [B, N, 3]，高断裂概率边 → 低权重
-                weighted_diffs = edge_diffs * intra_weights          # [B, N, 3]
-                max_intra_feat_var, _ = weighted_diffs.max(dim=-1, keepdim=True)  # [B, N, 1]
+                # 4 × C concat → 线性压缩到 D=16
+                intra_feat_summary = torch.cat([F_center_feat, F_edge_mean, F_edge_max, F_edge_diff_max], dim=-1)  # [B, N, 4C]
+                intra_feat_embed = self.intra_feat_encoder(intra_feat_summary)  # → [B, N, D]
 
         # =====================================================================
         # 3. 收集图网络邻居异构上下文
@@ -388,10 +398,19 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             else:
                 surface_var_in = surface_var.unsqueeze(-1) if surface_var.dim() == 2 else surface_var
 
-            # 串联宏观先验特征、实时匹配代价、收敛速度探测器、物理先验W、绝对几何防伪特征以及内部特征跳变散度
-            # 此时特征量纲严格对齐 [B, N, H + 7]
-            # 💡 【核心阻断：阻断梯度倒流】使用 init_hidden.detach() 和 max_intra_feat_var.detach() 切断置信度 Loss 对前向平面参数/FeatureNet的扭曲反噬
-            W_update_input = torch.cat([init_hidden.detach(), current_costs, delta_cost, W_plane_tri, W_raw_anchor_in, normalized_slope_in, surface_var_in, max_intra_feat_var.detach()], dim=-1)
+            # 串联宏观先验特征、实时匹配代价、收敛速度探测器、物理先验W以及绝对几何防伪特征
+            # 此时特征量纲严格对齐 [B, N, H + 6 + 16]
+            # 💡 【核心阻断：阻断梯度倒流】使用 init_hidden.detach() 切断置信度 Loss 对前向平面参数/FeatureNet的扭曲反噬
+            W_update_input = torch.cat([
+                init_hidden.detach(), 
+                current_costs, 
+                delta_cost, 
+                W_plane_tri, 
+                W_raw_anchor_in, 
+                normalized_slope_in, 
+                surface_var_in, 
+                intra_feat_embed
+            ], dim=-1)
             W_plane_tri_raw = self.confidence_predict_head(W_update_input)
 
             # 🎯 【残差修正模式】：以上一轮置信度为基准，神经网络只学习 [-0.3, 0.3] 内的修正量，实现时序累加
@@ -555,8 +574,27 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         max_shift_Z = d_max_val * 0.05
         delta_Z = torch.tanh(delta_Z_raw) * max_shift_Z
 
+        # Exp-5: 执行切空间法向微调
+        delta_uv_raw = self.normal_head(refine_input)  # [B, N, 2]
+        delta_uv = torch.tanh(delta_uv_raw) * 0.15     # 限制最大偏转角度约 8.5 度
+
+        du = delta_uv[..., 0:1]
+        dv = delta_uv[..., 1:2]
+
+        # 构造局部正交切空间基底 (u, v)
+        c = torch.tensor([1.0, 0.0, 0.0], device=agg_n.device).view(1, 1, 3).expand_as(agg_n)
+        mask_singularity = (torch.abs(agg_n[..., 0]) > 0.9).unsqueeze(-1)
+        c_alt = torch.tensor([0.0, 1.0, 0.0], device=agg_n.device).view(1, 1, 3).expand_as(agg_n)
+        c = torch.where(mask_singularity, c_alt, c)
+
+        u = F.normalize(torch.cross(agg_n, c, dim=-1), p=2, dim=-1)
+        v = F.normalize(torch.cross(agg_n, u, dim=-1), p=2, dim=-1)
+
+        # 在切空间叠加扰动并重归一化
+        n_new_raw = agg_n + du * u + dv * v
+        n_new = F.normalize(n_new_raw, p=2, dim=-1)
+
         # 执行刚性约束闭环更新
-        n_new = agg_n
         Z_new = (Z_agg + delta_Z).clamp(min=min_bound_tensor.view(B, 1, 1), max=d_max_val)
 
         # 质心物理射线反解出唯一的闭环截距 d (捍卫大面根基)

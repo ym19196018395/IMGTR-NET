@@ -556,7 +556,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 3. 法向约束 (晚启动，晚满载，早退坡)：
     # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
-    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.0, 0.5, 0.55, max_lambda_n_1, end_ratio=0.05)
+    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.0, 0.3, 0.95, max_lambda_n_1, end_ratio=0.85)
 
     # 4. cost约束
     lambda_cost = get_smooth_weight_with_decay(progress, 0.0, 0.1, 0.6, max_lambda_cost, end_ratio=0.5)

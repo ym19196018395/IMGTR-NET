@@ -698,8 +698,11 @@ def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_
             loss_curved_aux = torch.clamp(W_pred[mask_curved] - 0.2, min=0.0).mean()
             loss_aux = loss_aux + loss_curved_aux
             
-    # 结合辅助损失
-    loss_final = loss_conf + loss_aux
+    
+    # 早期 Hinge(aux) 主导给稳定锚点，晚期动态真值(dyn)主导做精细拟合
+    weight_dyn = 0.3 + 0.7 * progress
+    weight_aux = 1.5 - 1.0 * progress
+    loss_final = loss_conf * weight_dyn + loss_aux * weight_aux
 
     # 还原像素空间置信度真值用于 TensorBoard
     tri_id_flat_dense = tri_id_map.squeeze(1).view(B, -1, 1)
