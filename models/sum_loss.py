@@ -8,6 +8,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import math
+from utils import compute_normal_map_torch
 
 def compute_edge_supervision_loss(
         edge_label_generator,
@@ -827,3 +828,64 @@ def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=
     cos_sim = (n_pred * n_gt_tensor).sum(dim=-1)
     loss = (1.0 - torch.abs(cos_sim))[valid_mask].mean()
     return loss
+
+
+def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=None, cliff_threshold=0.8):
+    """
+    P1: 像素级 D2N 几何正则化损失 (Pixel-Level Differentiable Normal Loss)
+    利用可微差分算子从 Stage 1 原生像素级深度求出预测法向量，
+    通过余弦相似度损失反向传播，强行熨平弱纹理区域的深度凹凸噪点。
+    同时使用深度梯度断崖掩码过滤掉房檐、物体边界处的飞面法向。
+
+    Args:
+        depth_pixel_pred: [B, H, W] 或 [B, 1, H, W] Stage 1 原生像素级 PM 深度 (depth_patchmatch['stage_1'][0])
+        depth_gt:         [B, H, W] 或 [B, 1, H, W] Stage 1 GT 深度
+        intrinsics:       [B, 3, 3] 参考视角相机内参
+        mask:             [B, H, W] 或 [B, 1, H, W] 0-1 有效深度掩码
+        cliff_threshold:  断崖过滤阈值 (默认 0.8 米)，过滤楼檐悬崖处的虚假法向
+
+    Returns:
+        loss_pix_normal:  标量 Loss
+    """
+    device = depth_pixel_pred.device
+    if depth_pixel_pred.dim() == 3:
+        depth_pixel_pred = depth_pixel_pred.unsqueeze(1)
+    if depth_gt.dim() == 3:
+        depth_gt = depth_gt.unsqueeze(1)
+
+    # 1. 前置平滑 + 可微计算预测法向 (smooth=True 抑制微分高频噪声放大)
+    N_pred, _ = compute_normal_map_torch(depth_pixel_pred, intrinsics, mask=None, smooth=True)
+
+    # 2. 从 GT 深度计算真值法向 (detach 隔离)
+    with torch.no_grad():
+        N_gt, _ = compute_normal_map_torch(depth_gt, intrinsics, mask=None, smooth=True)
+        N_gt = N_gt.detach()
+
+        # 3. 房檐悬崖断崖掩码 (Occlusion Edge Mask / Cliff Filter)
+        # 计算 GT 深度在 x 和 y 方向的相邻差分落差
+        diff_x = torch.zeros_like(depth_gt)
+        diff_y = torch.zeros_like(depth_gt)
+        diff_x[:, :, :, 1:] = torch.abs(depth_gt[:, :, :, 1:] - depth_gt[:, :, :, :-1])
+        diff_y[:, :, 1:, :] = torch.abs(depth_gt[:, :, 1:, :] - depth_gt[:, :, :-1, :])
+        diff_max = torch.max(diff_x, diff_y)
+
+        valid_cliff = diff_max < cliff_threshold
+
+        if mask is not None:
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            valid_mask = (mask > 0.5) & (depth_gt > 1e-4) & valid_cliff
+        else:
+            valid_mask = (depth_gt > 1e-4) & valid_cliff
+
+    # 4. 余弦相似度损失: 1.0 - abs(cos_sim) 或 1.0 - cos_sim (由于 compute_normal_map_torch 统一朝向相机 Z<0，直接计算点积)
+    cos_sim = torch.sum(N_pred * N_gt, dim=1, keepdim=True)  # [B, 1, H, W]
+    loss_map = 1.0 - cos_sim
+
+    if valid_mask.sum() > 0:
+        loss_pix_normal = loss_map[valid_mask].mean()
+    else:
+        loss_pix_normal = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return loss_pix_normal
+

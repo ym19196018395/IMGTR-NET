@@ -507,7 +507,7 @@ class PatchmatchNet(nn.Module):
         continuity_s_loss = [] # 正则化损失，防止边断裂概率都为1
         output_plane={
             'final_plane':[], # 最终结果平面 B,N,4
-           'depth_stage1_pixels':[],# stage2放大后产生的深度图
+            'depth_stage1_pixels':[],# stage1的深度图
             'normal_pro':[], # 传播后法向量--可视化
             'normal_pro_pure': [],  # 传播后法向量像素级
             'tri_id_map':[],# 三角形stage1下的id图

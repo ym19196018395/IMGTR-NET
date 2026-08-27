@@ -263,6 +263,9 @@ class MVSDataset(Dataset):
                                                           self.mode, scan, file_id))
             else:
                 img_filename = os.path.join(self.datapath,"{}/Images/{}/{}/{}.png".format(self.mode,scan,vid,file_id))
+                triangulation_filename = os.path.join(self.datapath,
+                                                      '{}/Images/{}/{}/CDT_info_vlf_{}.txt'.format(
+                                                          self.mode, scan, vid, file_id))
 
             depth_filename_hr = os.path.join(self.datapath,
                                              "{}/Depths/{}/{}/{}.png".format(self.mode, scan, vid, file_id))
@@ -294,8 +297,11 @@ class MVSDataset(Dataset):
                 W = imgs_0[0].shape[1]
                 H = imgs_0[0].shape[0]
 
-                cdt_data = get_cdt_datas(triangulation_filename, H=H, W=W)
+            # 所有视图都要读取网格数据
+            cdt_curr = get_cdt_datas(triangulation_filename, H=H, W=W)
+            cdt_data.append(cdt_curr)
 
+            if vid == 1:
                 # --- 🚨 新增：读取离线超轻量 npz 几何特征并进行一维极速判定与降级 ---
                 npz_path = os.path.join(self.datapath, self.mode, "Images", scan, "triangulation", f"geom_svd_{file_id}.npz")
                 if os.path.exists(npz_path):
@@ -391,16 +397,23 @@ class MVSDataset(Dataset):
         intrinsics_mats['stage_0'] = intrinsics_matrices_0
 
         # todo：将数据转化为list or ndarray，为的是后续可以使用，如果之后要进行并行运算还需要修改
-        vertexs = np.asarray(cdt_data.vertexs, dtype=np.float32)
-        lines = np.asarray(cdt_data.lines, dtype=np.int64)
-        # 每个 triangle 分开处理，保留 list，
-        triangles = []
-        for t in cdt_data.triangles:
-            tri_v = np.asarray(t.vertex_ids, dtype=np.int64)
-            tri_l = np.asarray(t.line_ids, dtype=np.int64)
-            tri_pts = np.asarray(t.valid_points, dtype=np.int64)  # 变长，允许不同长度
-            triangles.append({'vertex_ids': tri_v, 'line_ids': tri_l, 'valid_points': tri_pts})
+        vertexs_list = []
+        lines_list = []
+        triangles_list = []
+        for cdt in cdt_data:
+            vertexs_list.append(np.asarray(cdt.vertexs, dtype=np.float32))
+            lines_list.append(np.asarray(cdt.lines, dtype=np.int64))
+            triangles = []
+            for t in cdt.triangles:
+                tri_v = np.asarray(t.vertex_ids, dtype=np.int64)
+                tri_l = np.asarray(t.line_ids, dtype=np.int64)
+                tri_pts = np.asarray(t.valid_points, dtype=np.int64)  # 变长，允许不同长度
+                triangles.append({'vertex_ids': tri_v, 'line_ids': tri_l, 'valid_points': tri_pts})
+            triangles_list.append(triangles)
 
+        vertexs = vertexs_list
+        lines = lines_list
+        triangles = triangles_list
 
         return {"imgs": imgs,  # N*3*H0*W0
                 "proj_matrices": proj,  # N*4*4

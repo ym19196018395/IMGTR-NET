@@ -2633,6 +2633,9 @@ class PlaneVisualizer:
         normal_vis[:, 2, :, :] = -normal_vis[:, 2, :, :]  # 翻转 Z 用于显示
         # 专门针对于目前这个 svd 拟合 ym-modify
         normal_vis[:, 1, :, :] = -normal_vis[:, 1, :, :]  # 翻转 Y 用于显示
+
+        normal_vis[:, 0, :, :] = -normal_vis[:, 0, :, :]  # 翻转 X 用于显示
+
         normal_vis = (normal_vis + 1.0) / 2.0
 
         mask_expand = invalid_mask.unsqueeze(1).expand(-1, 3, -1, -1)
