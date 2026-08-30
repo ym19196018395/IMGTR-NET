@@ -2092,13 +2092,421 @@ def filter_depth_new3( scans ,plyfilename, geo_pixel_thres, geo_depth_thres, pho
 def swap_views_in_dict(d, v1, v2):
     if d is None:
         return None
+    if v1 == v2:
+        return d
     new_d = {}
     for k, v in d.items():
         if isinstance(v, torch.Tensor):
             v_new = v.clone()
             v_new[:, [v1, v2]] = v_new[:, [v2, v1]]
             new_d[k] = v_new
+        elif isinstance(v, np.ndarray):
+            v_new = v.copy()
+            v_new[:, [v1, v2]] = v_new[:, [v2, v1]]
+            new_d[k] = v_new
+        elif isinstance(v, list):
+            v_new = list(v)
+            v_new[v1], v_new[v2] = v_new[v2], v_new[v1]
+            new_d[k] = v_new
+        else:
+            new_d[k] = v
     return new_d
+
+def extract_init_planes_from_maps(depth_no_pro, normal_no_pro, tri_id_map, K_ref_s1, N_tri):
+    """
+    👑 方案 1：从 DensePlaneFitter 初始渲染的 depth_no_pro 和 normal_no_pro 中精确反求每个三角形的初始拟合平面方程 (nx, ny, nz, d)
+    数学上与原始刚拟合出的未传播平面 100% 精确等价，零接口改动！
+    """
+    init_planes = np.zeros((N_tri, 4), dtype=np.float64)
+    fx, fy = K_ref_s1[0, 0], K_ref_s1[1, 1]
+    cx, cy = K_ref_s1[0, 2], K_ref_s1[1, 2]
+    
+    unique_tris = np.unique(tri_id_map)
+    for tri_id in unique_tris:
+        if tri_id < 0 or tri_id == 255 or tri_id >= N_tri:
+            continue
+        mask_i = (tri_id_map == tri_id)
+        if not mask_i.any():
+            continue
+            
+        # 1. 提取法向量 (三角形内各像素法向处处恒等于初始法向 n_i)
+        norm_i = normal_no_pro[mask_i] # [P, 3]
+        n_vec = np.mean(norm_i, axis=0)
+        norm_mag = np.linalg.norm(n_vec)
+        if norm_mag < 1e-4:
+            continue
+        n_vec = n_vec / norm_mag
+        
+        # 2. 提取有效像素深度与坐标反求截距 d_i
+        v_indices, u_indices = np.where(mask_i)
+        depths_i = depth_no_pro[mask_i]
+        valid_p = depths_i > 0.1
+        if not valid_p.any():
+            continue
+            
+        # 取中间像素点计算空间 3D 坐标
+        valid_u = u_indices[valid_p]
+        valid_v = v_indices[valid_p]
+        mid_idx = len(valid_u) // 2
+        u_mid = valid_u[mid_idx]
+        v_mid = valid_v[mid_idx]
+        z_mid = depth_no_pro[v_mid, u_mid]
+        
+        X_mid = (u_mid - cx) / fx * z_mid
+        Y_mid = (v_mid - cy) / fy * z_mid
+        Z_mid = z_mid
+        
+        # 平面方程: nx*X + ny*Y + nz*Z + d = 0 => d = -(nx*X + ny*Y + nz*Z)
+        d_val = -(n_vec[0] * X_mid + n_vec[1] * Y_mid + n_vec[2] * Z_mid)
+        init_planes[tri_id] = [n_vec[0], n_vec[1], n_vec[2], d_val]
+        
+    return init_planes
+
+def compute_topology_tear_scores(planes, triangles_raw, lines_raw, vertexs_raw, K_ref_s1, tri_id_map):
+    """
+    👑 实验一：纯方向切向夹角拓扑质检算法 (Pure Directional Alignment Topo Check)
+    完全尺度无关 (Scale-Invariant)、免疫绝对深度与平移病态放大，只检验折痕棱线与网格边是否同向平行延伸！
+    """
+    from collections import defaultdict
+    N_tri = len(planes)
+    H_s1, W_s1 = tri_id_map.shape
+    
+    vertexs_s1 = vertexs_raw.astype(np.float32) / 2.0
+    
+    edge_to_faces = defaultdict(list)
+    for i in range(N_tri):
+        if i < len(triangles_raw):
+            t = triangles_raw[i]
+            line_ids = t['line_ids']
+            for l_id in line_ids:
+                edge_to_faces[int(l_id)].append(i)
+                
+    topo_tear_scores = np.zeros(N_tri, dtype=np.float32) # 记录最大方向偏角 (度)
+    is_pruned_tri = np.zeros(N_tri, dtype=bool)
+    
+    fx, fy = K_ref_s1[0, 0], K_ref_s1[1, 1]
+    cx, cy = K_ref_s1[0, 2], K_ref_s1[1, 2]
+    
+    for i in range(N_tri):
+        plane_i = planes[i]
+        n_i = plane_i[:3].astype(np.float64)
+        d_i = float(plane_i[3])
+        
+        norm_i = np.linalg.norm(n_i)
+        if norm_i < 1e-4 or d_i == 0.0:
+            continue
+        n_i = n_i / norm_i
+        
+        if i >= len(triangles_raw):
+            continue
+        t_i = triangles_raw[i]
+        line_ids_i = t_i['line_ids']
+        
+        valid_edge_angles = []
+        
+        for l_id in line_ids_i:
+            l_id_int = int(l_id)
+            faces = edge_to_faces[l_id_int]
+            if len(faces) < 2:
+                continue
+            
+            j = faces[1] if faces[0] == i else faces[0]
+            if j < 0 or j >= N_tri or j == i:
+                continue
+                
+            plane_j = planes[j]
+            n_j = plane_j[:3].astype(np.float64)
+            d_j = float(plane_j[3])
+            
+            norm_j = np.linalg.norm(n_j)
+            if norm_j < 1e-4 or d_j == 0.0:
+                continue
+            n_j = n_j / norm_j
+            
+            if l_id_int >= len(lines_raw):
+                continue
+            v_pair = lines_raw[l_id_int]
+            va_idx, vb_idx = int(v_pair[0]), int(v_pair[1])
+            if va_idx >= len(vertexs_s1) or vb_idx >= len(vertexs_s1):
+                continue
+                
+            VA = vertexs_s1[va_idx]
+            VB = vertexs_s1[vb_idx]
+            
+            # 步骤 1.1：法向夹角判定
+            cos_norm = np.clip(np.dot(n_i, n_j), -1.0, 1.0)
+            norm_angle_deg = np.arccos(cos_norm) * (180.0 / np.pi)
+            if norm_angle_deg < 5.0: # 平坦共面，夹角偏差为 0
+                valid_edge_angles.append(0.0)
+                continue
+                
+            # 步骤 1.2：求解 3D 空间相交线方向 v
+            v_3d = np.cross(n_i, n_j)
+            v_len = np.linalg.norm(v_3d)
+            if v_len < 1e-5:
+                continue
+            v_3d = v_3d / v_len
+            
+            # 步骤 1.3：将 3D 相交线方向投影到 2D 图像平面切向 (Scale-Invariant)
+            # 在公共边中点附近取微分射线点进行透视投影
+            P_mid = (VA + VB) / 2.0
+            ray_mid = np.array([(P_mid[0] - cx) / fx, (P_mid[1] - cy) / fy, 1.0])
+            denom_i = np.dot(n_i, ray_mid)
+            if abs(denom_i) < 1e-4:
+                continue
+            z_mid = -d_i / denom_i
+            if z_mid <= 0.1:
+                z_mid = 5.0
+                
+            X_mid = z_mid * ray_mid
+            X_end = X_mid + v_3d * 1.0 # 沿相交线前移 1 米
+            
+            if X_end[2] <= 0.1:
+                X_end = X_mid - v_3d * 1.0
+                
+            p_mid_proj = np.array([fx * (X_mid[0] / X_mid[2]) + cx, fy * (X_mid[1] / X_mid[2]) + cy])
+            p_end_proj = np.array([fx * (X_end[0] / X_end[2]) + cx, fy * (X_end[1] / X_end[2]) + cy])
+            
+            v_proj = p_end_proj - p_mid_proj
+            v_proj_len = np.linalg.norm(v_proj)
+            if v_proj_len < 1e-4:
+                continue
+            t_line = v_proj / v_proj_len
+            
+            # 步骤 1.4：2D 网格边切向与无向方向夹角 Δθ
+            v_edge = VB - VA
+            v_edge_len = np.linalg.norm(v_edge)
+            if v_edge_len < 1e-4:
+                continue
+            t_edge = v_edge / v_edge_len
+            
+            cos_delta = abs(t_edge[0] * t_line[0] + t_edge[1] * t_line[1])
+            delta_theta_deg = np.arccos(np.clip(cos_delta, 0.0, 1.0)) * (180.0 / np.pi)
+            valid_edge_angles.append(float(delta_theta_deg))
+            
+        # 步骤 1.5：👑 纯方向夹角阶梯判决 (Scale-Invariant Decision)
+        if valid_edge_angles:
+            max_angle = max(valid_edge_angles)
+            mean_angle = np.mean(valid_edge_angles)
+            topo_tear_scores[i] = max_angle
+            
+            # 规则 A：单边严重横跨屋脊 (Δθ > 40°) -> 解决屋脊端头/单边错误假面
+            # 规则 B：多边中度斜切 (>=2条边且均值 > 25°) -> 解决连续跨脊假面
+            if max_angle > 40.0 or (len(valid_edge_angles) >= 2 and mean_angle > 25.0):
+                is_pruned_tri[i] = True
+                
+    topo_tear_map = np.zeros((H_s1, W_s1), dtype=np.float32)
+    unique_tris = np.unique(tri_id_map)
+    for tri_id in unique_tris:
+        if tri_id < 0 or tri_id == 255 or tri_id >= N_tri:
+            continue
+        topo_tear_map[tri_id_map == tri_id] = topo_tear_scores[tri_id]
+        
+    return topo_tear_scores, is_pruned_tri, topo_tear_map
+
+def compute_edge_topology_tears(planes, triangles_raw, lines_raw, vertexs_raw, K_ref_s1):
+    """
+    👑 边级纯方向切向夹角分析 (Scale-Invariant Edge Tangent Alignment)
+    以每条网格公共边为第一性基元，直接度量相交棱线与公共边的 2D 延伸方向夹角 Δθ。
+    """
+    from collections import defaultdict
+    N_tri = len(planes)
+    N_lines = len(lines_raw)
+    vertexs_s1 = vertexs_raw.astype(np.float32) / 2.0
+    
+    edge_to_faces = defaultdict(list)
+    for i in range(N_tri):
+        if i < len(triangles_raw):
+            t = triangles_raw[i]
+            for l_id in t['line_ids']:
+                edge_to_faces[int(l_id)].append(i)
+                
+    fx, fy = K_ref_s1[0, 0], K_ref_s1[1, 1]
+    cx, cy = K_ref_s1[0, 2], K_ref_s1[1, 2]
+    
+    edge_records = []
+    
+    for l_id in range(N_lines):
+        v_pair = lines_raw[l_id]
+        va_idx, vb_idx = int(v_pair[0]), int(v_pair[1])
+        if va_idx >= len(vertexs_s1) or vb_idx >= len(vertexs_s1):
+            continue
+            
+        VA = vertexs_s1[va_idx]
+        VB = vertexs_s1[vb_idx]
+        P_mid = (VA + VB) / 2.0
+        
+        faces = edge_to_faces[l_id]
+        if len(faces) < 2:
+            edge_records.append({
+                'line_id': l_id, 'pt1': VA, 'pt2': VB, 'type': 'boundary',
+                'angle_deg': 0.0, 'faces': faces
+            })
+            continue
+            
+        i, j = faces[0], faces[1]
+        if i >= N_tri or j >= N_tri:
+            continue
+            
+        plane_i = planes[i]
+        plane_j = planes[j]
+        n_i = plane_i[:3].astype(np.float64)
+        d_i = float(plane_i[3])
+        n_j = plane_j[:3].astype(np.float64)
+        d_j = float(plane_j[3])
+        
+        norm_i = np.linalg.norm(n_i)
+        norm_j = np.linalg.norm(n_j)
+        if norm_i < 1e-4 or norm_j < 1e-4 or d_i == 0.0 or d_j == 0.0:
+            continue
+            
+        n_i = n_i / norm_i
+        n_j = n_j / norm_j
+        
+        # 法向夹角
+        cos_norm = np.clip(np.dot(n_i, n_j), -1.0, 1.0)
+        norm_angle_deg = np.arccos(cos_norm) * (180.0 / np.pi)
+        if norm_angle_deg < 5.0: # 平坦共面
+            edge_records.append({
+                'line_id': l_id, 'pt1': VA, 'pt2': VB, 'type': 'flat',
+                'angle_deg': 0.0, 'faces': (i, j)
+            })
+            continue
+            
+        # 求解 3D 相交线方向
+        v_3d = np.cross(n_i, n_j)
+        v_len = np.linalg.norm(v_3d)
+        if v_len < 1e-5:
+            continue
+        v_3d = v_3d / v_len
+        
+        # 投影到 2D 图像切向
+        ray_mid = np.array([(P_mid[0] - cx) / fx, (P_mid[1] - cy) / fy, 1.0])
+        denom_i = np.dot(n_i, ray_mid)
+        if abs(denom_i) < 1e-4:
+            continue
+        z_mid = -d_i / denom_i
+        if z_mid <= 0.1:
+            z_mid = 5.0
+            
+        X_mid = z_mid * ray_mid
+        X_end = X_mid + v_3d * 1.0
+        if X_end[2] <= 0.1:
+            X_end = X_mid - v_3d * 1.0
+            
+        p_mid_proj = np.array([fx * (X_mid[0] / X_mid[2]) + cx, fy * (X_mid[1] / X_mid[2]) + cy])
+        p_end_proj = np.array([fx * (X_end[0] / X_end[2]) + cx, fy * (X_end[1] / X_end[2]) + cy])
+        
+        v_proj = p_end_proj - p_mid_proj
+        v_proj_len = np.linalg.norm(v_proj)
+        if v_proj_len < 1e-4:
+            continue
+        t_line = v_proj / v_proj_len
+        
+        # 2D 网格边切向
+        v_edge = VB - VA
+        v_edge_len = np.linalg.norm(v_edge)
+        if v_edge_len < 1e-4:
+            continue
+        t_edge = v_edge / v_edge_len
+        
+        cos_delta = abs(t_edge[0] * t_line[0] + t_edge[1] * t_line[1])
+        delta_theta_deg = np.arccos(np.clip(cos_delta, 0.0, 1.0)) * (180.0 / np.pi)
+        
+        # 👑 纯方向分类准则
+        if delta_theta_deg < 15.0:
+            e_type = 'good_crease' # 真实物理屋脊/折痕 (共线平行延伸)
+        elif delta_theta_deg <= 35.0:
+            e_type = 'mild_skew'   # 轻度斜交
+        else:
+            e_type = 'severe_tear' # 严重横跨撕裂边 (斜交/垂直横切屋脊)
+            
+        edge_records.append({
+            'line_id': l_id, 'pt1': VA, 'pt2': VB, 'type': e_type,
+            'angle_deg': float(delta_theta_deg), 'faces': (i, j)
+        })
+        
+    return edge_records
+
+def plot_edge_tear_vector_map(edge_records, H_s1, W_s1, ref_img_np, save_path):
+    """
+    绘制纯方向切向夹角矢量线框图 (_topo_edge_tear_vis.png)
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    import matplotlib.patches as mpatches
+    
+    lines_flat = []          # 暗绿色细线 (共面平坦)
+    lines_good_crease = []   # 亮绿色线 (真屋脊/共线平行)
+    lines_mild = []          # 黄色线 (轻度斜交)
+    lines_severe = []        # 红色粗线 (横切屋脊撕裂边)
+    lines_boundary = []      # 浅蓝细线 (外边界)
+    
+    for rec in edge_records:
+        seg = [rec['pt1'], rec['pt2']]
+        t = rec['type']
+        if t == 'flat':
+            lines_flat.append(seg)
+        elif t == 'good_crease':
+            lines_good_crease.append(seg)
+        elif t == 'mild_skew':
+            lines_mild.append(seg)
+        elif t == 'severe_tear':
+            lines_severe.append(seg)
+        elif t == 'boundary':
+            lines_boundary.append(seg)
+            
+    fig, ax = plt.subplots(figsize=(12, 10), facecolor='black')
+    ax.set_facecolor('black')
+    
+    if ref_img_np is not None:
+        if ref_img_np.ndim == 3:
+            gray = np.mean(ref_img_np, axis=2) if ref_img_np.shape[2] == 3 else ref_img_np[..., 0]
+            ax.imshow(gray * 0.35, cmap='gray', vmin=0, vmax=255, extent=[0, W_s1, H_s1, 0])
+        else:
+            ax.imshow(ref_img_np * 0.35, cmap='gray', extent=[0, W_s1, H_s1, 0])
+    else:
+        ax.set_xlim(0, W_s1)
+        ax.set_ylim(H_s1, 0)
+        
+    # 分层渲染
+    if lines_boundary:
+        lc_bound = LineCollection(lines_boundary, colors='#5588BB', linewidths=0.9, alpha=0.6)
+        ax.add_collection(lc_bound)
+    if lines_flat:
+        lc_flat = LineCollection(lines_flat, colors='#00AA44', linewidths=0.9, alpha=0.7)
+        ax.add_collection(lc_flat)
+    if lines_good_crease:
+        lc_good = LineCollection(lines_good_crease, colors='#00FF66', linewidths=2.0, alpha=0.95)
+        ax.add_collection(lc_good)
+    if lines_mild:
+        lc_mild = LineCollection(lines_mild, colors='#FFCC00', linewidths=1.8, alpha=0.95)
+        ax.add_collection(lc_mild)
+    if lines_severe:
+        lc_severe = LineCollection(lines_severe, colors='#FF1111', linewidths=2.8, alpha=1.0)
+        ax.add_collection(lc_severe)
+        
+    ax.set_xlim(0, W_s1)
+    ax.set_ylim(H_s1, 0)
+    ax.axis('off')
+    
+    p_good = mpatches.Patch(color='#00FF66', label=f'True Ridge / Crease (Δθ < 15°): {len(lines_good_crease)}')
+    p_flat = mpatches.Patch(color='#00AA44', label=f'Flat Coplanar: {len(lines_flat)}')
+    p_mild = mpatches.Patch(color='#FFCC00', label=f'Mild Skew (15°~35°): {len(lines_mild)}')
+    p_severe = mpatches.Patch(color='#FF1111', label=f'Cross-Ridge Severe Tear (Δθ > 35°): {len(lines_severe)}')
+    p_bound = mpatches.Patch(color='#5588BB', label=f'Mesh Boundary: {len(lines_boundary)}')
+    
+    ax.legend(handles=[p_good, p_flat, p_mild, p_severe, p_bound],
+              loc='upper right', framealpha=0.85, fontsize=10, facecolor='#111111', edgecolor='white', labelcolor='white')
+              
+    plt.title(f'Directional Tangent Alignment Mesh Diagnostic (Scale-Invariant)\n'
+              f'Total Edges: {len(edge_records)} | Cross-Ridge Bad Edges: {len(lines_severe)} | True Ridge Creases: {len(lines_good_crease)}',
+              fontsize=13, fontweight='bold', color='white')
+              
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=180, bbox_inches='tight', pad_inches=0.1, facecolor='black')
+    plt.close()
+    print(f"   [Visualization] Directional Vector Alignment Map saved to: {save_path}")
 
 def save_depth_cross_check():
     # dataset, dataloader
@@ -2136,9 +2544,6 @@ def save_depth_cross_check():
             
             intrinsics_s1 = sample["intrinsics_mats"]['stage_1'][0].cpu().numpy() # [V, 3, 3]
             extrinsics = sample["proj_matrices"]['stage_0'][0].cpu().numpy() # [V, 4, 4], extrinsics are in proj_matrices initially
-            # Wait! eval_whu_big.py line 361: proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
-            # The orig extrinsics are overwritten! 
-            # We must parse extrinsics from proj_matrices by multiplying with inv(intrinsics).
             
             # Helper to get raw extrinsics:
             extrinsics_raw = []
@@ -2150,7 +2555,9 @@ def save_depth_cross_check():
                 extrinsics_raw.append(E)
             extrinsics_raw = np.stack(extrinsics_raw)
             
-            for v in range(num_views):
+            # 👑 实验二升级：前向参考视图 (v=0) 以及两个互补主源视角 (v=1, v=2)，兼顾极致轻量与遮挡免疫！
+            views_to_run = [0, 1, 2] if num_views >= 3 else list(range(num_views))
+            for v in views_to_run:
                 # Swap data
                 imgs_v = tocuda(swap_views_in_dict(sample["imgs"], v, 0), device=device)
                 proj_v = tocuda(swap_views_in_dict(sample["proj_matrices"], v, 0), device=device)
@@ -2203,6 +2610,15 @@ def save_depth_cross_check():
                     # 2. 平面几何解析深度 (经过三角网格拟合/传播的平面几何深度)
                     ref_stage1_plane_depth = d1
                     
+                    ref_stage1_normal = None
+                    if 'normal_pro_pure' in outputs.get("output_plane", {}):
+                        normal_tensor = outputs["output_plane"]['normal_pro_pure'][0]
+                        normal_np = normal_tensor.detach().cpu().numpy() if isinstance(normal_tensor, torch.Tensor) else normal_tensor
+                        ref_stage1_normal = np.transpose(normal_np, (1, 2, 0))  # [H_s1, W_s1, 3]
+                    elif 'normal_pro' in outputs.get("output_plane", {}):
+                        normal_tensor = outputs["output_plane"]['normal_pro'][0]
+                        ref_stage1_normal = normal_tensor.detach().cpu().numpy() if isinstance(normal_tensor, torch.Tensor) else normal_tensor
+                    
                     ref_tri_id_map = None
                     if "tri_id_map" in outputs.get("output_plane", {}):
                         tri_map_data = outputs["output_plane"]["tri_id_map"]
@@ -2210,72 +2626,122 @@ def save_depth_cross_check():
                             tri_map_data = tri_map_data.detach().cpu().numpy()
                         ref_tri_id_map = np.squeeze(tri_map_data[0])
                     
-            # --- CROSS CHECK ---
-            print("Running Stage 1 Geometric Cross-Check...")
+            # ==============================================================================
+            # 👑 双主源正交互补双轨几何 Cross-Check (Dual-Source Dual-Track Cross-Check)
+            # 分支 A：标准容限降级剔除伪平面 (0.08m & 1.0px -> 0.30)
+            # 分支 B：超严苛容限提分回捞真平面 (0.06m & 0.8px -> 0.85)
+            # ==============================================================================
+            print("\n======================= 👑 双主源双轨互补 Cross-Check (Views 1 & 2) 👑 =======================")
             depth_ref_1 = stage1_depths[0]
             K_ref_1 = intrinsics_s1[0]
             E_ref = extrinsics_raw[0]
             
-            geo_pixel_thres = 1.0 # 1 pixel in stage 1
-            geo_abs_depth_thres = 0.08 # 8cm strict absolute depth error for cross-check (收紧几何偏差门槛)
+            # 👑 1. 降级通道参数 (标准容限：0.10m & 1.0px)
+            geo_pixel_thres_deg = 1.0 # 1 pixel
+            base_depth_thres_deg = 0.10 # 基准 10 厘米容限
             
-            valid_src_count = np.zeros_like(depth_ref_1)
+            # 👑 2. 提分通道参数 (非对称超严苛容限：0.06m + 0.8px)
+            geo_pixel_thres_promo = 1.0 # 0.8 pixel 亚像素级严格对齐
+            base_depth_thres_promo = 0.06 # 6cm 极低深度偏差门槛！
             
-            for src_idx in range(1, num_views):
-                # 👑 核心破局：源视角采用纯像素级深度 (stage1_depths_pixels)，作为不受平面先验污染的客观几何裁判！
+            if ref_stage1_normal is not None:
+                norm_mag = np.linalg.norm(ref_stage1_normal, axis=-1, keepdims=True)
+                normal_unit = ref_stage1_normal / (norm_mag + 1e-8)
+                cos_theta = np.abs(normal_unit[..., 2])  # |n_z|
+                cos_theta_clamped = np.clip(cos_theta, 0.30, 1.0)
+                
+                geo_abs_depth_thres_deg_map = base_depth_thres_deg / cos_theta_clamped
+                geo_abs_depth_thres_promo_map = base_depth_thres_promo / cos_theta_clamped
+            else:
+                geo_abs_depth_thres_deg_map = base_depth_thres_deg
+                geo_abs_depth_thres_promo_map = base_depth_thres_promo
+                
+            src_indices = [1, 2] if len(stage1_depths_pixels) >= 3 else [1]
+            src_masks_deg = []
+            src_masks_promo = []
+            
+            import time
+            for src_idx in src_indices:
+                t_start = time.time()
                 depth_src_1 = stage1_depths_pixels[src_idx]
                 K_src_1 = intrinsics_s1[src_idx]
                 E_src = extrinsics_raw[src_idx]
                 
-                # We need depth_reprojected to compute MAE
-                depth_reprojected, x2d_reprojected, y2d_reprojected, x2d_src, y2d_src = reproject_with_depth(depth_ref_1, K_ref_1, E_ref, depth_src_1, K_src_1, E_src)
+                depth_reprojected, x2d_reprojected, y2d_reprojected, x2d_src, y2d_src = reproject_with_depth(
+                    depth_ref_1, K_ref_1, E_ref, depth_src_1, K_src_1, E_src
+                )
+                t_cost = (time.time() - t_start) * 1000.0
                 
-                dist = np.sqrt((x2d_reprojected - np.arange(0, depth_ref_1.shape[1]).reshape(1,-1)) ** 2 + 
-                               (y2d_reprojected - np.arange(0, depth_ref_1.shape[0]).reshape(-1,1)) ** 2)
+                dist_2d = np.sqrt((x2d_reprojected - np.arange(0, depth_ref_1.shape[1]).reshape(1, -1)) ** 2 + 
+                                  (y2d_reprojected - np.arange(0, depth_ref_1.shape[0]).reshape(-1, 1)) ** 2)
                 depth_diff = np.abs(depth_reprojected - depth_ref_1)
                 
-                # Check valid pixels (where depth_reprojected > 0)
                 valid_reproj = depth_reprojected > 0
                 if valid_reproj.sum() > 0:
                     mae = np.mean(depth_diff[valid_reproj])
-                    print(f"   [View {src_idx}] Reproject to Pixel-Depth MAE: {mae:.4f} m, valid pixels: {valid_reproj.sum()}")
+                    print(f"   [Source View {src_idx}] 重投影至纯像素深度 MAE: {mae:.4f} m, 有效像素: {valid_reproj.sum()} (重投影耗时: {t_cost:.1f}ms)")
                 else:
-                    print(f"   [View {src_idx}] No valid reprojected pixels!")
+                    print(f"   [Source View {src_idx}] 无有效重投影像素！")
+                    
+                # 降级通道单源掩码
+                mask_d = np.logical_and(valid_reproj, np.logical_and(dist_2d < geo_pixel_thres_deg, depth_diff < geo_abs_depth_thres_deg_map))
+                src_masks_deg.append(mask_d)
                 
-                # Use Absolute Depth Difference!
-                mask = np.logical_and(valid_reproj, np.logical_and(dist < geo_pixel_thres, depth_diff < geo_abs_depth_thres))
-                valid_src_count += mask.astype(np.int32)
+                # 👑 提分通道单源掩码 (更严苛：0.06m & 0.8px)
+                mask_p = np.logical_and(valid_reproj, np.logical_and(dist_2d < geo_pixel_thres_promo, depth_diff < geo_abs_depth_thres_promo_map))
+                src_masks_promo.append(mask_p)
                 
-            # 👑 视角支持度要求：若视角数充裕(>=3)，要求至少 2 个源视角一致；否则至少 1 个源视角一致
-            min_views_needed = 2 if num_views >= 3 else 1
-            is_consistent_s1 = valid_src_count >= min_views_needed
-            
-            # 👑 依用户指令：基于三角形级别的几何一致性聚合降级 (仅分支 A)
+            # 像素级一致性汇总（任一主源视角通过即为几何一致）
+            if len(src_masks_deg) == 2:
+                is_consistent_s1_deg = src_masks_deg[0] | src_masks_deg[1]
+                is_consistent_s1_promo = src_masks_promo[0] | src_masks_promo[1]
+            else:
+                is_consistent_s1_deg = src_masks_deg[0]
+                is_consistent_s1_promo = src_masks_promo[0]
+            is_consistent_s1 = is_consistent_s1_deg
+                
+            # 5. 👑 三角形级别双主源互补双轨校准 (Complementary Union Dual-Track Rule)
             ref_stage1_conf_degraded = ref_stage1_conf.copy()
-            tri_ratio_threshold = 0.60  # 三角形内部至少有 60% 像素通过多视角一致性，否则认定整体偏差过大
-            degraded_target_val = 0.30  # 统一降级至固定低值 0.30 (< 0.8)
-
+            tri_ratio_threshold_deg = 0.40   # 降级门槛：两个互补主源通过率最大值 < 40% 判定为跨脊假面
+            promote_ratio_threshold = 0.60  # 👑 提分门槛：在任一开阔主源视角下严苛通过率 >= 90% 判定为被低估真平面
+            degraded_target_val = 0.30      # 降级目标值 (< 0.8)
+            promoted_target_val = 0.85      # 提分目标值 (> 0.8)
+            
             if ref_tri_id_map is not None:
                 unique_tris = np.unique(ref_tri_id_map)
+                dual_pruned_tri_count = 0
+                dual_promoted_tri_count = 0
                 for tri_id in unique_tris:
-                    # 背景或未覆盖区域 (-1 或 255) 保持原始置信度不变
                     if tri_id < 0 or tri_id == 255:
                         continue
-                    
-                    mask_tri = (ref_tri_id_map == tri_id)
-                    if not mask_tri.any():
+                    tri_mask = (ref_tri_id_map == tri_id)
+                    tri_pixel_count = np.sum(tri_mask)
+                    if tri_pixel_count == 0:
                         continue
+                        
+                    # 计算该三角形在各个主源视角下的标准与严苛通过率
+                    ratios_deg = [np.sum(m & tri_mask) / float(tri_pixel_count) for m in src_masks_deg]
+                    max_ratio_deg = max(ratios_deg) # 互补取最大
                     
-                    # 统计该三角形内部像素的多视角几何一致性率
-                    consistency_ratio = is_consistent_s1[mask_tri].mean()
+                    ratios_promo = [np.sum(m & tri_mask) / float(tri_pixel_count) for m in src_masks_promo]
+                    max_ratio_promo = max(ratios_promo)
                     
-                    # 分支 A：若几何一致性比例过低，且内部包含高置信度像素 (>0.8)，则统一降级为 0.30
-                    if consistency_ratio < tri_ratio_threshold:
-                        degrade_mask = mask_tri & (ref_stage1_conf > PRED_PLANAR_CONF_THRESHOLD)
+                    # 🔴 分支 A：若两个视角均未达到 40% 通过率，且内部包含高置信度像素 (>0.8)，则统一降级为 0.30
+                    if max_ratio_deg < tri_ratio_threshold_deg:
+                        degrade_mask = tri_mask & (ref_stage1_conf > PRED_PLANAR_CONF_THRESHOLD)
                         ref_stage1_conf_degraded[degrade_mask] = degraded_target_val
+                        dual_pruned_tri_count += 1
+                    # 🟡 👑 分支 B：若在开阔视角下严苛一致性极高 (>=80% 且 0.06m 内通过)，且原本是低分像素 (<=0.8)，则提分回捞升为 0.85！
+                    elif max_ratio_promo >= promote_ratio_threshold:
+                        promote_mask = tri_mask & (ref_stage1_conf <= PRED_PLANAR_CONF_THRESHOLD)
+                        ref_stage1_conf_degraded[promote_mask] = promoted_target_val
+                        dual_promoted_tri_count += 1
+                        
+                print(f"   [Dual-Source Cross-Check] 成功剔除 {dual_pruned_tri_count} 个伪平面 (max_ratio < 40%)，👑 成功提分回捞 {dual_promoted_tri_count} 个被低估真平面！")
             else:
-                # 若无 tri_id_map 则退化为逐像素降级
-                ref_stage1_conf_degraded[~is_consistent_s1 & (ref_stage1_conf > PRED_PLANAR_CONF_THRESHOLD)] = degraded_target_val
+                ref_stage1_conf_degraded[~is_consistent_s1_deg & (ref_stage1_conf > PRED_PLANAR_CONF_THRESHOLD)] = degraded_target_val
+                ref_stage1_conf_degraded[is_consistent_s1_promo & (ref_stage1_conf <= PRED_PLANAR_CONF_THRESHOLD)] = promoted_target_val
+            print(f"==============================================================================================\n")
             
             # Upsample everything to Stage 0 for Evaluation and Saving
             H0, W0 = ref_stage0_depth.shape[-2:]
@@ -2306,16 +2772,26 @@ def save_depth_cross_check():
                 
                 # 3. 统计多维度深度与区域消融 MAE
                 valid_orig_plane = valid_gt_mask_s1 & mask_planar_orig   # 未过滤时的初始预测平面区
-                valid_deg_plane = valid_gt_mask_s1 & mask_planar_deg     # 经 Cross-Check 过滤后的真平面区
+                valid_deg_plane = valid_gt_mask_s1 & mask_planar_deg     # 经双向校准后的最终平面区
+                
+                # 状态细分掩码：
+                retained_mask = valid_orig_plane & valid_deg_plane       # 🟢 原始真平面保留
+                pruned_mask = valid_orig_plane & (~valid_deg_plane)      # 🔴 剔除伪平面
+                promoted_mask = (~valid_orig_plane) & valid_deg_plane    # 🟡 👑 提分回捞真平面
+                non_plane_mask = valid_gt_mask_s1 & (~valid_orig_plane) & (~valid_deg_plane) # 🔵 非平面
                 
                 # 【1. 原版 PatchmatchNet 纯像素深度 ref_stage1_pixel_depth】
                 mae_pixel_global = np.mean(np.abs(ref_stage1_pixel_depth[valid_gt_mask_s1] - depth_gt_s1[valid_gt_mask_s1]))
                 mae_pixel_orig_plane = np.mean(np.abs(ref_stage1_pixel_depth[valid_orig_plane] - depth_gt_s1[valid_orig_plane])) if valid_orig_plane.sum() > 0 else 0.0
                 mae_pixel_deg_plane = np.mean(np.abs(ref_stage1_pixel_depth[valid_deg_plane] - depth_gt_s1[valid_deg_plane])) if valid_deg_plane.sum() > 0 else 0.0
+                mae_pixel_promoted = np.mean(np.abs(ref_stage1_pixel_depth[promoted_mask] - depth_gt_s1[promoted_mask])) if promoted_mask.sum() > 0 else 0.0
+                mae_pixel_pruned = np.mean(np.abs(ref_stage1_pixel_depth[pruned_mask] - depth_gt_s1[pruned_mask])) if pruned_mask.sum() > 0 else 0.0
 
                 # 【2. 三角几何平面解析深度 ref_stage1_plane_depth】
                 mae_plane_orig_plane = np.mean(np.abs(ref_stage1_plane_depth[valid_orig_plane] - depth_gt_s1[valid_orig_plane])) if valid_orig_plane.sum() > 0 else 0.0
                 mae_plane_deg_plane = np.mean(np.abs(ref_stage1_plane_depth[valid_deg_plane] - depth_gt_s1[valid_deg_plane])) if valid_deg_plane.sum() > 0 else 0.0
+                mae_plane_promoted = np.mean(np.abs(ref_stage1_plane_depth[promoted_mask] - depth_gt_s1[promoted_mask])) if promoted_mask.sum() > 0 else 0.0
+                mae_plane_pruned = np.mean(np.abs(ref_stage1_plane_depth[pruned_mask] - depth_gt_s1[pruned_mask])) if pruned_mask.sum() > 0 else 0.0
 
                 # 【3. 全图物理融合深度 (平面走 plane, 其余走 pixel)】
                 mae_fused_orig_global = np.mean(np.abs(depth_fused_orig[valid_gt_mask_s1] - depth_gt_s1[valid_gt_mask_s1]))
@@ -2325,10 +2801,18 @@ def save_depth_cross_check():
                 print(f"   【1. 原版 PatchmatchNet 纯像素深度 (Z_pixel)】")
                 print(f"      • 全图有效区域 MAE:               {mae_pixel_global:.4f} m")
                 print(f"      • 未 Cross-Check 原始平面区 MAE:  {mae_pixel_orig_plane:.4f} m (像素数: {valid_orig_plane.sum()})")
-                print(f"      • 经 Cross-Check 真实平面区 MAE:  {mae_pixel_deg_plane:.4f} m (像素数: {valid_deg_plane.sum()})")
+                print(f"      • 经 Cross-Check 最终平面区 MAE:  {mae_pixel_deg_plane:.4f} m (像素数: {valid_deg_plane.sum()})")
+                if promoted_mask.sum() > 0:
+                    print(f"      • 🟡 提分回捞区 (Promoted) 像素 MAE: {mae_pixel_promoted:.4f} m (原 PatchmatchNet 像素深度)")
+                if pruned_mask.sum() > 0:
+                    print(f"      • 🔴 剔除伪平面区 (Pruned) 像素 MAE: {mae_pixel_pruned:.4f} m (回退至像素深度)")
                 print(f"   【2. 三角几何平面解析深度 (Z_plane)】")
                 print(f"      • 未 Cross-Check 原始平面区 MAE:  {mae_plane_orig_plane:.4f} m (包含误判伪平面)")
-                print(f"      • 🌟 经 Cross-Check 真实平面区 MAE: {mae_plane_deg_plane:.4f} m (剔除伪平面后的真平面！)")
+                print(f"      • 🌟 经 Cross-Check 最终平面区 MAE: {mae_plane_deg_plane:.4f} m (剔除伪平面+提分真平面)")
+                if promoted_mask.sum() > 0:
+                    print(f"      • 🟡 提分回捞区 (Promoted) 平面 MAE: {mae_plane_promoted:.4f} m (回捞像素数: {promoted_mask.sum()} | 提升: {mae_pixel_promoted - mae_plane_promoted:+.4f} m)")
+                if pruned_mask.sum() > 0:
+                    print(f"      • 🔴 剔除伪平面区 (Pruned) 平面 MAE: {mae_plane_pruned:.4f} m (错误平面严重偏离真实几何)")
                 print(f"   【3. 全图物理融合深度 (Z_fused = 平面用 Z_plane, 其余回退 Z_pixel)】")
                 print(f"      • 未 Cross-Check 原始融合全图 MAE: {mae_fused_orig_global:.4f} m")
                 print(f"      • 🌟 Cross-Checked 最终融合全图 MAE: {mae_fused_deg_global:.4f} m")
@@ -2361,23 +2845,21 @@ def save_depth_cross_check():
                 print(f"   [Visualization] Fused depth error map saved to: {fused_err_filename}")
 
                 # =========================================================================
-                # 5. 核心：Cross-Check 剔除对比与伪平面标记可视化图
+                # 5. 核心：Cross-Check 剔除对比与伪平面标记可视化图 (4 状态色谱)
                 # =========================================================================
                 import matplotlib.patches as mpatches
 
                 H_s1, W_s1 = depth_gt_s1.shape
-                retained_mask = valid_orig_plane & valid_deg_plane
-                pruned_mask = valid_orig_plane & (~valid_deg_plane)
-                non_plane_mask = valid_gt_mask_s1 & (~valid_orig_plane)
-
                 pruned_count = pruned_mask.sum()
                 retained_count = retained_mask.sum()
+                promoted_count = promoted_mask.sum()
                 prune_rate = (pruned_count / max(valid_orig_plane.sum(), 1)) * 100.0
 
                 rgb_vis = np.zeros((H_s1, W_s1, 3), dtype=np.uint8)
-                rgb_vis[non_plane_mask] = [30, 80, 200]    # 蓝色：原始非平面
+                rgb_vis[non_plane_mask] = [30, 80, 200]    # 蓝色：纯非平面
                 rgb_vis[retained_mask] = [0, 230, 70]       # 绿色：一致保留的高质量平面
                 rgb_vis[pruned_mask] = [235, 40, 40]       # 红色：被 Cross-Check 剔除的伪平面！
+                rgb_vis[promoted_mask] = [255, 215, 0]     # 亮黄色：👑 提分回捞的真平面！
 
                 plt.figure(figsize=(11, 8))
                 plt.imshow(rgb_vis)
@@ -2386,18 +2868,54 @@ def save_depth_cross_check():
                 # 构造图例与标题
                 patch_green = mpatches.Patch(color='#00E646', label=f'Retained Plane: {retained_count} px')
                 patch_red = mpatches.Patch(color='#EB2828', label=f'Pruned False-Plane: {pruned_count} px ({prune_rate:.1f}%)')
+                patch_yellow = mpatches.Patch(color='#FFD700', label=f'Promoted Plane: {promoted_count} px')
                 patch_blue = mpatches.Patch(color='#1E50C8', label=f'Non-Planar Region: {non_plane_mask.sum()} px')
-                plt.legend(handles=[patch_green, patch_red, patch_blue], loc='upper right', framealpha=0.85, fontsize=12)
+                plt.legend(handles=[patch_green, patch_red, patch_yellow, patch_blue], loc='upper right', framealpha=0.85, fontsize=11)
 
-                plt.title(f'Cross-Check Planar Pruning Analysis (Conf > {PRED_PLANAR_CONF_THRESHOLD})\n'
-                          f'Fused Global MAE: {mae_fused_deg_global:.4f}m | Pruned False-Planar Area: {pruned_count} px ({prune_rate:.1f}%)',
+                plt.title(f'Dual-Source (Views 1 & 2) Complementary Cross-Check Analysis (Conf > {PRED_PLANAR_CONF_THRESHOLD})\n'
+                          f'Fused Global MAE: {mae_fused_deg_global:.4f}m | Pruned: {pruned_count} px ({prune_rate:.1f}%) | Retained: {retained_count} px',
                           fontsize=13, fontweight='bold')
 
                 prune_vis_filename = os.path.join(args.outdir, sample["filename"][0].format('cross_check_pruned_regions', '.png'))
                 os.makedirs(os.path.dirname(prune_vis_filename), exist_ok=True)
                 plt.savefig(prune_vis_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                 plt.close()
-                print(f"   [Visualization] Pruned comparison map saved to: {prune_vis_filename}")
+                print(f"   [Visualization] Dual-Source pruned comparison map saved to: {prune_vis_filename}")
+
+                # =========================================================================
+                # [暂存屏蔽] 👑 实验一产物：拓扑相交线撕裂度热力图 & 拓扑过滤分析图 (待明天深入研究后启用)
+                # =========================================================================
+                # if topo_map is not None:
+                #     # 6.1 生成拓扑方向夹角热力图 (_topo_tear_heatmap.png)
+                #     plt.figure(figsize=(10, 8))
+                #     topo_map_masked = np.ma.masked_where(~valid_gt_mask_s1, topo_map)
+                #     cmap_tear = plt.get_cmap('jet')
+                #     cmap_tear.set_bad(color='black')
+                #     im_tear = plt.imshow(topo_map_masked, cmap=cmap_tear, vmin=0, vmax=90.0)
+                #     cbar_tear = plt.colorbar(im_tear, fraction=0.046, pad=0.04)
+                #     cbar_tear.set_label('Tangent Angular Deviation Δθ (Degrees)', size=13)
+                #     plt.axis('off')
+                #     topo_heat_filename = os.path.join(args.outdir, sample["filename"][0].format('topo_tear_heatmap', '.png'))
+                #     os.makedirs(os.path.dirname(topo_heat_filename), exist_ok=True)
+                #     plt.savefig(topo_heat_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                #     plt.close()
+                #     
+                #     # 6.2 生成拓扑过滤 4 状态色谱图 (_topo_pruned_regions.png)
+                #     topo_prune_vis_filename = os.path.join(args.outdir, sample["filename"][0].format('topo_pruned_regions', '.png'))
+                #     os.makedirs(os.path.dirname(topo_prune_vis_filename), exist_ok=True)
+                #     plt.savefig(topo_prune_vis_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                #     plt.close()
+                #
+                #     # 6.3 生成边级相交线矢量线框图 (_topo_edge_tear_vis.png)
+                #     edge_records = compute_edge_topology_tears(
+                #         ref_planes_for_check, ref_triangles_raw, ref_lines_raw, ref_vertexs_raw, intrinsics_s1[0]
+                #     )
+                #     ref_img_vis = None
+                #     if "imgs" in sample and 'stage_1' in sample["imgs"]:
+                #         img_t = sample["imgs"]['stage_1'][0, 0].permute(1, 2, 0).cpu().numpy()
+                #         ref_img_vis = np.clip((img_t * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+                #     edge_vis_filename = os.path.join(args.outdir, sample["filename"][0].format('topo_edge_tear_vis', '.png'))
+                #     plot_edge_tear_vector_map(edge_records, H_s1, W_s1, ref_img_vis, edge_vis_filename)
             
             # Save results
             print("Saving results...")
@@ -2406,6 +2924,7 @@ def save_depth_cross_check():
             for i, filename in enumerate(filenames):
                 depth_filename = os.path.join(outdir, filename.format('depth_est', '.pfm'))
                 mask_filename = os.path.join(outdir, filename.format('cross_check_mask', '.png'))
+                mask_single_filename = os.path.join(outdir, filename.format('cross_check_single_view_mask', '.png'))
                 
                 # Make colorized images for confidence
                 import matplotlib.pyplot as plt
@@ -2421,7 +2940,7 @@ def save_depth_cross_check():
                 conf_img_filename = os.path.join(outdir, filename.format('confidence_color', '.png'))
                 conf_deg_img_filename = os.path.join(outdir, filename.format('confidence_degraded_color', '.png'))
                 
-                for fpath in [depth_filename, mask_filename, conf_img_filename, conf_deg_img_filename]:
+                for fpath in [depth_filename, mask_filename, mask_single_filename, conf_img_filename, conf_deg_img_filename]:
                     os.makedirs(os.path.dirname(fpath), exist_ok=True)
                 
                 # 仅保存 depth_est.pfm，不再保存庞大的 confidence pfm
@@ -2432,11 +2951,12 @@ def save_depth_cross_check():
                 
                 mask_img = (is_consistent_s0 * 255).astype(np.uint8)
                 cv2.imwrite(mask_filename, mask_img)
+                cv2.imwrite(mask_single_filename, mask_img)
 
 if __name__ == '__main__':
     # step1. save all the depth maps and the masks in outputs directory
-    # save_depth()
-    save_depth_cross_check()
+    save_depth()
+    # save_depth_cross_check()
     # img_wh=(768, 384)
     
     # with open(args.testlist) as f:

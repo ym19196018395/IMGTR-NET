@@ -1,9 +1,10 @@
 from typing import List, Tuple, Dict
 
-from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 from .PlanePatchMatch import *
-from utils import batch_convert_to_tri_infos_new,build_neighbor_indices,map_tri_to_pixel_single,compute_normal_map_torch
 from .feature_map import *
+from utils import (batch_convert_to_tri_infos_new, build_neighbor_indices, 
+                   map_tri_to_pixel_single, compute_normal_map_torch,
+                   generate_cross_check_diagnosis_rgb, compute_cross_check_score_gpu)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -646,6 +647,53 @@ class PatchmatchNet(nn.Module):
                 output_plane['W_plane_pixel_init'] = W_plane_pixel_init
                 output_plane['W_plane_tri'] = W_plane_tri
                 output_plane['W_plane_tri_init'] = W_plane_tri_init
+
+                # ==============================================================================
+                # 👑 [实验零：Post-GNN 双主源 Cross-Check 几何连续软降级与门控同步]
+                # ==============================================================================
+                # 1. 提取主源视角纯像素级 Stage 1 原生深度 (Views 1 & 2)
+                src_raw_depths = self.compute_source_raw_depths(features, depth_min, depth_max, src_indices=[1, 2])
+                
+                # 2. 对 GNN 最终深度 depth_samples[-1] 执行 GPU 极速双向重投影 (传入 pixel_normal_s1_pure 做大倾角自适应补偿)
+                max_ratio_deg = compute_cross_check_score_gpu(
+                    depth_ref=depth_samples[-1],
+                    ref_proj=self.proj_matrices_1[0],
+                    src_raw_depths=src_raw_depths,
+                    src_projs=self.proj_matrices_1[1:],
+                    tri_id_map=tri_id_map_tensor,
+                    max_tri_num=W_plane_tri.shape[1],
+                    base_depth_thresh=0.10,
+                    pixel_dist_thresh=1.0,
+                    normal_ref=pixel_normal_s1_pure
+                )
+                
+                # 3. 连续乘法软降级约束 (Sigmoid 门控压制)
+                if W_plane_tri.dim() == 2:
+                    W_plane_tri = W_plane_tri.unsqueeze(-1)
+                
+                W_plane_tri_pre_cc = W_plane_tri.clone().detach()
+
+                # Sigmoid 陡峭连续软压制门控 (tau=0.40, T=0.04, min_penalty=0.25)
+                tau_deg = 0.40
+                temperature = 0.04
+                min_penalty = 0.25
+                penalty = min_penalty + (1.0 - min_penalty) * torch.sigmoid((max_ratio_deg - tau_deg) / temperature)
+                W_plane_tri = W_plane_tri * penalty
+                
+                # 4. 同步广播生成像素级置信度 W_plane_pixel 并更新输出字典 (彻底废除极化算子)
+                W_plane_pixel = self.plane_patchmatch_agent._scatter_triangle_to_pixel(W_plane_tri, tri_id_map_tensor)
+                output_plane['W_plane_tri'] = W_plane_tri
+                output_plane['W_plane_pixel'] = W_plane_pixel
+                output_plane['cross_check_ratio_deg'] = max_ratio_deg
+
+                # 5. 👑 生成 Cross-Check 三态诊断图并打包进 output_plane (绿: 保持真面 | 红: 降级伪面 | 蓝黑: 背景非平面)
+                W_plane_pixel_orig = self.plane_patchmatch_agent._scatter_triangle_to_pixel(W_plane_tri_pre_cc, tri_id_map_tensor)
+                output_plane['cross_check_diagnosis_rgb'] = generate_cross_check_diagnosis_rgb(
+                    W_plane_pixel_orig=W_plane_pixel_orig,
+                    W_plane_pixel_final=W_plane_pixel,
+                    tri_id_map=tri_id_map_tensor,
+                    threshold=0.70
+                )
                 
                 # 计算用于光度 Ambiguity 诊断的 pixel_cost_min 和 view_weights_mean
                 # pixel_costs 形状为 [B, H, W, K], 在 K 维度取 min 得到最匹配代价并升维
@@ -713,7 +761,7 @@ class PatchmatchNet(nn.Module):
             feat_s0=ref_feature['stage_0'],
             final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
             tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
-            W_plane_tri=W_plane_tri_polarized.detach(),  # [B, N_tri] 稀疏平面门控
+            W_plane_tri=W_plane_tri.detach(),  # [B, N_tri, 1] 纯净连续物理置信度门控
             intrinsics_s0=intrinsics_mats['stage_0'][:, 0],  # [B, 3, 3]
             depth_range=(depth_min, depth_max),  # 场景深度裁剪范围
             depth_stage1_pixels=output_plane['depth_stage1_pixels']
@@ -741,16 +789,7 @@ class PatchmatchNet(nn.Module):
                         "smoothness_loss":smoothness_loss # 光滑性损失
                     }
         else:
-            # num_depth = self.patchmatch_num_sample[0]
-            # score_sum4 = 4 * F.avg_pool3d(F.pad(score.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
-            # # [B, 1, H, W]
-            # depth_index = depth_regression(score, depth_values=torch.arange(num_depth, device=score.device, dtype=torch.float)).long()
-            # depth_index = torch.clamp(depth_index, 0, num_depth-1)
-            # photometric_confidence = torch.gather(score_sum4, 1, depth_index)
-            # photometric_confidence = F.interpolate(photometric_confidence,
-            #                             scale_factor=2, mode='nearest')
-            # photometric_confidence = photometric_confidence.squeeze(1)
-            photometric_confidence=NULL_TENSOR
+            photometric_confidence = None
             return {"refined_depth": refined_depth, 
                         "depth_patchmatch": depth_patchmatch, 
                         "photometric_confidence": photometric_confidence,
@@ -760,6 +799,47 @@ class PatchmatchNet(nn.Module):
                         "continuity_loss": continuity_loss,  # 连续性损失
                         "smoothness_loss": smoothness_loss
                     }
+
+    def compute_source_raw_depths(self, features, depth_min, depth_max, src_indices=[1, 2]):
+        """
+        轻量化提取主源视角的纯像素级 Stage 1 原生深度 (用于 Cross-Check 几何照妖镜)
+        零三角剖分、零SVD、零GNN，仅复用已有特征跑纯像素级 PatchMatch
+        """
+        src_raw_depths = {}
+        with torch.no_grad():
+            for s_idx in src_indices:
+                if s_idx >= len(features):
+                    continue
+                ref_feat_s = features[s_idx]
+                other_feats = [features[i] for i in range(len(features)) if i != s_idx]
+                
+                depth_s = None
+                vw_s = None
+                for l in reversed(range(1, self.stages)):  # Stage 3 -> 2 -> 1
+                    src_feats_l = [f[f'stage_{l}'] for f in other_feats]
+                    projs_l = getattr(self, f'proj_matrices_{l}')
+                    ref_proj_s = projs_l[s_idx]
+                    other_projs_s = [projs_l[i] for i in range(len(projs_l)) if i != s_idx]
+                    
+                    if l > 1:
+                        depth_s_list, _, vw_s = getattr(self, f'patchmatch_{l}')(
+                            ref_feat_s[f'stage_{l}'], src_feats_l,
+                            ref_proj_s, other_projs_s,
+                            depth_min, depth_max, depth=depth_s, img=None, view_weights=vw_s
+                        )
+                        # 取出当前 stage 的最终输出深度 Tensor，并上采样 2 倍供下一 stage 使用
+                        depth_s = depth_s_list[-1].detach()
+                        depth_s = F.interpolate(depth_s, scale_factor=2, mode='nearest')
+                        vw_s = F.interpolate(vw_s, scale_factor=2, mode='nearest')
+                    else:
+                        depth_s_pm, _, _ = getattr(self, f'patchmatch_{l}')(
+                            ref_feat_s[f'stage_{l}'], src_feats_l,
+                            ref_proj_s, other_projs_s,
+                            depth_min, depth_max, depth=depth_s, img=None, view_weights=vw_s
+                        )
+                        src_raw_depths[s_idx] = depth_s_pm[-1].detach()  # [B, 1, H1, W1]
+        return src_raw_depths
+        
         
 def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
     """

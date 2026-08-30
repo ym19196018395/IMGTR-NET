@@ -437,6 +437,13 @@ def save_depth():
 
                     cv2.imwrite(conf_jet_filename, w_plane_color)
 
+                if 'cross_check_diagnosis_rgb' in outputs["output_plane"]:
+                    diag_filename = os.path.join(args.outdir, filename.format('cross_check_diag_s1', '.png'))
+                    diag_rgb_tensor = outputs["output_plane"]['cross_check_diagnosis_rgb'][b_idx]
+                    diag_rgb_np = diag_rgb_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+                    diag_bgr_np = (np.clip(diag_rgb_np, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1]
+                    cv2.imwrite(diag_filename, diag_bgr_np)
+
                 # ====================================================================
                 # 🚨 新增功能 3：生成 Stage 1 纯自由像素级 (Pixel-wise) 深度的差异热力图
                 # 这是最原汁原味的 Baseline，用于和网格约束后的结果做对比

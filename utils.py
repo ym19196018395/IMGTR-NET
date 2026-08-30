@@ -2038,7 +2038,158 @@ def map_tri_to_pixel_single(planes, tri_id_map, H, W):
 
     # 5. 无效区域熔断物理清洗 (刷成全0，防止背景虚空产生脏梯度)
     if invalid_mask.any():
-        mask_expand = invalid_mask.unsqueeze(1).expand(-1, 4, -1, -1)
+        mask_expand = invalid_mask.unsqueeze(1).expand(-1, C, -1, -1)
         pixel_planes = pixel_planes.masked_fill(mask_expand, 0.0)
 
     return pixel_planes
+
+
+def generate_cross_check_diagnosis_rgb(W_plane_pixel_orig, W_plane_pixel_final, tri_id_map, threshold=0.70):
+    """
+    生成 Cross-Check 三态动态诊断图 (RGB)
+
+    Args:
+        W_plane_pixel_orig:   [B, 1, H, W] 校准前 (GNN 输出) 像素级平面置信度
+        W_plane_pixel_final:  [B, 1, H, W] 校准后 (Cross-Check 连续降级) 像素级平面置信度
+        tri_id_map:           [B, H, W] 三角形密集索引地图 (-1 表示无效背景)
+        threshold:            float 判定为平面的置信度阈值 (默认 0.70)
+
+    Returns:
+        diag_rgb:             [B, 3, H, W] 诊断 RGB 图像 (TensorBoard 格式)
+                              - 🟢 亮绿 [0.0, 0.85, 0.2]: 原始真平面保留 (一致率高，未降级)
+                              - 🔴 鲜红 [0.95, 0.15, 0.15]: 降级伪平面 (跨脊假面，被惩罚至低分)
+                              - 🔵 暗蓝 [0.1, 0.15, 0.35]: 稳定非平面 / 背景 (原本即为非平面)
+    """
+    B, _, H, W = W_plane_pixel_final.shape
+    device = W_plane_pixel_final.device
+
+    orig_planar = (W_plane_pixel_orig > threshold)
+    final_planar = (W_plane_pixel_final > threshold)
+    valid_bg = (tri_id_map.unsqueeze(1) >= 0) if tri_id_map.dim() == 3 else (tri_id_map >= 0)
+
+    mask_retained = orig_planar & final_planar                   # 🟢 原始真平面保留 (绿)
+    mask_pruned = orig_planar & (~final_planar)                  # 🔴 剔除伪平面 (红)
+    mask_non_plane = valid_bg & (~orig_planar)                   # 🔵 非平面 (深蓝)
+
+    diag_rgb = torch.zeros(B, 3, H, W, device=device)
+    # 🟢 绿色
+    diag_rgb[:, 0:1] += mask_retained.float() * 0.0
+    diag_rgb[:, 1:2] += mask_retained.float() * 0.85
+    diag_rgb[:, 2:3] += mask_retained.float() * 0.2
+
+    # 🔴 红色
+    diag_rgb[:, 0:1] += mask_pruned.float() * 0.95
+    diag_rgb[:, 1:2] += mask_pruned.float() * 0.15
+    diag_rgb[:, 2:3] += mask_pruned.float() * 0.15
+
+    # 🔵 暗蓝色
+    diag_rgb[:, 0:1] += mask_non_plane.float() * 0.1
+    diag_rgb[:, 1:2] += mask_non_plane.float() * 0.15
+    diag_rgb[:, 2:3] += mask_non_plane.float() * 0.35
+
+    return diag_rgb
+
+
+def compute_cross_check_score_gpu(depth_ref, ref_proj, src_raw_depths, src_projs, 
+                                  tri_id_map, max_tri_num, 
+                                  base_depth_thresh=0.10, pixel_dist_thresh=1.0,
+                                  normal_ref=None):
+    """
+    GPU 纯 Tensor 极速双向 Cross-Check (零 CPU-GPU 数据拷贝，全量耗时 < 3ms)
+    返回每个三角形在双源视角下的最大一致率 (ratio_deg) [B, N_tri, 1]
+    
+    Args:
+        normal_ref: 可选 [B, 3, H, W] 或 [B, H, W, 3]，用于大倾斜角 (cos_theta = |n_z|) 动态深度容限补偿
+    """
+    B, _, H, W = depth_ref.shape
+    device = depth_ref.device
+    
+    # 构造参考视角像素坐标网格
+    y_coords, x_coords = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    x_flat = x_coords.reshape(1, 1, -1).repeat(B, 1, 1).float()  # [B, 1, H*W]
+    y_flat = y_coords.reshape(1, 1, -1).repeat(B, 1, 1).float()
+    z_flat = depth_ref.reshape(B, 1, -1)  # [B, 1, H*W]
+    ones_flat = torch.ones_like(z_flat)
+    
+    # 3D 点云反投影到世界坐标系
+    ref_proj_inv = torch.inverse(ref_proj)  # [B, 4, 4]
+    p_ref_homo = torch.cat([x_flat * z_flat, y_flat * z_flat, z_flat, ones_flat], dim=1)  # [B, 4, H*W]
+    p_world = torch.bmm(ref_proj_inv, p_ref_homo)  # [B, 4, H*W]
+    
+    # 👑 大倾斜角深度动态容限补偿 (cos_theta = |n_z|)
+    if normal_ref is not None:
+        if normal_ref.shape[1] == 3:
+            nz = normal_ref[:, 2:3, :, :].abs().permute(0, 2, 3, 1)  # [B, H, W, 1]
+        else:
+            nz = normal_ref[..., 2:3].abs()
+        cos_theta_clamped = torch.clamp(nz, min=0.30, max=1.0)
+        depth_thresh_map = base_depth_thresh / cos_theta_clamped  # [B, H, W, 1]
+    else:
+        depth_thresh_map = base_depth_thresh
+
+    # 准备 Scatter 索引 (与 aggregate_costs_per_triangle 对齐)
+    flat_ids = tri_id_map.reshape(B, -1)  # [B, H*W]
+    valid_mask = (flat_ids >= 0) & (flat_ids < max_tri_num)
+    batch_offset = (torch.arange(B, device=device) * max_tri_num).view(B, 1)
+    safe_ids = flat_ids.clone()
+    safe_ids[~valid_mask] = 0
+    global_ids = (safe_ids + batch_offset).view(-1)
+    flat_mask = valid_mask.reshape(-1)
+    valid_global_ids = global_ids[flat_mask]
+    total_bins = B * max_tri_num
+    
+    ratios_deg_list = []
+    
+    # 遍历 View 1 和 View 2
+    for s_idx, d_src in src_raw_depths.items():
+        proj_s = src_projs[s_idx - 1]  # src_projs 索引 0 对应 s_idx=1
+        proj_s_inv = torch.inverse(proj_s)
+        
+        # 1. 投影到源视角像素坐标
+        p_src_homo = torch.bmm(proj_s, p_world)  # [B, 4, H*W]
+        z_src_proj = p_src_homo[:, 2:3, :]  # [B, 1, H*W]
+        x_src_proj = p_src_homo[:, 0:1, :] / (z_src_proj + 1e-7)
+        y_src_proj = p_src_homo[:, 1:2, :] / (z_src_proj + 1e-7)
+        
+        # 2. 归一化采样网格并采样源视图像素深度
+        grid_x = (x_src_proj.view(B, H, W) / ((W - 1) / 2.0)) - 1.0
+        grid_y = (y_src_proj.view(B, H, W) / ((H - 1) / 2.0)) - 1.0
+        sample_grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
+        
+        sampled_src_z = F.grid_sample(d_src, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)  # [B, 1, H, W]
+        sampled_src_z_flat = sampled_src_z.reshape(B, 1, -1)
+        
+        # 3. 将采样的源图点重新反投影回参考视角
+        p_src_reproj = torch.cat([x_src_proj * sampled_src_z_flat, y_src_proj * sampled_src_z_flat, sampled_src_z_flat, ones_flat], dim=1)
+        p_world_reproj = torch.bmm(proj_s_inv, p_src_reproj)
+        p_ref_reproj = torch.bmm(ref_proj, p_world_reproj)
+        
+        z_reproj = p_ref_reproj[:, 2:3, :]
+        x_reproj = p_ref_reproj[:, 0:1, :] / (z_reproj + 1e-7)
+        y_reproj = p_ref_reproj[:, 1:2, :] / (z_reproj + 1e-7)
+        
+        # 4. 计算 2D 坐标偏移与绝对深度差
+        dist_2d = torch.sqrt((x_reproj - x_flat) ** 2 + (y_reproj - y_flat) ** 2).view(B, H, W, 1)
+        depth_diff = torch.abs(z_reproj - z_flat).view(B, H, W, 1)
+        valid_reproj = (sampled_src_z.view(B, H, W, 1) > 0) & (depth_ref.permute(0, 2, 3, 1) > 0)
+        
+        # 生成降级掩码 (应用动态倾角容限 depth_thresh_map)
+        mask_deg = (valid_reproj & (dist_2d < pixel_dist_thresh) & (depth_diff < depth_thresh_map)).float()
+        
+        # 5. 聚合为三角形级通过率 (Scatter Add)
+        valid_mask_deg = mask_deg.reshape(-1, 1)[flat_mask]
+        tri_sum = torch.zeros(total_bins, 1, device=device).scatter_add_(0, valid_global_ids.unsqueeze(1), valid_mask_deg)
+        tri_cnt = torch.zeros(total_bins, 1, device=device).scatter_add_(0, valid_global_ids.unsqueeze(1), torch.ones_like(valid_mask_deg))
+        tri_ratio = tri_sum / (tri_cnt + 1e-6)
+        tri_ratio = torch.where(tri_cnt > 0, tri_ratio, torch.ones_like(tri_ratio))
+        ratios_deg_list.append(tri_ratio.view(B, max_tri_num, 1))
+        
+    # 双源互补仲裁 (OR 逻辑 -> 取最大值)
+    if len(ratios_deg_list) >= 2:
+        max_ratio_deg = torch.max(ratios_deg_list[0], ratios_deg_list[1])
+    elif len(ratios_deg_list) == 1:
+        max_ratio_deg = ratios_deg_list[0]
+    else:
+        max_ratio_deg = torch.ones(B, max_tri_num, 1, device=device)
+        
+    return max_ratio_deg.detach()
