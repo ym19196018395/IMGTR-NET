@@ -747,10 +747,10 @@ def compute_heteroscedastic_depth_loss(depth_patchmatch, refined_depth, depth_gt
                 else:
                     W_aligned = W_val.detach()
                 
-                # SmoothStep 极化映射：保底降低至 0.3，最大增强为 0.3 + gamma
+                # SmoothStep 极化映射：保底彻底降为 0.0（非平面完全免除平面监督），最大增强为 gamma (1.5)
                 x = torch.clamp((W_aligned - threshold_low) / (threshold_high - threshold_low + 1e-8), 0.0, 1.0)
                 smooth_weight = 3.0 * (x ** 2) - 2.0 * (x ** 3)
-                pixel_weight = 0.3 + gamma * smooth_weight
+                pixel_weight = gamma * smooth_weight
                 
                 weighted_loss = pixel_loss * pixel_weight
                 loss = loss + weighted_loss[mask_l].mean()

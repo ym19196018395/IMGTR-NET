@@ -805,6 +805,50 @@ def save_depth():
                     else:
                         print("👑 [SVD NORMAL EVAL] 无足够优质平面像素以进行法向量夹角偏差评估")
 
+                # ====================================================================
+                # 👑 提前提取像素级原生深度、三角网格ID与平面置信度，构建混合深度 (Fused Depth)
+                # ====================================================================
+                depth_est_sq = np.squeeze(depth_est)  # [H, W]
+                depth_pix_s1 = None
+                if stage1_depths_pixels is not None:
+                    depth_pix_raw = stage1_depths_pixels[b_idx]
+                    if isinstance(depth_pix_raw, torch.Tensor):
+                        depth_pix_raw = depth_pix_raw.detach().cpu().numpy()
+                    depth_pix_s1 = np.squeeze(depth_pix_raw)
+                    if depth_pix_s1.shape != depth_est_sq.shape:
+                        depth_pix_s1 = cv2.resize(depth_pix_s1, (depth_est_sq.shape[1], depth_est_sq.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+                # 提取当前视角的三角网格 ID 图
+                tri_id_curr = None
+                if tri_id_maps_np is not None:
+                    tri_id_raw = tri_id_maps_np[b_idx]
+                    if isinstance(tri_id_raw, torch.Tensor):
+                        tri_id_raw = tri_id_raw.detach().cpu().numpy()
+                    tri_id_curr = np.squeeze(tri_id_raw)
+                    if tri_id_curr.shape != depth_est_sq.shape:
+                        tri_id_curr = cv2.resize(tri_id_curr, (depth_est_sq.shape[1], depth_est_sq.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+                # 判断有效三角网格内部掩码 (非三角剖分地区 tri_id < 0 或 == 255)
+                if tri_id_curr is not None:
+                    is_in_mesh = (tri_id_curr >= 0) & (tri_id_curr != 255)
+                else:
+                    is_in_mesh = np.ones_like(depth_est_sq, dtype=bool)
+
+                w_plane_sq = np.zeros_like(depth_est_sq, dtype=np.float32)
+                if 'W_plane_pixel' in outputs.get("output_plane", {}):
+                    w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
+                    w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data, torch.Tensor) else w_plane_data
+                    w_plane_sq = np.squeeze(w_plane_np)
+                    if w_plane_sq.shape != depth_est_sq.shape:
+                        w_plane_sq = cv2.resize(w_plane_sq, (depth_est_sq.shape[1], depth_est_sq.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                # 👑 核心规则：仅在有效三角网格内且置信度达标时采用平面几何解析深度，非平面区与非三角剖分区全部回退原生像素深度！
+                mask_planar_pred = is_in_mesh & (w_plane_sq > PRED_PLANAR_CONF_THRESHOLD)
+                if depth_pix_s1 is not None:
+                    depth_fused_s1 = np.where(mask_planar_pred, depth_est_sq, depth_pix_s1)
+                else:
+                    depth_fused_s1 = depth_est_sq.copy()
+
                 # ==========================================
                 # 【深度图可视化】
                 # ==========================================
@@ -864,6 +908,33 @@ def save_depth():
                         # 额外保存原始未传播深度 PFM，方便后续对比分析
                         no_pro_depth_filename = depth_filename.replace('.pfm', '_noprop.pfm')
                         save_pfm(no_pro_depth_filename, depth_no_pro.astype(np.float32))
+
+                    # ==========================================
+                    # 👑 【混合深度图 (Fused: Plane + Pixel) 可视化】
+                    # ==========================================
+                    valid_fused = depth_fused_s1 > 0
+                    if valid_fused.any():
+                        d_min_f = np.percentile(depth_fused_s1[valid_fused], 1)
+                        d_max_f = np.percentile(depth_fused_s1[valid_fused], 99)
+                        depth_fused_vis = (depth_fused_s1 - d_min_f) / (d_max_f - d_min_f + 1e-8)
+                        depth_fused_vis = np.clip(depth_fused_vis, 0, 1)
+                        depth_fused_uint8 = (depth_fused_vis * 255).astype(np.uint8)
+
+                        # 样式 1: JET 伪彩色图
+                        fused_color = cv2.applyColorMap(depth_fused_uint8, cv2.COLORMAP_JET)
+                        fused_color[~valid_fused] = 0
+                        vis_fused_color_filename = depth_filename.replace('.pfm', '_fused_vis.png')
+                        cv2.imwrite(vis_fused_color_filename, fused_color)
+
+                        # 样式 2: 类似 Tensorboard 的灰度图
+                        fused_gray = depth_fused_uint8.copy()
+                        fused_gray[~valid_fused] = 255
+                        vis_fused_gray_filename = depth_filename.replace('.pfm', '_fused_black_vis.png')
+                        cv2.imwrite(vis_fused_gray_filename, fused_gray)
+
+                    # 保存混合深度 PFM
+                    fused_depth_filename = depth_filename.replace('.pfm', '_fused.pfm')
+                    save_pfm(fused_depth_filename, depth_fused_s1.astype(np.float32))
 
 
                 # ==========================================
@@ -934,6 +1005,19 @@ def save_depth():
                         Image.fromarray(pixel_normal_vis).save(pixel_normal_filename)
 
                 # ====================================================================
+                # 👑 【混合法向量图可视化 (方案 A: 平面采用网络法向量，非平面采用像素级微分法向量)】
+                # ====================================================================
+                if pixel_normal_vis is not None and normal_vis_rgb is not None:
+                    mask_planar_3d = np.repeat(mask_planar_pred[:, :, np.newaxis], 3, axis=-1)
+                    normal_fused_vis = np.where(mask_planar_3d, normal_vis_rgb, pixel_normal_vis)
+                    valid_fused_3d = np.repeat((depth_fused_s1 > 0)[:, :, np.newaxis], 3, axis=-1)
+                    normal_fused_vis[~valid_fused_3d] = 0
+
+                    normal_fused_filename = normal_filename.replace('.png', '_fused.png')
+                    Image.fromarray(normal_fused_vis).save(normal_fused_filename)
+                    print(f"   [Visualization] Fused normal map saved to: {normal_fused_filename}")
+
+                # ====================================================================
                 # 👑 【新增功能】评估预测法向量与 SVD 真值法向量的角度偏差 (MAE 角度)
                 # ====================================================================
                 # 预测法向量与 SVD 真值法向量的角度偏差评估以及偏差热力图绘制已在 SVD 拟合及置信度清洗阶段提前完成
@@ -941,19 +1025,7 @@ def save_depth():
                 # ====================================================================
                 # 提前提取平面置信度 (W_plane)，供平面 MAE 切分和最终保存使用
                 # ====================================================================
-                depth_est_sq = np.squeeze(depth_est)  # [H, W]
-                w_plane_sq = []
                 dev_gt = None  # 提前初始化，用于后续导出静态二值图
-                if 'W_plane_pixel' in outputs["output_plane"]:
-                    w_plane_data = outputs["output_plane"]['W_plane_pixel'][b_idx]
-                    w_plane_np = w_plane_data.detach().cpu().numpy() if isinstance(w_plane_data,
-                                                                                   torch.Tensor) else w_plane_data
-                    w_plane_sq = np.squeeze(w_plane_np)
-                    if w_plane_sq.shape != depth_est_sq.shape:
-                        w_plane_sq = cv2.resize(w_plane_sq, (depth_est_sq.shape[1], depth_est_sq.shape[0]),
-                                                interpolation=cv2.INTER_LINEAR)
-                else:
-                    w_plane_sq = np.zeros_like(depth_est_sq)
 
                 # ====================================================================
                 # 🚨 3. 生成 Stage 1 预测与 GT 的差异热力图 (带全局与平面专属 MAE)
@@ -1079,6 +1151,54 @@ def save_depth():
                             
                             plt.savefig(pred_planar_diff_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
                             plt.close()
+
+                        # ── 图四：👑 混合深度差异热力图 (Fused Depth MAE: 格式与之前完全一致) ──
+                        mask_diff_fused = (depth_fused_s1 > 0) & (gt_curr > 0) & (tri_id_curr >= 0)
+                        if mask_diff_fused.any():
+                            abs_error_fused = np.abs(depth_fused_s1[mask_diff_fused] - gt_curr[mask_diff_fused])
+                            mean_abs_error_fused = np.mean(abs_error_fused)
+
+                            if mask_planar.any():
+                                planar_mae_fused = np.mean(np.abs(depth_fused_s1[mask_planar] - gt_curr[mask_planar]))
+                                planar_text_fused = f"\nFlat Region MAE (GT Planar): {planar_mae_fused:.4f}m"
+                            else:
+                                planar_mae_fused = 0.0
+                                planar_text_fused = ""
+
+                            diff_map_fused = np.zeros_like(depth_fused_s1)
+                            diff_map_fused[mask_diff_fused] = abs_error_fused
+
+                            plt.figure(figsize=(10, 8))
+                            diff_map_fused_masked = np.ma.masked_where(~mask_diff_fused, diff_map_fused)
+                            cmap_fused = plt.get_cmap('jet')
+                            cmap_fused.set_bad(color='black')
+
+                            im_f = plt.imshow(diff_map_fused_masked, cmap=cmap_fused, vmin=0, vmax=diff_max_plot)
+                            cbar_f = plt.colorbar(im_f, fraction=0.046, pad=0.04)
+                            cbar_f.set_label('Absolute Error (Meters)', size=14)
+                            plt.title(f'Stage 1 Fused Depth MAE: {mean_abs_error_fused:.4f}m {planar_text_fused}\nMax Cutoff: {diff_max_plot:.2f}m',
+                                      fontsize=14, fontweight='bold')
+                            plt.axis('off')
+
+                            diff_fused_filename = diff_filename.replace('_dif.png', '_fused_dif.png')
+                            os.makedirs(os.path.dirname(diff_fused_filename), exist_ok=True)
+                            plt.savefig(diff_fused_filename, dpi=150, bbox_inches='tight', pad_inches=0.1)
+                            plt.close()
+
+                            clean_name = filename.format('', '').replace('/', '_').replace('\\', '_')
+                            print(f"\n==================================================================================")
+                            print(f"👑 ==> [Stage 1 Depth Fusion Evaluation - {clean_name}]")
+                            if depth_pix_s1 is not None:
+                                pix_mae_global = np.mean(np.abs(depth_pix_s1[mask_diff_fused] - gt_curr[mask_diff_fused]))
+                                print(f"      • 原生像素级深度全图 MAE:   {pix_mae_global:.4f}m")
+                                print(f"      • 平面级解析深度全图 MAE:   {mean_abs_error:.4f}m")
+                                print(f"      • 🌟 混合后深度全图 MAE:    {mean_abs_error_fused:.4f}m (对比原生像素提升: {pix_mae_global - mean_abs_error_fused:+.4f}m)")
+                            else:
+                                print(f"      • 平面级解析深度全图 MAE:   {mean_abs_error:.4f}m")
+                                print(f"      • 🌟 混合后深度全图 MAE:    {mean_abs_error_fused:.4f}m")
+                            if mask_planar.any():
+                                print(f"      • 🌟 平面区域 (GT Planar) MAE: {planar_mae_fused:.4f}m")
+                            print(f"==================================================================================\n")
 
                     # ====================================================================
                     # 🚨 3.b 生成 Stage 1 未传播预测与 GT 的差异热力图 (基于 W_plane_pixel_init)

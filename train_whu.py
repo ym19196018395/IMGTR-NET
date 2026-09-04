@@ -546,17 +546,20 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_dnc_s1 = 0.05 * 50
     max_lambda_plane = 1.0
 
-    # 1. 连通性约束 (早启动，早满载，晚退坡)：
-    # 0.2 启动，0.4 满载，0.85 开始松绑，最后保留 10% 的防撕裂底线
-    lambda_c = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.6, max_lambda_c, end_ratio=0.05)
+    # ====================================================
+    # 物理课程学习（Curriculum Learning）黄金阶梯错峰调度
+    # ====================================================
+    # 1. 法向约束 (一阶方向引导，率先点火，摆正平面且不破坏深度边界)：
+    # 0.15 启动，0.40 满载，0.85 开始松绑，底线保留 75%
+    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_1, end_ratio=0.75)
 
-    # 2. 光滑性约束 (中启动，中满载，早退坡)：
-    # 0.3 启动，0.6 满载，0.8 开始松绑，因为平滑最容易影响高频细节，所以早点松绑
-    lambda_s = get_smooth_weight_with_decay(progress, 0.1, 0.4, 0.6, max_lambda_s, end_ratio=0.4)
+    # 2. 连通性约束 (强几何缝合，等 edge_head 充分预热学会断裂后再缓坡介入)：
+    # 0.30 启动，0.55 满载，0.85 开始松绑，底线保留 5%
+    lambda_c = get_smooth_weight_with_decay(progress, 0.30, 0.55, 0.85, max_lambda_c, end_ratio=0.05)
 
-    # 3. 法向约束 (晚启动，晚满载，早退坡)：
-    # 0.5 启动，0.7 满载，0.8 开始松绑，防止后期拟合 SVD 噪声
-    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.1, 0.3, 0.85, max_lambda_n_1, end_ratio=0.75)
+    # 3. 光滑性约束 (曲率平滑，晚启动，最后微调局部细节)：
+    # 0.40 启动，0.65 满载，0.80 开始松绑，底线保留 40%
+    lambda_s = get_smooth_weight_with_decay(progress, 0.40, 0.65, 0.80, max_lambda_s, end_ratio=0.40)
 
     # 4. cost约束
     lambda_cost = get_smooth_weight_with_decay(progress, 0.0, 0.1, 0.6, max_lambda_cost, end_ratio=0.5)
@@ -930,6 +933,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     scalar_outputs["abs_depth_error_patchmatch_stage_1_pixel_raw"] = AbsDepthError_metrics(depth_patchmatch['stage_1'][0],
                                                                                             depth_gt['stage_1'],
                                                                                             mask['stage_1'] > 0.5)
+    # 👑 严格对齐 eval_whu_big.py:L2865 的 Stage 1 像素/平面全图物理混合融合深度 (Z_fused)
+    # 统计全图有效真值区域 (depth_gt > 0)，三角剖分外的区域天然回退为纯像素深度 depth_patchmatch['stage_1'][0]
+    if "W_plane_pixel" in outputs["output_plane"]:
+        w_pixel_s1 = outputs["output_plane"]["W_plane_pixel"]
+        mask_planar_s1 = (w_pixel_s1 >= 0.80)
+        # 平面区走 Stage 1 最终平面深度 depth_patchmatch['stage_1'][-1]，非平面区/三角网外回退至纯像素深度 depth_patchmatch['stage_1'][0]
+        depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
+        valid_gt_mask_s1 = (depth_gt['stage_1'] > 0)
+        scalar_outputs["abs_depth_error_patchmatch_stage_1_fused"] = AbsDepthError_metrics(
+            depth_s1_fused, depth_gt['stage_1'], valid_gt_mask_s1
+        )
     # threshold = 1mm
     scalar_outputs["thres1mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      1)
@@ -1232,6 +1246,17 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     scalar_outputs["abs_depth_error_patchmatch_stage_1_pixel_raw"] = AbsDepthError_metrics(depth_patchmatch['stage_1'][0],
                                                                                             depth_gt['stage_1'],
                                                                                             mask['stage_1'] > 0.5)
+    # 👑 严格对齐 eval_whu_big.py:L2865 的 Stage 1 像素/平面全图物理混合融合深度 (Z_fused)
+    # 统计全图有效真值区域 (depth_gt > 0)，三角剖分外的区域天然回退为纯像素深度 depth_patchmatch['stage_1'][0]
+    if "W_plane_pixel" in outputs["output_plane"]:
+        w_pixel_s1 = outputs["output_plane"]["W_plane_pixel"]
+        mask_planar_s1 = (w_pixel_s1 >= 0.80)
+        # 平面区走 Stage 1 最终平面深度 depth_patchmatch['stage_1'][-1]，非平面区/三角网外回退至纯像素深度 depth_patchmatch['stage_1'][0]
+        depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
+        valid_gt_mask_s1 = (depth_gt['stage_1'] > 0)
+        scalar_outputs["abs_depth_error_patchmatch_stage_1_fused"] = AbsDepthError_metrics(
+            depth_s1_fused, depth_gt['stage_1'], valid_gt_mask_s1
+        )
     # threshold = 1mm
     scalar_outputs["thres1mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      1)

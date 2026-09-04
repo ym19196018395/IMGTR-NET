@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from mpmath import eye
 
 from models.edge_head import EdgeHead
-from utils import convert_edge_features_to_tri_format
+from utils import convert_edge_features_to_tri_format, compute_cross_check_score_gpu
 
 
 class PlaneHypothesisGenerator(nn.Module):
@@ -270,7 +270,8 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
     def forward(self, current_planes, current_costs, neighbor_indices,
                 edge_probs, rays_centroids, depth_max,prev_costs,W_plane_tri,
                 pixel_counts=None, ref_feature=None, centroids_norm=None, midpoints_norm=None, temperature=0.2, 
-                W_raw_anchor=None, cross_costs=None, normalized_slope=None, surface_var=None):
+                W_raw_anchor=None, cross_costs=None, normalized_slope=None, surface_var=None,
+                penalty_cc=None):
         """
         前向双解耦核心计算图流动
         Args:
@@ -416,6 +417,9 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
             # 🎯 【残差修正模式】：以上一轮置信度为基准，神经网络只学习 [-0.3, 0.3] 内的修正量，实现时序累加
             delta_W = torch.tanh(W_plane_tri_raw) * 0.3
             W_plane_tri_learn = torch.clamp(W_plane_tri + delta_W, min=1e-6, max=1.0)  # 🧾 【Learn轨】
+            if penalty_cc is not None:
+                penalty_cc_in = penalty_cc.unsqueeze(-1) if penalty_cc.dim() == 2 else penalty_cc
+                W_plane_tri_learn = W_plane_tri_learn * penalty_cc_in
             W_plane_tri_reg = W_plane_tri_learn.detach()  # 🛡️ 【Reg轨】
   
         # =====================================================================
@@ -1158,7 +1162,8 @@ class PlanePatchMatchModule(nn.Module):
 
     def forward(self,fitter_module, depth_stage1, tri_infos, ref_feature, src_features,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights=None,
-                neighbor_indices_batched=None,lambda_c=0.0, lambda_s=0.0,current_temp=0.0):
+                neighbor_indices_batched=None,lambda_c=0.0, lambda_s=0.0,current_temp=0.0,
+                src_raw_depths=None):
         """
         Args:
             fitter_module: 实例化好的 DensePlaneFitter 对象
@@ -1296,6 +1301,34 @@ class PlanePatchMatchModule(nn.Module):
             ref_feature, depth_stage1, no_prop_depth, surface_var, tri_id_map, max_tri_num,
             current_planes=current_planes, rays_centroids=rays_centroids,
         )
+        if W_plane_tri.dim() == 2:
+            W_plane_tri = W_plane_tri.unsqueeze(-1)
+            
+        # 👑 [实验二：Pre-GNN 锚点先验解耦] 
+        # 进循环前，先行原地备份最纯净、未受几何掩码污染的原生物理平整度先验 W_raw_anchor，作为 MLP 特征输入
+        W_raw_anchor = W_plane_tri.clone().detach()
+
+        # 👑 [实验一：Pre-GNN 物理铁闸] 计算初始 SVD 深度基于主源视角的重投影一致率并构建静态 penalty_cc (带大倾角动态补偿)
+        penalty_cc = None
+        if src_raw_depths is not None:
+            ratio_deg_init = compute_cross_check_score_gpu(
+                depth_ref=no_prop_depth,
+                ref_proj=ref_proj,
+                src_raw_depths=src_raw_depths,
+                src_projs=src_projs,
+                tri_id_map=tri_id_map,
+                max_tri_num=max_tri_num,
+                base_depth_thresh=0.16,
+                pixel_dist_thresh=1.2,
+                normal_ref=no_propa_normal
+            )
+            tau_deg = 0.35
+            temperature_cc = 0.04
+            min_penalty = 0.40
+            penalty_cc = min_penalty + (1.0 - min_penalty) * torch.sigmoid((ratio_deg_init - tau_deg) / temperature_cc)
+            
+            # 仅对传入 GNN 循环的初始门控 W_plane_tri 施加冷启动压制
+            W_plane_tri = W_plane_tri * penalty_cc
 
         # ==========================================
         # 4. 预测物理断裂边 (EdgeHead) 在传播中第一轮预测
@@ -1318,8 +1351,6 @@ class PlanePatchMatchModule(nn.Module):
 
         # 初始化上一轮代价缓存 (第一轮没有历史，设为 None)
         prev_costs = None
-
-        W_raw_anchor = W_plane_tri.clone().detach() # 👈 进循环前，原地备份最纯净的物理冷启动初始置信度
         # ==========================================
         # 5. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
@@ -1382,7 +1413,8 @@ class PlanePatchMatchModule(nn.Module):
                 W_raw_anchor=W_raw_anchor,  # 刚性投递，防止置信度头多轮迭代后神经失忆
                 cross_costs=cross_costs_flat, # 传入 Cross-Cost
                 normalized_slope=normalized_slope,  # 传入绝对斜率特征 (对抗悬崖错分面)
-                surface_var=surface_var             # 传入表面粗糙度 (对抗树木与噪声)
+                surface_var=surface_var,            # 传入表面粗糙度 (对抗树木与噪声)
+                penalty_cc=penalty_cc               # 传入 Pre-GNN 物理铁闸门控
             )
 
             # 将本轮的代价封存，作为下一轮的“历史代价”

@@ -38,3 +38,8 @@ __pycache__/
 
 ppt.py
 readPfm.py
+
+# 屏蔽一些其他产生文件
+
+intelligence_rules/
+学习笔记/

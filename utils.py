@@ -2116,16 +2116,19 @@ def compute_cross_check_score_gpu(depth_ref, ref_proj, src_raw_depths, src_projs
     p_ref_homo = torch.cat([x_flat * z_flat, y_flat * z_flat, z_flat, ones_flat], dim=1)  # [B, 4, H*W]
     p_world = torch.bmm(ref_proj_inv, p_ref_homo)  # [B, 4, H*W]
     
-    # 👑 大倾斜角深度动态容限补偿 (cos_theta = |n_z|)
+    # 👑 大倾斜角深度与 2D 像素动态容限补偿 (cos_theta = |n_z|)
     if normal_ref is not None:
         if normal_ref.shape[1] == 3:
             nz = normal_ref[:, 2:3, :, :].abs().permute(0, 2, 3, 1)  # [B, H, W, 1]
         else:
             nz = normal_ref[..., 2:3].abs()
-        cos_theta_clamped = torch.clamp(nz, min=0.30, max=1.0)
+        cos_theta_clamped = torch.clamp(nz, min=0.15, max=1.0)
         depth_thresh_map = base_depth_thresh / cos_theta_clamped  # [B, H, W, 1]
+        # 👑 2D 像素容限按 1/nz 动态缩放（化解斜面透视压缩 Foreshortening，跨脊假面 nz≈1 零增益）
+        pixel_dist_thresh_map = pixel_dist_thresh / cos_theta_clamped  # [B, H, W, 1]
     else:
         depth_thresh_map = base_depth_thresh
+        pixel_dist_thresh_map = pixel_dist_thresh
 
     # 准备 Scatter 索引 (与 aggregate_costs_per_triangle 对齐)
     flat_ids = tri_id_map.reshape(B, -1)  # [B, H*W]
@@ -2173,15 +2176,20 @@ def compute_cross_check_score_gpu(depth_ref, ref_proj, src_raw_depths, src_projs
         depth_diff = torch.abs(z_reproj - z_flat).view(B, H, W, 1)
         valid_reproj = (sampled_src_z.view(B, H, W, 1) > 0) & (depth_ref.permute(0, 2, 3, 1) > 0)
         
-        # 生成降级掩码 (应用动态倾角容限 depth_thresh_map)
-        mask_deg = (valid_reproj & (dist_2d < pixel_dist_thresh) & (depth_diff < depth_thresh_map)).float()
+        # 生成降级掩码 (应用动态倾角 3D 深度与 2D 像素容限)
+        mask_deg = (valid_reproj & (dist_2d < pixel_dist_thresh_map) & (depth_diff < depth_thresh_map)).float()
         
         # 5. 聚合为三角形级通过率 (Scatter Add)
+        # 🛡️ 修复分母 Bug：分母严格统计落在源视图画幅内的【可观测有效像素】，出界像素不计入分母
+        valid_obs = valid_reproj.float()
+        valid_obs_flat = valid_obs.reshape(-1, 1)[flat_mask]
         valid_mask_deg = mask_deg.reshape(-1, 1)[flat_mask]
+        
         tri_sum = torch.zeros(total_bins, 1, device=device).scatter_add_(0, valid_global_ids.unsqueeze(1), valid_mask_deg)
-        tri_cnt = torch.zeros(total_bins, 1, device=device).scatter_add_(0, valid_global_ids.unsqueeze(1), torch.ones_like(valid_mask_deg))
+        tri_cnt = torch.zeros(total_bins, 1, device=device).scatter_add_(0, valid_global_ids.unsqueeze(1), valid_obs_flat)
         tri_ratio = tri_sum / (tri_cnt + 1e-6)
-        tri_ratio = torch.where(tri_cnt > 0, tri_ratio, torch.ones_like(tri_ratio))
+        # 🛡️ 边界防爆：当该三角形在源视角完全出界（tri_cnt == 0）时，弃权赋 0.0，依赖对向能看清的源视角裁决
+        tri_ratio = torch.where(tri_cnt > 0, tri_ratio, torch.zeros_like(tri_ratio))
         ratios_deg_list.append(tri_ratio.view(B, max_tri_num, 1))
         
     # 双源互补仲裁 (OR 逻辑 -> 取最大值)

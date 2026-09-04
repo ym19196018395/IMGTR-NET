@@ -593,6 +593,8 @@ class PatchmatchNet(nn.Module):
                                                            depth_max=depth_max,
                                                            depth_min=depth_min)
 
+                # 提取主源视角纯像素级 Stage 1 原生深度 (Views 1 & 2)，供 Pre-GNN 与 Post-GNN 几何质检使用
+                src_raw_depths = self.compute_source_raw_depths(features, depth_min, depth_max, src_indices=[1, 2])
 
                 (depth_samples, pixel_costs, view_weights, normal_samples, output_plane['final_plane'], edge_alpha,
                  continuity_loss, smoothness_loss, W_plane_pixel, W_plane_tri, W_plane_tri_polarized,
@@ -603,7 +605,8 @@ class PatchmatchNet(nn.Module):
                                                                     src_features_l,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
-                lambda_c=lambda_c,lambda_s=lambda_s,current_temp=current_temp
+                lambda_c=lambda_c,lambda_s=lambda_s,current_temp=current_temp,
+                src_raw_depths=src_raw_depths
                 )
 
                 # Score (Confidence) = -min_cost
@@ -651,10 +654,7 @@ class PatchmatchNet(nn.Module):
                 # ==============================================================================
                 # 👑 [实验零：Post-GNN 双主源 Cross-Check 几何连续软降级与门控同步]
                 # ==============================================================================
-                # 1. 提取主源视角纯像素级 Stage 1 原生深度 (Views 1 & 2)
-                src_raw_depths = self.compute_source_raw_depths(features, depth_min, depth_max, src_indices=[1, 2])
-                
-                # 2. 对 GNN 最终深度 depth_samples[-1] 执行 GPU 极速双向重投影 (传入 pixel_normal_s1_pure 做大倾角自适应补偿)
+                # 对 GNN 最终深度 depth_samples[-1] 执行 GPU 极速双向重投影 (传入 pixel_normal_s1_pure 做大倾角自适应补偿)
                 max_ratio_deg = compute_cross_check_score_gpu(
                     depth_ref=depth_samples[-1],
                     ref_proj=self.proj_matrices_1[0],
@@ -662,8 +662,8 @@ class PatchmatchNet(nn.Module):
                     src_projs=self.proj_matrices_1[1:],
                     tri_id_map=tri_id_map_tensor,
                     max_tri_num=W_plane_tri.shape[1],
-                    base_depth_thresh=0.10,
-                    pixel_dist_thresh=1.0,
+                    base_depth_thresh=0.12,
+                    pixel_dist_thresh=1.2,
                     normal_ref=pixel_normal_s1_pure
                 )
                 
@@ -673,8 +673,8 @@ class PatchmatchNet(nn.Module):
                 
                 W_plane_tri_pre_cc = W_plane_tri.clone().detach()
 
-                # Sigmoid 陡峭连续软压制门控 (tau=0.40, T=0.04, min_penalty=0.25)
-                tau_deg = 0.40
+                # Sigmoid 陡峭连续软压制门控 (tau=0.38, T=0.04, min_penalty=0.25)
+                tau_deg = 0.38
                 temperature = 0.04
                 min_penalty = 0.25
                 penalty = min_penalty + (1.0 - min_penalty) * torch.sigmoid((max_ratio_deg - tau_deg) / temperature)
@@ -692,7 +692,7 @@ class PatchmatchNet(nn.Module):
                     W_plane_pixel_orig=W_plane_pixel_orig,
                     W_plane_pixel_final=W_plane_pixel,
                     tri_id_map=tri_id_map_tensor,
-                    threshold=0.70
+                    threshold=0.80
                 )
                 
                 # 计算用于光度 Ambiguity 诊断的 pixel_cost_min 和 view_weights_mean
