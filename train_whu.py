@@ -143,15 +143,22 @@ if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.l
     # use the latest checkpoint file
     loadckpt = os.path.join(args.logdir, saved_models[-1])
     print("resuming", loadckpt)
-    state_dict = torch.load(loadckpt)
-    model.load_state_dict(state_dict['model'])
+    try:
+        model.load_state_dict(state_dict['model'])
+    except RuntimeError as e:
+        print(f"Warning: Exact load failed ({e}), loading with strict=False...")
+        model.load_state_dict(state_dict['model'], strict=False)
     optimizer.load_state_dict(state_dict['optimizer'])
     start_epoch = state_dict['epoch'] + 1
 elif args.loadckpt:
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt)
-    model.load_state_dict(state_dict['model'])
+    try:
+        model.load_state_dict(state_dict['model'])
+    except RuntimeError as e:
+        print(f"Warning: Exact load failed ({e}), loading with strict=False...")
+        model.load_state_dict(state_dict['model'], strict=False)
 print("start at epoch {}".format(start_epoch))
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -215,7 +222,8 @@ def  train():
             do_summary = global_step % args.summary_freq == 0
             # do_summary_test = global_step % (10*args.summary_freq) == 0
             do_summary_image = global_step % (10 * args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image)
+            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image,
+                                                              global_step=global_step, total_steps=total_steps)
             loss_depth = scalar_outputs['loss_depth']
             loss_alpha_sup=scalar_outputs['loss_alpha_sup']
             if do_summary:
@@ -535,11 +543,12 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 一开始不启动连续性约束和光滑性约束，后面再打开，目前是直接打开
     progress = global_step / total_steps
     # 连续性约束和光滑性约束权重
-    max_lambda_c = 40.0
-    max_lambda_s = 1.0
-    # max_lambda_c = 0.0
-    # max_lambda_s = 0.0
-    max_lambda_n_1 = 1.0 # 建议设为 1.0，因为 (1-cos) 均值通常在 0.1 左右，乘 1.0 恰好贡献 0.1 总 Loss
+    # max_lambda_c = 40.0
+    # max_lambda_s = 1.0
+    max_lambda_c = 0.0
+    max_lambda_s = 0.0
+    max_lambda_n_tri = 1.0  # 宏观平面级法向峰值（完全恢复至创造 0.185m/0.106m 黄金记录时的 1.0，贡献约 0.05）
+    max_lambda_n_pix = 0.0  # 微观像素级 D2N 法向峰值（已关闭，彻底释放 FeatureNet 泛化能力）
     max_lambda_n_0 = 0.0
     max_lambda_cost=0.2
     weight_alpha = 1.0
@@ -551,7 +560,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # ====================================================
     # 1. 法向约束 (一阶方向引导，率先点火，摆正平面且不破坏深度边界)：
     # 0.15 启动，0.40 满载，0.85 开始松绑，底线保留 75%
-    lambda_n_1 = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_1, end_ratio=0.75)
+    lambda_n_tri = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_tri, end_ratio=0.75)
+    lambda_n_pix = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_pix, end_ratio=0.75) if max_lambda_n_pix > 0.0 else 0.0
 
     # 2. 连通性约束 (强几何缝合，等 edge_head 充分预热学会断裂后再缓坡介入)：
     # 0.30 启动，0.55 满载，0.85 开始松绑，底线保留 5%
@@ -568,7 +578,6 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     lambda_plane_s1=get_smooth_weight_with_decay(progress, 0.05, 0.15, 1.0, max_lambda_plane, end_ratio=1.0)
 
-    # lambda_c,lambda_s,lambda_n=0.0,0.0,0.0
 
     # 余弦柔和退火控温 [1.0 -> 0.55]，避免线性下坠引发 Softmax 阶跃相变
     current_temp = cosine_temperature_schedule(progress)
@@ -713,18 +722,33 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 3. 损失函数的混合
     # ====================================================
 
-    # 计算法向量损失 stage1
-    normal_loss_s1 = torch.tensor(0.0, device=device)
+    # 1. 计算宏观平面级法向量损失 (每个三角面参数对比 GT SVD 法向)
+    normal_loss_tri = torch.tensor(0.0, device=device)
     if "is_gt_planar" in sample_cuda and "tri_normal_cleaned" in sample_cuda:
         pixel_counts = outputs["output_plane"]["pixel_counts"] # [B, N_tri]
         
-        normal_loss_s1 = compute_normal_gt_loss(
+        normal_loss_tri = compute_normal_gt_loss(
             n_pred=outputs["output_plane"]["final_plane"][..., :3],
             n_gt=sample_cuda["tri_normal_cleaned"],
             is_gt_planar=sample_cuda["is_gt_planar"],
             pixel_counts=pixel_counts,
             min_pixels=3
         )
+
+    # 2. 计算微观像素级 D2N 法向损失（带权重门控判断：若 max_lambda_n_pix <= 0 则彻底跳过计算，零计算开销）
+    if max_lambda_n_pix > 0.0:
+        normal_loss_pix = compute_pixel_d2n_normal_loss(
+            depth_pixel_pred=depth_patchmatch['stage_1'][0],
+            depth_gt=depth_gt['stage_1'],
+            intrinsics=ref_intrinsics,
+            mask=valid_mask_s1,
+            cliff_threshold=0.8,
+            W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),
+            threshold_low=0.3,
+            threshold_high=0.8
+        )
+    else:
+        normal_loss_pix = torch.tensor(0.0, device=device)
         
     normal_loss_s0 = 0.0
 
@@ -749,7 +773,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     continuity_loss = outputs["continuity_loss"] * lambda_c
     smoothness_loss = outputs["smoothness_loss"] * lambda_s
-    normal_loss = (normal_loss_s1 * lambda_n_1) + (normal_loss_s0 * max_lambda_n_0)
+    normal_loss = (normal_loss_tri * lambda_n_tri) + (normal_loss_pix * lambda_n_pix) + (normal_loss_s0 * max_lambda_n_0)
 
     # DNC 损失
     loss_dnc_s1 = loss_dnc_s1 * lambda_dnc_s1
@@ -778,10 +802,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                       }
 
         # 记录到 scalar_outputs 以便主循环写入 Tensorboard
-    if isinstance(normal_loss_s1, torch.Tensor):
-        scalar_outputs["loss_normal_gt_s1"] = (normal_loss_s1 * lambda_n_1).item()
+    if isinstance(normal_loss_tri, torch.Tensor):
+        scalar_outputs["loss_normal_gt_s1"] = (normal_loss_tri * lambda_n_tri).item()
     else:
         scalar_outputs["loss_normal_gt_s1"] = 0.0
+    if isinstance(normal_loss_pix, torch.Tensor):
+        scalar_outputs["loss_normal_pix_s1"] = (normal_loss_pix * lambda_n_pix).item()
+    else:
+        scalar_outputs["loss_normal_pix_s1"] = 0.0
+    scalar_outputs["loss_normal_total_s1"] = (
+        scalar_outputs["loss_normal_gt_s1"] + scalar_outputs["loss_normal_pix_s1"]
+    )
 
     image_outputs = {}
 
@@ -847,9 +878,16 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         # vis_depth_pre_plane = normalize_depth_for_display(outputs["output_plane"]['depth_pred'])  # 传入 valid mask
 
         # ===== tensorboard显示图片和曲线 ======================================
+        # 👑 构建 Stage 1 物理混合融合深度 (Z_fused) 用于可视化展示
+        if "W_plane_pixel" in outputs["output_plane"]:
+            w_pixel_s1 = outputs["output_plane"]["W_plane_pixel"]
+            mask_planar_s1 = (w_pixel_s1 >= 0.80)
+            depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
+        else:
+            depth_s1_fused = depth_patchmatch['stage_1'][-1]
 
         image_outputs = {  # 暂时注释一些图片，输出的图片太多了
-            # "最终预测结果": vis_depth_final,
+            "stage0最终深度预测值": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'] ,
             "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
             # "patchmatch预测的stage2深度值": depth_patchmatch['stage_2'][-1] * mask['stage_2'],
@@ -862,7 +900,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             # "经过平面传播预测的stage1深度值生成的像素法向量": normal_pred_s1,
             # 新增：基于平面的深度图和法向量图传播完
             "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_pro'],
-            "经过平面传播预测的stage1深度值": depth_patchmatch['stage_1'][-1],
+            "stage1融合深度预测值": depth_s1_fused,
             # 新增：基于平面的深度图和法向量图，刚拟合
             "没有经过平面传播，刚拟合完初始平面深度值": outputs["output_plane"]['depth_no_pro'],
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'] ,
@@ -995,10 +1033,9 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # ====================================================
     # 2. 模型 Forward (补齐缺失的 lambda 参数)
     # ====================================================
-    # 在测试阶段，我们通常希望查看模型在"完全体"约束下的表现
-    # 所以直接给出完全展开的惩罚系数
-    max_lambda_c = 100.0
-    max_lambda_s = 3.0
+    # 在测试阶段，与当前训练设置严格对齐（暂不开启强缝合与平滑）
+    max_lambda_c = 0.0
+    max_lambda_s = 0.0
     max_lambda_n = 0.3
     max_lambda_cost = 0.2
     max_lambda_dnc_s1 = 0.05
@@ -1170,15 +1207,23 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
         vis_depth_final = get_visual_depth(depth_est['stage_0'], valid_mask_s0)
 
+        # 👑 构建 Stage 1 物理混合融合深度 (Z_fused) 用于测试集可视化展示
+        if "W_plane_pixel" in outputs["output_plane"]:
+            w_pixel_s1 = outputs["output_plane"]["W_plane_pixel"]
+            mask_planar_s1 = (w_pixel_s1 >= 0.80)
+            depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
+        else:
+            depth_s1_fused = depth_patchmatch['stage_1'][-1]
+
         image_outputs = {
-            # "最终预测结果": vis_depth_final,
+            "stage0最终深度预测值": vis_depth_final,
             "stage1深度真值": depth_gt['stage_1'],
             # "patchmatch预测的stage2上采样经过恢复的深度值": outputs["output_plane"]['depth_stage1_pixels'],
             "最终预测的法向量": vis_nomal_final,
             "ref_img": sample["imgs"]['stage_0'][:, 0],
             "根据深度真值生成的法向量": gt_normals_vis,
             "经过平面传播生成的平面法向量": outputs["output_plane"]['normal_pro'],
-            "经过平面传播预测的stage1深度值": depth_patchmatch['stage_1'][-1],
+            "stage1融合深度预测值": depth_s1_fused,
             "没有经过平面传播，刚拟合完初始平面深度值": outputs["output_plane"]['depth_no_pro'],
             "没有经过平面传播，刚拟合完初始平面法向量": outputs["output_plane"]['normal_no_pro'],
             "ref_img_edge_alpha_pre": image_outputs_pre["ref_img_edge_alpha"],

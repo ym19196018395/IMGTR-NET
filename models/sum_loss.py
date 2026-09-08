@@ -764,11 +764,8 @@ def compute_heteroscedastic_depth_loss(depth_patchmatch, refined_depth, depth_gt
     depth_gt_l = depth_gt[f'stage_{l}']
     mask_l = mask[f'stage_{l}'] > 0.5
 
-    # 核心隔离：如果提供了平面掩码，仅对非平面像素计算 Stage 0 细化损失
-    if is_planar_s0 is not None:
-        active_mask = mask_l & (~is_planar_s0)
-    else:
-        active_mask = mask_l
+    # Stage 0 级 Refine 深度损失：全面恢复原版全图有效像素监督（涵盖平面与非平面区）
+    active_mask = mask_l
 
     depth1 = depth_refined_l[active_mask]
     depth2 = depth_gt_l[active_mask]
@@ -830,11 +827,13 @@ def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=
     return loss
 
 
-def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=None, cliff_threshold=0.8):
+def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=None, cliff_threshold=0.8,
+                                   W_plane_pixel=None, threshold_low=0.3, threshold_high=0.8):
     """
-    P1: 像素级 D2N 几何正则化损失 (Pixel-Level Differentiable Normal Loss)
+    P1: 像素级 D2N 几何正则化损失 (Pixel-Level Differentiable Normal Loss with SmoothStep Gating)
     利用可微差分算子从 Stage 1 原生像素级深度求出预测法向量，
     通过余弦相似度损失反向传播，强行熨平弱纹理区域的深度凹凸噪点。
+    结合物理平面置信度 SmoothStep 软门控进行极化加权（平面区满载拉直，非平面区彻底关死）。
     同时使用深度梯度断崖掩码过滤掉房檐、物体边界处的飞面法向。
 
     Args:
@@ -843,6 +842,9 @@ def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=N
         intrinsics:       [B, 3, 3] 参考视角相机内参
         mask:             [B, H, W] 或 [B, 1, H, W] 0-1 有效深度掩码
         cliff_threshold:  断崖过滤阈值 (默认 0.8 米)，过滤楼檐悬崖处的虚假法向
+        W_plane_pixel:    [B, 1, H, W] 像素级物理平面置信度（用于软门控极化加权）
+        threshold_low:    软门控低阈值 (默认 0.2)，低于此值权重归 0
+        threshold_high:   软门控高阈值 (默认 0.8)，高于此值权重饱和至 1.0
 
     Returns:
         loss_pix_normal:  标量 Loss
@@ -878,9 +880,20 @@ def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=N
         else:
             valid_mask = (depth_gt > 1e-4) & valid_cliff
 
-    # 4. 余弦相似度损失: 1.0 - abs(cos_sim) 或 1.0 - cos_sim (由于 compute_normal_map_torch 统一朝向相机 Z<0，直接计算点积)
+    # 4. 余弦相似度损失: 1.0 - cos_sim (带 clamp 防微小数值越界)
     cos_sim = torch.sum(N_pred * N_gt, dim=1, keepdim=True)  # [B, 1, H, W]
-    loss_map = 1.0 - cos_sim
+    loss_map = 1.0 - torch.clamp(cos_sim, -1.0, 1.0)
+
+    # 5. 置信度 SmoothStep 软门控极化加权：平面区满额拉直，非平面区彻底归零
+    if W_plane_pixel is not None:
+        W_val = W_plane_pixel.detach()
+        if W_val.shape[2:] != loss_map.shape[2:]:
+            W_aligned = F.interpolate(W_val, size=loss_map.shape[2:], mode='bilinear', align_corners=True).detach()
+        else:
+            W_aligned = W_val
+        x = torch.clamp((W_aligned - threshold_low) / (threshold_high - threshold_low + 1e-8), 0.0, 1.0)
+        smooth_weight = 3.0 * (x ** 2) - 2.0 * (x ** 3)
+        loss_map = loss_map * smooth_weight
 
     if valid_mask.sum() > 0:
         loss_pix_normal = loss_map[valid_mask].mean()

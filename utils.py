@@ -2192,12 +2192,11 @@ def compute_cross_check_score_gpu(depth_ref, ref_proj, src_raw_depths, src_projs
         tri_ratio = torch.where(tri_cnt > 0, tri_ratio, torch.zeros_like(tri_ratio))
         ratios_deg_list.append(tri_ratio.view(B, max_tri_num, 1))
         
-    # 双源互补仲裁 (OR 逻辑 -> 取最大值)
-    if len(ratios_deg_list) >= 2:
-        max_ratio_deg = torch.max(ratios_deg_list[0], ratios_deg_list[1])
-    elif len(ratios_deg_list) == 1:
-        max_ratio_deg = ratios_deg_list[0]
+    # 多源互补仲裁 (OR 逻辑 -> 取全部源视角的逐面片最大值，支持 2 视角及 4 视角无缝扩展)
+    if len(ratios_deg_list) > 0:
+        max_ratio_deg = torch.stack(ratios_deg_list, dim=0).max(dim=0)[0]
     else:
         max_ratio_deg = torch.ones(B, max_tri_num, 1, device=device)
         
     return max_ratio_deg.detach()
+

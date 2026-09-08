@@ -67,15 +67,7 @@ class FeatureNet(nn.Module):
         del conv4
         # 细尺度
         output_feature['stage_1'] = self.output3(intra_feat)
-
-        # 🔥 新增：FPN 最终融合至全分辨率 (Stage 0)
-        intra_feat = F.interpolate(intra_feat, scale_factor=2, mode="bilinear", align_corners=False) + self.inner3(
-            conv1)
-        del conv1
-        # 极细尺度特征 (Stage 0)
-        output_feature['stage_0'] = self.output0(intra_feat)
-
-        del intra_feat
+        del conv1, intra_feat
             
         return output_feature
 
@@ -161,7 +153,7 @@ class Refinement(nn.Module):
         # depth residual
         res = self.res(self.conv3(cat))
         del cat
-        # 上采样后的原始深度 + res 预测残差
+
         depth = F.interpolate(depth, scale_factor=2, mode="nearest") + res
         # convert the normalized depth back
         depth = depth * (depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1)) + depth_min.view(batch_size,1,1,1)
@@ -593,8 +585,8 @@ class PatchmatchNet(nn.Module):
                                                            depth_max=depth_max,
                                                            depth_min=depth_min)
 
-                # 提取主源视角纯像素级 Stage 1 原生深度 (Views 1 & 2)，供 Pre-GNN 与 Post-GNN 几何质检使用
-                src_raw_depths = self.compute_source_raw_depths(features, depth_min, depth_max, src_indices=[1, 2])
+                # 提取全部 4 个源视角纯像素级 Stage 1 原生深度 (Views 1, 2, 3, 4)，全向立体覆盖几何死角
+                src_raw_depths = self.compute_source_raw_depths(features, depth_min, depth_max, src_indices=[1, 2, 3, 4])
 
                 (depth_samples, pixel_costs, view_weights, normal_samples, output_plane['final_plane'], edge_alpha,
                  continuity_loss, smoothness_loss, W_plane_pixel, W_plane_tri, W_plane_tri_polarized,
@@ -652,9 +644,9 @@ class PatchmatchNet(nn.Module):
                 output_plane['W_plane_tri_init'] = W_plane_tri_init
 
                 # ==============================================================================
-                # 👑 [实验零：Post-GNN 双主源 Cross-Check 几何连续软降级与门控同步]
+                # 👑 [实验零：Post-GNN 四向源视角 Cross-Check 几何连续软降级与门控同步]
                 # ==============================================================================
-                # 对 GNN 最终深度 depth_samples[-1] 执行 GPU 极速双向重投影 (传入 pixel_normal_s1_pure 做大倾角自适应补偿)
+                # 对 GNN 最终深度 depth_samples[-1] 执行 GPU 极速四向重投影 (传入 pixel_normal_s1_pure 做大倾角自适应补偿)
                 max_ratio_deg = compute_cross_check_score_gpu(
                     depth_ref=depth_samples[-1],
                     ref_proj=self.proj_matrices_1[0],
@@ -673,8 +665,8 @@ class PatchmatchNet(nn.Module):
                 
                 W_plane_tri_pre_cc = W_plane_tri.clone().detach()
 
-                # Sigmoid 陡峭连续软压制门控 (tau=0.38, T=0.04, min_penalty=0.25)
-                tau_deg = 0.38
+                # Sigmoid 陡峭连续软压制门控 (tau=0.40 严格对齐 Pre-GNN 门限, T=0.04, min_penalty=0.25)
+                tau_deg = 0.40
                 temperature = 0.04
                 min_penalty = 0.25
                 penalty = min_penalty + (1.0 - min_penalty) * torch.sigmoid((max_ratio_deg - tau_deg) / temperature)
@@ -752,27 +744,28 @@ class PatchmatchNet(nn.Module):
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
 
-        # step 3. Refinement
+        # step 3. Refinement: 使用原版 PatchmatchNet 经过验证的 Refinement (upsample_net) 进行全图残差细化
+        # 构建 Stage 1 物理混合融合深度 (Z_fused) 作为 Stage 0 上采样的初始输入底图
+        w_pixel_s1 = output_plane.get("W_plane_pixel", None)
+        if w_pixel_s1 is not None:
+            mask_planar_s1 = (w_pixel_s1 >= 0.80)
+            depth_stage1_fused = torch.where(mask_planar_s1, depth, output_plane['depth_stage1_pixels'].detach())
+        else:
+            depth_stage1_fused = depth
 
-        # depth = self.upsample_net(self.imgs_0_ref, depth, depth_min, depth_max)
+        depth = self.upsample_net(self.imgs_0_ref, depth_stage1_fused, depth_min, depth_max)
+        refined_depth['stage_0'] = depth
 
-        # 传入你已经在信心模块里用多项式算好的稀疏 output_plane['M_gating_tri']
-        res, Z_final, N_final, is_planar_s0, valid_mask_s0 = self.stage0_refiner(
-            feat_s0=ref_feature['stage_0'],
-            final_planes=output_plane['final_plane'],  # [B, N_tri, 4]
-            tri_id_map_stage0=output_plane['tri_id_map_stage0'],  # [B, H0, W0]
-            W_plane_tri=W_plane_tri.detach(),  # [B, N_tri, 1] 纯净连续物理置信度门控
-            intrinsics_s0=intrinsics_mats['stage_0'][:, 0],  # [B, 3, 3]
-            depth_range=(depth_min, depth_max),  # 场景深度裁剪范围
-            depth_stage1_pixels=output_plane['depth_stage1_pixels']
-        )
-
-        # ====== 🛡️ [在此无情拦截：切空间合成网络后续再做] ======
-        # 目前你已经拿到了绝对纯净、无任何插值模糊的残差源张量 res [B, 3, H0, W0]
-        # 以及完好无损的 Z_base, N_base 和像素级无泄漏死区遮罩 M_gating_s0
-        refined_depth['stage_0'] = Z_final
+        # 计算 Stage 0 法向量（用于 TensorBoard 与可视化系统兼容）
+        N_final, _ = compute_normal_map_torch(depth.detach(), intrinsics_mats['stage_0'][:, 0], mask=None, smooth=True)
         output_plane['final_normal'] = N_final
-        output_plane['is_planar_s0'] = is_planar_s0
+
+        # 提取 Stage 0 平面掩码，供 train_whu.py 记录 stage0_planar_mae 和 stage0_curved_mae 指标
+        tri_id_map_stage0 = output_plane['tri_id_map_stage0']
+        H0, W0 = tri_id_map_stage0.shape[1], tri_id_map_stage0.shape[2]
+        W_tri_in = W_plane_tri.detach() if W_plane_tri.dim() == 3 else W_plane_tri.unsqueeze(-1).detach()
+        W_plane_s0 = map_tri_to_pixel_single(W_tri_in, tri_id_map_stage0, H0, W0)
+        output_plane['is_planar_s0'] = (W_plane_s0 >= 0.80) & (tri_id_map_stage0.unsqueeze(1) >= 0)
         
         # 👑 架构师诊断探测针：向外输送 Stage 1 的特征网络张量，用于外围可视化纯净 DoH
         output_plane['ref_feature_s1'] = ref_feature['stage_1'].detach()

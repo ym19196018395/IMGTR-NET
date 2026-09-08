@@ -1322,7 +1322,7 @@ class PlanePatchMatchModule(nn.Module):
                 pixel_dist_thresh=1.2,
                 normal_ref=no_propa_normal
             )
-            tau_deg = 0.35
+            tau_deg = 0.40  # 调高及格线门槛（原 0.35 提至 0.40），对冲 4 视角 max 极值虚高，卡死单视角偶然伪面
             temperature_cc = 0.04
             min_penalty = 0.40
             penalty_cc = min_penalty + (1.0 - min_penalty) * torch.sigmoid((ratio_deg_init - tau_deg) / temperature_cc)
