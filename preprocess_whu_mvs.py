@@ -287,7 +287,7 @@ def main():
             tri_id_tensor = torch.from_numpy(tri_id_map_stage0).unsqueeze(0).to(device).long()
             intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).to(device).float()
 
-            hypotheses, _ = fitter_svd.get_plane_hypotheses(
+            hypotheses, *rest = fitter_svd.get_plane_hypotheses(
                 depth_stage2=depth_tensor,
                 tri_id_map=tri_id_tensor,
                 intrinsics_s1=intrinsics_tensor,

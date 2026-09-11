@@ -125,27 +125,21 @@ class GeometricRefinement(nn.Module):
 
 class Refinement(nn.Module):
     def __init__(self):
-        
         super(Refinement, self).__init__()
-        
         # img: [B,3,H,W]
         self.conv0 = ConvBnReLU(3, 8)
         # depth map:[B,1,H/2,W/2]
         self.conv1 = ConvBnReLU(1, 8)
         self.conv2 = ConvBnReLU(8, 8)
-        # 转置卷积（反卷积）
         self.deconv = nn.ConvTranspose2d(8, 8, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False)
-        
         self.bn = nn.BatchNorm2d(8)
         self.conv3 = ConvBnReLU(16, 8)
         self.res = nn.Conv2d(8, 1, 3, padding=1, bias=False)
-        
-        
+
     def forward(self, img, depth_0, depth_min, depth_max):
         batch_size = depth_min.size()[0]
         # pre-scale the depth map into [0,1]
         depth = (depth_0-depth_min.view(batch_size,1,1,1))/(depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1))
-        
         conv0 = self.conv0(img)
         deconv = F.relu(self.bn(self.deconv(self.conv2(self.conv1(depth)))), inplace=True)
         cat = torch.cat((deconv, conv0), dim=1)
@@ -593,8 +587,8 @@ class PatchmatchNet(nn.Module):
                  pixel_counts_tensor, W_plane_pixel_init, W_plane_tri_init) = self.plane_patchmatch_agent.forward(
                                                                     self.dense_plane_fitter,
                                                                     depth_stage1_init.detach(), tri_infos, # todo：暂时不让传播阶段去影响原来pixelpatchmatch阶段
-                                                                    ref_feature[f'stage_{l}'],
-                                                                    src_features_l,
+                                                                    ref_feature[f'stage_{l}'].detach(),
+                                                                    [f.detach() for f in src_features_l],
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
                 lambda_c=lambda_c,lambda_s=lambda_s,current_temp=current_temp,
@@ -744,8 +738,19 @@ class PatchmatchNet(nn.Module):
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
 
-        # step 3. Refinement: 使用原版 PatchmatchNet 经过验证的 Refinement (upsample_net) 进行全图残差细化
-        # 构建 Stage 1 物理混合融合深度 (Z_fused) 作为 Stage 0 上采样的初始输入底图
+        # step 3. Refinement: 全图残差细化 (引入 Stage 0 平面置信度作为空间先验)
+        # 1. 提前提取 Stage 0 平面置信度图 W_plane_s0 及平面掩码 is_planar_s0
+        tri_id_map_stage0 = output_plane['tri_id_map_stage0']
+        H0, W0 = tri_id_map_stage0.shape[1], tri_id_map_stage0.shape[2]
+        W_tri_in = W_plane_tri.detach() if W_plane_tri.dim() == 3 else W_plane_tri.unsqueeze(-1).detach()
+        W_plane_s0 = map_tri_to_pixel_single(W_tri_in, tri_id_map_stage0, H0, W0)
+        valid_tri_s0 = (tri_id_map_stage0.unsqueeze(1) >= 0)
+        # 将无效三角网格区域安全置零，确保物理置信度严格位于 [0, 1]
+        W_plane_s0 = torch.where(valid_tri_s0, W_plane_s0, torch.zeros_like(W_plane_s0)).detach()
+        output_plane['is_planar_s0'] = (W_plane_s0 >= 0.80) & valid_tri_s0
+        output_plane['W_plane_s0'] = W_plane_s0
+
+        # 2. 构建 Stage 1 物理混合融合深度 (Z_fused) 作为 Stage 0 上采样的初始输入底图
         w_pixel_s1 = output_plane.get("W_plane_pixel", None)
         if w_pixel_s1 is not None:
             mask_planar_s1 = (w_pixel_s1 >= 0.80)
@@ -753,19 +758,13 @@ class PatchmatchNet(nn.Module):
         else:
             depth_stage1_fused = depth
 
+        # 3. 运行全图残差细化网络 (纯净 3 通道 RGB 图像引导，不开启置信度先验，对齐最佳基线)
         depth = self.upsample_net(self.imgs_0_ref, depth_stage1_fused, depth_min, depth_max)
         refined_depth['stage_0'] = depth
 
         # 计算 Stage 0 法向量（用于 TensorBoard 与可视化系统兼容）
         N_final, _ = compute_normal_map_torch(depth.detach(), intrinsics_mats['stage_0'][:, 0], mask=None, smooth=True)
         output_plane['final_normal'] = N_final
-
-        # 提取 Stage 0 平面掩码，供 train_whu.py 记录 stage0_planar_mae 和 stage0_curved_mae 指标
-        tri_id_map_stage0 = output_plane['tri_id_map_stage0']
-        H0, W0 = tri_id_map_stage0.shape[1], tri_id_map_stage0.shape[2]
-        W_tri_in = W_plane_tri.detach() if W_plane_tri.dim() == 3 else W_plane_tri.unsqueeze(-1).detach()
-        W_plane_s0 = map_tri_to_pixel_single(W_tri_in, tri_id_map_stage0, H0, W0)
-        output_plane['is_planar_s0'] = (W_plane_s0 >= 0.80) & (tri_id_map_stage0.unsqueeze(1) >= 0)
         
         # 👑 架构师诊断探测针：向外输送 Stage 1 的特征网络张量，用于外围可视化纯净 DoH
         output_plane['ref_feature_s1'] = ref_feature['stage_1'].detach()

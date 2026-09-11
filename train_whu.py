@@ -135,6 +135,33 @@ model_loss = patchmatchnet_loss
 optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd)
 
 
+def load_checkpoint_with_channel_adaptation(model, state_dict_model):
+    """
+    自适应权重迁移与平滑加载：
+    针对 Stage 0 Refinement 从 3 通道 (RGB) 升级至 4 通道 (RGB + W_plane_s0) 实行前3通道继承、第4通道置零初始化，
+    确保微调或测试冷启动时输出与基线 100% 相同，实现真正平滑无冲击的 Warm-Start。
+    """
+    model_state = model.state_dict()
+    key = 'upsample_net.conv0.conv.weight'
+    if key in state_dict_model and key in model_state:
+        ckpt_w = state_dict_model[key]
+        tgt_w = model_state[key]
+        if ckpt_w.shape[1] == 4 and tgt_w.shape[1] == 3:
+            print(f"[Adaptive Loading] Adapting {key} from [8, 4, 3, 3] -> [8, 3, 3, 3] (discarding 4th channel)...")
+            state_dict_model[key] = ckpt_w[:, :3, :, :]
+        elif ckpt_w.shape[1] == 3 and tgt_w.shape[1] == 4:
+            print(f"[Adaptive Loading] Adapting {key} from [8, 3, 3, 3] -> [8, 4, 3, 3] (Channel 4 set to 0.0 for zero-shock start)...")
+            adapted_w = torch.zeros_like(tgt_w)
+            adapted_w[:, :3, :, :] = ckpt_w
+            state_dict_model[key] = adapted_w
+
+    try:
+        model.load_state_dict(state_dict_model)
+    except RuntimeError as e:
+        print(f"Warning: Exact load failed ({e}), loading with strict=False...")
+        model.load_state_dict(state_dict_model, strict=False)
+
+
 # load 模型 parameters
 start_epoch = 0
 if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.loadckpt):
@@ -143,22 +170,18 @@ if (args.mode == "train" and args.resume) or (args.mode == "test" and not args.l
     # use the latest checkpoint file
     loadckpt = os.path.join(args.logdir, saved_models[-1])
     print("resuming", loadckpt)
+    state_dict = torch.load(loadckpt)
+    load_checkpoint_with_channel_adaptation(model, state_dict['model'])
     try:
-        model.load_state_dict(state_dict['model'])
-    except RuntimeError as e:
-        print(f"Warning: Exact load failed ({e}), loading with strict=False...")
-        model.load_state_dict(state_dict['model'], strict=False)
-    optimizer.load_state_dict(state_dict['optimizer'])
+        optimizer.load_state_dict(state_dict['optimizer'])
+    except Exception as e:
+        print(f"Warning: Failed to load optimizer state ({e}), re-initializing optimizer state fresh.")
     start_epoch = state_dict['epoch'] + 1
 elif args.loadckpt:
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt)
-    try:
-        model.load_state_dict(state_dict['model'])
-    except RuntimeError as e:
-        print(f"Warning: Exact load failed ({e}), loading with strict=False...")
-        model.load_state_dict(state_dict['model'], strict=False)
+    load_checkpoint_with_channel_adaptation(model, state_dict['model'])
 print("start at epoch {}".format(start_epoch))
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -550,10 +573,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_n_tri = 1.0  # 宏观平面级法向峰值（完全恢复至创造 0.185m/0.106m 黄金记录时的 1.0，贡献约 0.05）
     max_lambda_n_pix = 0.0  # 微观像素级 D2N 法向峰值（已关闭，彻底释放 FeatureNet 泛化能力）
     max_lambda_n_0 = 0.0
-    max_lambda_cost=0.2
-    weight_alpha = 1.0
+    max_lambda_cost = 0.0  # 完全关闭代价裕量损失，彻底断绝对 FeatureNet 特征底座的反向梯度污染
+    weight_alpha = 0.15    # 辅助边分类损失降权，防止绑架总梯度范数
     max_lambda_dnc_s1 = 0.05 * 50
-    max_lambda_plane = 1.0
+    max_lambda_plane = 0.10  # 辅助平面置信度分类损失降权，作为正则项介入
 
     # ====================================================
     # 物理课程学习（Curriculum Learning）黄金阶梯错峰调度
@@ -717,7 +740,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         outputs["output_plane"]["W_plane_gt_pixel"] = planar_soft_conf_s1
         outputs["output_plane"]["gt_normal_map_s1"] = gt_normal_map_s1
 
-    # loss_plane_s1=lambda_plane_s1*loss_plane_s1
+    loss_plane_s1 = loss_plane_s1 * lambda_plane_s1
     # ====================================================
     # 3. 损失函数的混合
     # ====================================================
@@ -752,15 +775,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         
     normal_loss_s0 = 0.0
 
-    # 计算 Cost Margin Loss
-    cost_margin_loss = compute_pixel_cost_margin_loss(
-        no_prop_depth=outputs["output_plane"]['depth_no_pro'].detach(),  # SVD 的初始深度
-        gt_depth=depth_gt['stage_1'],  # GT 深度
-        pixel_costs=outputs["output_plane"]['pixel_costs'],  # 畅通回传给特征网的代价
-        tri_id_map=outputs["output_plane"]['tri_id_map']
-    )
-
-    cost_margin_loss = cost_margin_loss * lambda_cost
+    # 计算 Cost Margin Loss（带权重门控判断：若 max_lambda_cost <= 0 则彻底跳过计算）
+    if max_lambda_cost > 0.0:
+        cost_margin_loss = compute_pixel_cost_margin_loss(
+            no_prop_depth=outputs["output_plane"]['depth_no_pro'].detach(),  # SVD 的初始深度
+            gt_depth=depth_gt['stage_1'],  # GT 深度
+            pixel_costs=outputs["output_plane"]['pixel_costs'],  # 畅通回传给特征网的代价
+            tri_id_map=outputs["output_plane"]['tri_id_map']
+        )
+        cost_margin_loss = cost_margin_loss * lambda_cost
+    else:
+        cost_margin_loss = torch.tensor(0.0, device=device)
 
     # 边缘监督 Loss
     # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
@@ -1037,7 +1062,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     max_lambda_c = 0.0
     max_lambda_s = 0.0
     max_lambda_n = 0.3
-    max_lambda_cost = 0.2
+    max_lambda_cost = 0.0
     max_lambda_dnc_s1 = 0.05
 
     current_temp = cosine_temperature_schedule(progress)
@@ -1144,18 +1169,19 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     #                                          depth_stage_1=depth_gt['stage_1'])
     normal_loss = 0.0
 
-    # 计算 Cost Margin Loss
-    cost_margin_loss = compute_pixel_cost_margin_loss(
-        no_prop_depth=outputs["output_plane"]['depth_no_pro'].detach(),  # SVD 的初始深度
-        gt_depth=depth_gt['stage_1'],  # GT 深度
-        pixel_costs=outputs["output_plane"]['pixel_costs'],  # 畅通回传给特征网的代价
-        tri_id_map=outputs["output_plane"]['tri_id_map']
-    )
+    # 计算 Cost Margin Loss（带权重门控判断：若 max_lambda_cost <= 0 则彻底跳过计算）
+    if max_lambda_cost > 0.0:
+        cost_margin_loss = compute_pixel_cost_margin_loss(
+            no_prop_depth=outputs["output_plane"]['depth_no_pro'].detach(),  # SVD 的初始深度
+            gt_depth=depth_gt['stage_1'],  # GT 深度
+            pixel_costs=outputs["output_plane"]['pixel_costs'],  # 畅通回传给特征网的代价
+            tri_id_map=outputs["output_plane"]['tri_id_map']
+        )
+        cost_margin_loss = cost_margin_loss * max_lambda_cost
+    else:
+        cost_margin_loss = torch.tensor(0.0, device=device)
 
-
-    cost_margin_loss = cost_margin_loss * max_lambda_cost
-
-    weight_alpha = 1.0
+    weight_alpha = 0.15
     loss_alpha_sup = loss_alpha_raw * weight_alpha + loss_sparsity_raw
     continuity_loss = outputs["continuity_loss"] * max_lambda_c
     smoothness_loss = outputs["smoothness_loss"] * max_lambda_s
