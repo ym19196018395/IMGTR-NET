@@ -716,6 +716,55 @@ def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_
     return loss_final, W_GT_pixel
 
 
+def compute_plane_depth_loss(depth_plane, depth_gt, mask, W_plane_pixel=None, gamma=1.5, threshold_low=0.2, threshold_high=0.8):
+    """
+    【特异性异方差加权】Stage 1 平面级深度重构损失函数
+    仅针对 Stage 1 平面优化/传播后的深度预测进行几何置信度动态加权监督。
+    
+    :param depth_plane: [B, 1, H, W] 或 [B, H, W] 平面深度图 (例如 depth_patchmatch['stage_1'][-1])
+    :param depth_gt: [B, 1, H, W] 或 [B, H, W] Stage 1 真实深度
+    :param mask: [B, 1, H, W] 或 [B, H, W] Stage 1 有效深度掩码
+    :param W_plane_pixel: [B, 1, H, W] 像素级平面置信度权重
+    :param gamma: 最大增强权重系数 (默认 1.5)
+    :param threshold_low: 置信度截断下界 (默认 0.2)
+    :param threshold_high: 置信度完全激活上界 (默认 0.8)
+    :return: 加权后的平面深度损失标量
+    """
+    if depth_plane is None or depth_gt is None or mask is None:
+        return torch.tensor(0.0)
+
+    if depth_plane.dim() == 3:
+        depth_plane = depth_plane.unsqueeze(1)
+    if depth_gt.dim() == 3:
+        depth_gt = depth_gt.unsqueeze(1)
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+
+    mask_s1 = mask > 0.5
+    pixel_loss = F.smooth_l1_loss(depth_plane, depth_gt, reduction='none')  # [B, 1, H_s1, W_s1]
+
+    if W_plane_pixel is not None:
+        W_val = W_plane_pixel.detach()
+        if W_val.dim() == 3:
+            W_val = W_val.unsqueeze(1)
+            
+        # 对齐置信度图分辨率并强制进行梯度阻断双保险
+        if W_val.shape[2:] != pixel_loss.shape[2:]:
+            W_aligned = F.interpolate(W_val, size=pixel_loss.shape[2:], mode='bilinear', align_corners=True).detach()
+        else:
+            W_aligned = W_val.detach()
+
+        # SmoothStep 极化映射：保底彻底降为 0.0（非平面完全免除平面监督），最大增强为 gamma (1.5)
+        x = torch.clamp((W_aligned - threshold_low) / (threshold_high - threshold_low + 1e-8), 0.0, 1.0)
+        smooth_weight = 3.0 * (x ** 2) - 2.0 * (x ** 3)
+        pixel_weight = gamma * smooth_weight
+
+        weighted_loss = pixel_loss * pixel_weight
+        return weighted_loss[mask_s1].mean()
+    else:
+        return pixel_loss[mask_s1].mean()
+
+
 def compute_heteroscedastic_depth_loss(depth_patchmatch, refined_depth, depth_gt, mask, 
                                        W_plane_pixel=None, is_planar_s0=None, gamma=1.5, threshold_low=0.2, threshold_high=0.8):
     """

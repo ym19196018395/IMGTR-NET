@@ -124,10 +124,10 @@ class GeometricRefinement(nn.Module):
         return depth_refined
 
 class Refinement(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=3):
         super(Refinement, self).__init__()
-        # img: [B,3,H,W]
-        self.conv0 = ConvBnReLU(3, 8)
+        # 3 通道原生视觉空间输入: 纯 RGB (3 通道)，彻底切断 W_plane_s0 的直接条件化输入，消除纹理捷径与跨域过拟合
+        self.conv0 = ConvBnReLU(in_channels, 8)
         # depth map:[B,1,H/2,W/2]
         self.conv1 = ConvBnReLU(1, 8)
         self.conv2 = ConvBnReLU(8, 8)
@@ -136,10 +136,12 @@ class Refinement(nn.Module):
         self.conv3 = ConvBnReLU(16, 8)
         self.res = nn.Conv2d(8, 1, 3, padding=1, bias=False)
 
-    def forward(self, img, depth_0, depth_min, depth_max):
+    def forward(self, img, depth_0, depth_min, depth_max, w_plane_s0=None):
         batch_size = depth_min.size()[0]
         # pre-scale the depth map into [0,1]
         depth = (depth_0-depth_min.view(batch_size,1,1,1))/(depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1))
+        
+        # 纯 RGB 视觉输入 [B, 3, H, W]，彻底避免 W_plane_s0 人工纹理噪声对残差预测的误导
         conv0 = self.conv0(img)
         deconv = F.relu(self.bn(self.deconv(self.conv2(self.conv1(depth)))), inplace=True)
         cat = torch.cat((deconv, conv0), dim=1)
@@ -738,27 +740,26 @@ class PatchmatchNet(nn.Module):
                 view_weights = F.interpolate(view_weights,
                                     scale_factor=2, mode='nearest')
 
-        # step 3. Refinement: 全图残差细化 (引入 Stage 0 平面置信度作为空间先验)
-        # 1. 提前提取 Stage 0 平面置信度图 W_plane_s0 及平面掩码 is_planar_s0
+        # step 3. Refinement: 全图残差细化 (引入 Stage 0 双线性平滑平面置信度作为空间先验)
+        # 1. 采用双线性插值生成 Stage 0 连续像素级平面置信度（保留像素级空间渐变，杜绝网格阶跃退化）
+        w_pixel_s1 = output_plane.get("W_plane_pixel", None)
+        if w_pixel_s1 is not None:
+            # 双线性插值平滑放大 2 倍至 Stage 0 分辨率
+            W_plane_s0 = F.interpolate(w_pixel_s1.detach(), scale_factor=2, mode='bilinear', align_corners=True).clamp(0.0, 1.0)
+            mask_planar_s1 = (w_pixel_s1 >= 0.80)
+            depth_stage1_fused = torch.where(mask_planar_s1, depth, output_plane['depth_stage1_pixels'].detach())
+        else:
+            W_plane_s0 = torch.zeros_like(self.imgs_0_ref[:, 0:1])
+            depth_stage1_fused = depth
+
         tri_id_map_stage0 = output_plane['tri_id_map_stage0']
-        H0, W0 = tri_id_map_stage0.shape[1], tri_id_map_stage0.shape[2]
-        W_tri_in = W_plane_tri.detach() if W_plane_tri.dim() == 3 else W_plane_tri.unsqueeze(-1).detach()
-        W_plane_s0 = map_tri_to_pixel_single(W_tri_in, tri_id_map_stage0, H0, W0)
         valid_tri_s0 = (tri_id_map_stage0.unsqueeze(1) >= 0)
         # 将无效三角网格区域安全置零，确保物理置信度严格位于 [0, 1]
         W_plane_s0 = torch.where(valid_tri_s0, W_plane_s0, torch.zeros_like(W_plane_s0)).detach()
         output_plane['is_planar_s0'] = (W_plane_s0 >= 0.80) & valid_tri_s0
         output_plane['W_plane_s0'] = W_plane_s0
 
-        # 2. 构建 Stage 1 物理混合融合深度 (Z_fused) 作为 Stage 0 上采样的初始输入底图
-        w_pixel_s1 = output_plane.get("W_plane_pixel", None)
-        if w_pixel_s1 is not None:
-            mask_planar_s1 = (w_pixel_s1 >= 0.80)
-            depth_stage1_fused = torch.where(mask_planar_s1, depth, output_plane['depth_stage1_pixels'].detach())
-        else:
-            depth_stage1_fused = depth
-
-        # 3. 运行全图残差细化网络 (纯净 3 通道 RGB 图像引导，不开启置信度先验，对齐最佳基线)
+        # 2. 传入 3 通道纯视觉输入 (RGB 3通道) 进行全图残差细化，深度基底来自高质量融合深度 depth_stage1_fused
         depth = self.upsample_net(self.imgs_0_ref, depth_stage1_fused, depth_min, depth_max)
         refined_depth['stage_0'] = depth
 
@@ -849,9 +850,14 @@ def patchmatchnet_loss(depth_patchmatch, refined_depth, depth_gt, mask):
         depth2 = depth_gt_l[mask_l]
 
         depth_patchmatch_l = depth_patchmatch[f'stage_{l}']
-        for i in range(len(depth_patchmatch_l)):
-            depth1 = depth_patchmatch_l[i][mask_l]
+        if l == 1:
+            # Stage 1 严格对齐原版官方 PatchmatchNet：仅监督第 0 项纯像素级 PatchMatch 深度
+            depth1 = depth_patchmatch_l[0][mask_l]
             loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
+        else:
+            for i in range(len(depth_patchmatch_l)):
+                depth1 = depth_patchmatch_l[i][mask_l]
+                loss = loss + F.smooth_l1_loss(depth1, depth2, reduction='mean')
     # stage 0 损失
     l = 0
     depth_refined_l = refined_depth[f'stage_{l}']

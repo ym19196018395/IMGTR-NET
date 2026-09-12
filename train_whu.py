@@ -112,9 +112,9 @@ if args.dataset == 'dtu_whu':
     test_dataset = MVSDataset(args.trainpath, args.vallist, "test", 5, robust_train=False)
 
 # 进行了一个修改，对于有些数据不进行默认collate
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list, num_workers=8,
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list, num_workers=8,
                             drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list, num_workers=4,
+TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list, num_workers=4,
                            drop_last=False)
 
 # ym-modified 为了探测问题 num_workers设置为0
@@ -617,22 +617,28 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 通过计算最终的损失
     # ====================================================
-    # 1. 深度主任务 Loss
+    # 1. 深度主任务 Loss (解耦：原版 PatchmatchNet 纯像素深度主损失 + 新增平面级深度加权损失)
     # ====================================================
-    # 0-1掩码 用来损失函数的
+    # 局部三角形有效掩码 (仅供平面置信度/可视化等局部几何计算使用，严禁覆盖数据集全局真实 mask)
     valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
     valid_mask_s0 = (outputs["output_plane"]['tri_id_map_stage0'] >= 0).float().unsqueeze(dim=1)
-    mask['stage_1']=valid_mask_s1
-    mask['stage_0'] = valid_mask_s0
-    loss_depth = compute_heteroscedastic_depth_loss(
+
+    # 1.1 原版 PatchmatchNet 纯像素深度主损失 (6项标准像素级深度损失，完全等价于官方源工程)
+    loss_depth = patchmatchnet_loss(
         depth_patchmatch=depth_patchmatch,
         refined_depth=depth_est,
         depth_gt=depth_gt,
-        mask=mask,
-        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
-        is_planar_s0=outputs["output_plane"].get("is_planar_s0", None),    # Stage 0 硬路由屏蔽掩码
+        mask=mask
+    )
+
+    # 1.2 新增解耦的 Stage 1 平面级深度异方差加权损失
+    loss_depth_plane = compute_plane_depth_loss(
+        depth_plane=depth_patchmatch['stage_1'][-1],
+        depth_gt=depth_gt['stage_1'],
+        mask=mask['stage_1'],
+        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),
         gamma=1.5
-    )  # 深度损失
+    )
 
     # ====================================================
     # 2. 边预测头的混合监督 Loss
@@ -802,8 +808,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # DNC 损失
     loss_dnc_s1 = loss_dnc_s1 * lambda_dnc_s1
-    # 总损失：深度损失+边断裂损失+连续性损失+光滑性约束+cost损失+法向量损失+DNC损失+平面置信度
-    loss = loss_depth + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss +loss_dnc_s1 +loss_plane_s1
+
+    # 总损失：原版主深度损失 + 独立平面深度损失 + 边断裂损失 + 连续性损失 + 光滑性约束 + 法向量损失 + cost损失 + DNC损失 + 平面置信度
+    lambda_plane_depth = 1.0  # 平面深度加权损失系数（1.0 严格保持与原方案数学等价，消融时可置为 0.0）
+    loss = loss_depth + (loss_depth_plane * lambda_plane_depth) + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1 + loss_plane_s1
 
     # 边断裂损失
     loss.backward()
@@ -817,13 +825,15 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth,
+                      "loss_depth_plane": loss_depth_plane,
+                      "loss_depth_total": loss_depth + loss_depth_plane,
                       "loss_alpha_sup": loss_alpha_sup,
-                      "continuity_loss":continuity_loss,
-                      "smoothness_loss":smoothness_loss,
-                      "normal_loss":normal_loss,
-                      "cost_margin_loss":cost_margin_loss,
-                      "loss_plane_s1":loss_plane_s1,
-                      "loss_dnc_s1":loss_dnc_s1
+                      "continuity_loss": continuity_loss,
+                      "smoothness_loss": smoothness_loss,
+                      "normal_loss": normal_loss,
+                      "cost_margin_loss": cost_margin_loss,
+                      "loss_plane_s1": loss_plane_s1,
+                      "loss_dnc_s1": loss_dnc_s1
                       }
 
         # 记录到 scalar_outputs 以便主循环写入 Tensorboard
@@ -1003,7 +1013,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         mask_planar_s1 = (w_pixel_s1 >= 0.80)
         # 平面区走 Stage 1 最终平面深度 depth_patchmatch['stage_1'][-1]，非平面区/三角网外回退至纯像素深度 depth_patchmatch['stage_1'][0]
         depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
-        valid_gt_mask_s1 = (depth_gt['stage_1'] > 0)
+        valid_gt_mask_s1 = mask['stage_1'] > 0.5
         scalar_outputs["abs_depth_error_patchmatch_stage_1_fused"] = AbsDepthError_metrics(
             depth_s1_fused, depth_gt['stage_1'], valid_gt_mask_s1
         )
@@ -1107,18 +1117,24 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # ====================================================
     # 3. 损失计算 (同步使用新的 Edge Loss 和 Normal Loss)
     # ====================================================
+    # 局部三角形有效掩码 (仅供局部几何计算使用，严禁覆盖数据集全局真实 mask)
     valid_mask_s1 = (outputs["output_plane"]['tri_id_map'] >= 0).float().unsqueeze(dim=1)
     valid_mask_s0 = (outputs["output_plane"]['tri_id_map_stage0'] >= 0).float().unsqueeze(dim=1)
-    mask['stage_1']=valid_mask_s1
-    mask['stage_0'] = valid_mask_s0
 
-    loss_depth = compute_heteroscedastic_depth_loss(
+    # 1.1 原版 PatchmatchNet 纯像素深度主损失 (6项标准像素级深度损失，完全等价于官方源工程)
+    loss_depth = patchmatchnet_loss(
         depth_patchmatch=depth_patchmatch,
         refined_depth=depth_est,
         depth_gt=depth_gt,
-        mask=mask,
-        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),  # 采用真实的像素级预测置信度进行动态加权
-        is_planar_s0=outputs["output_plane"].get("is_planar_s0", None),    # Stage 0 硬路由屏蔽掩码
+        mask=mask
+    )
+
+    # 1.2 新增解耦的 Stage 1 平面级深度异方差加权损失
+    loss_depth_plane = compute_plane_depth_loss(
+        depth_plane=depth_patchmatch['stage_1'][-1],
+        depth_gt=depth_gt['stage_1'],
+        mask=mask['stage_1'],
+        W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),
         gamma=1.5
     )
 
@@ -1188,7 +1204,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     normal_loss = normal_loss * max_lambda_n
     # DNC 损失
     loss_dnc_s1 = loss_dnc_s1 * max_lambda_dnc_s1
-    loss = loss_depth + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss +cost_margin_loss +loss_dnc_s1
+    loss = loss_depth + loss_depth_plane + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1
 
     # ====================================================
     # 4. 指标统计与可视化记录
@@ -1196,13 +1212,15 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     scalar_outputs = {
         "loss": loss,
         "loss_depth": loss_depth,
+        "loss_depth_plane": loss_depth_plane,
+        "loss_depth_total": loss_depth + loss_depth_plane,
         "loss_alpha_sup": loss_alpha_sup,
         "continuity_loss": continuity_loss,
         "smoothness_loss": smoothness_loss,
         # "normal_loss": normal_loss,
-        "cost_margin_loss":cost_margin_loss,
-        # "loss_dnc_s1":loss_dnc_s1
-        }
+        "cost_margin_loss": cost_margin_loss,
+        # "loss_dnc_s1": loss_dnc_s1
+    }
 
     image_outputs = {}
 
@@ -1324,7 +1342,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
         mask_planar_s1 = (w_pixel_s1 >= 0.80)
         # 平面区走 Stage 1 最终平面深度 depth_patchmatch['stage_1'][-1]，非平面区/三角网外回退至纯像素深度 depth_patchmatch['stage_1'][0]
         depth_s1_fused = torch.where(mask_planar_s1, depth_patchmatch['stage_1'][-1], depth_patchmatch['stage_1'][0])
-        valid_gt_mask_s1 = (depth_gt['stage_1'] > 0)
+        valid_gt_mask_s1 = mask['stage_1'] > 0.5
         scalar_outputs["abs_depth_error_patchmatch_stage_1_fused"] = AbsDepthError_metrics(
             depth_s1_fused, depth_gt['stage_1'], valid_gt_mask_s1
         )
