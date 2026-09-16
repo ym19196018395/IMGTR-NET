@@ -495,7 +495,8 @@ def compute_gated_dnc_loss(Z_pixel, N_pixel, W_plane_pixel, tri_id_map, intrinsi
 
 def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_normal_pred, tri_id_map, W_pred, progress,
                                         depth_range=None, valid_mask=None, eps=1e-7, intrinsics=None, pixel_counts=None,
-                                        tri_conf_gt=None, is_gt_planar=None):
+                                        tri_conf_gt=None, is_gt_planar=None,
+                                        tri_weight_conf=None, conf_gt_mode='hard'):
     """
     【首席审判者·动态重构自愈完全体·几何辅助版】不确定性软标签回归损失函数
     
@@ -682,22 +683,60 @@ def compute_confidence_supervision_loss(pixel_depth_pred, pixel_depth_gt, pixel_
             W_GT_static = torch.stack(padded_list, dim=0).unsqueeze(-1)  # [B, num_triangles, 1]
         else:
             W_GT_static = tri_conf_gt.float().to(device)
-            if W_GT_static.dim() == 2:
+            if W_GT_static.dim() == 2:  
                 W_GT_static = W_GT_static.unsqueeze(-1)
                 
-    if GT_planar_mask is not None:
-        # 轨 1：几何真平坦区 (利用离线计算的精确掩码: tri_conf > 0.60 & tri_err95 < 0.08) 监督 W_pred 至少为 0.8
-        mask_plane = GT_planar_mask & (tri_pixel_count.unsqueeze(-1) >= 3)
-        if mask_plane.any():
-            loss_plane_aux = torch.clamp(0.8 - W_pred[mask_plane], min=0.0).mean()
+    # 解析软置信度目标 W_conf_soft
+    W_conf_soft = None
+    if conf_gt_mode == 'soft' and tri_weight_conf is not None:
+        if isinstance(tri_weight_conf, list):
+            padded_list = []
+            for b in range(B):
+                w_tensor = tri_weight_conf[b].float().to(device)
+                N_b = w_tensor.shape[0]
+                if N_b < num_triangles:
+                    padded = F.pad(w_tensor, (0, num_triangles - N_b), mode='constant', value=0.0)
+                elif N_b > num_triangles:
+                    padded = w_tensor[:num_triangles]
+                else:
+                    padded = w_tensor
+                padded_list.append(padded)
+            W_conf_soft = torch.stack(padded_list, dim=0).unsqueeze(-1)  # [B, num_triangles, 1]
+        else:
+            W_conf_soft = tri_weight_conf.float().to(device)
+            if W_conf_soft.dim() == 2:
+                W_conf_soft = W_conf_soft.unsqueeze(-1)
+
+    if conf_gt_mode == 'soft' and W_conf_soft is not None:
+        # 👑 软权重衰减辅助轨：目标恒为 0.80 (坚决鼓励成面)，但在 0.08~0.12m 仅施加软衰减的惩罚力度 W_conf_soft
+        mask_soft_plane = (W_conf_soft > 0.0) & (tri_pixel_count.unsqueeze(-1) >= 3)
+        if mask_soft_plane.any():
+            hinge_plane = torch.clamp(0.8 - W_pred[mask_soft_plane], min=0.0)
+            weights_plane = W_conf_soft[mask_soft_plane]
+            loss_plane_aux = (hinge_plane * weights_plane).sum() / (weights_plane.sum() + 1e-6)
             loss_aux = loss_aux + loss_plane_aux
             
-    if W_GT_static is not None:
-        # 轨 2：几何真曲折区 (W_GT_static <= 0.2) 监督 W_pred 至多为 0.2
-        mask_curved = (W_GT_static <= 0.3) & (tri_pixel_count.unsqueeze(-1) >= 3)
-        if mask_curved.any():
-            loss_curved_aux = torch.clamp(W_pred[mask_curved] - 0.2, min=0.0).mean()
-            loss_aux = loss_aux + loss_curved_aux
+        # 曲折区：严格回归原生 SVD 几何曲率判定 (W_GT_static <= 0.3)，绝不误伤弱纹理平坦地！
+        if W_GT_static is not None:
+            mask_curved = (W_GT_static <= 0.3) & (tri_pixel_count.unsqueeze(-1) >= 3)
+            if mask_curved.any():
+                loss_curved_aux = torch.clamp(W_pred[mask_curved] - 0.2, min=0.0).mean()
+                loss_aux = loss_aux + loss_curved_aux
+    else:
+        # 🛡️ 保持原有的 hard 基准逻辑
+        if GT_planar_mask is not None:
+            # 轨 1：几何真平坦区 (利用离线计算的精确掩码: tri_conf > 0.60 & tri_err95 < 0.08) 监督 W_pred 至少为 0.8
+            mask_plane = GT_planar_mask & (tri_pixel_count.unsqueeze(-1) >= 3)
+            if mask_plane.any():
+                loss_plane_aux = torch.clamp(0.8 - W_pred[mask_plane], min=0.0).mean()
+                loss_aux = loss_aux + loss_plane_aux
+                
+        if W_GT_static is not None:
+            # 轨 2：几何真曲折区 (W_GT_static <= 0.3) 监督 W_pred 至多为 0.2
+            mask_curved = (W_GT_static <= 0.3) & (tri_pixel_count.unsqueeze(-1) >= 3)
+            if mask_curved.any():
+                loss_curved_aux = torch.clamp(W_pred[mask_curved] - 0.2, min=0.0).mean()
+                loss_aux = loss_aux + loss_curved_aux
             
     
     # 早期 Hinge(aux) 主导给稳定锚点，晚期动态真值(dyn)主导做精细拟合
@@ -760,7 +799,13 @@ def compute_plane_depth_loss(depth_plane, depth_gt, mask, W_plane_pixel=None, ga
         pixel_weight = gamma * smooth_weight
 
         weighted_loss = pixel_loss * pixel_weight
-        return weighted_loss[mask_s1].mean()
+        # 物理归一化：除以平面有效权重和，彻底消除平面面积占比变动带来的虚假损失波动
+        valid_weights = pixel_weight[mask_s1]
+        weight_sum = valid_weights.sum()
+        if weight_sum > 1e-4:
+            return weighted_loss[mask_s1].sum() / (weight_sum + 1e-8)
+        else:
+            return weighted_loss[mask_s1].sum() * 0.0
     else:
         return pixel_loss[mask_s1].mean()
 
@@ -825,9 +870,11 @@ def compute_heteroscedastic_depth_loss(depth_patchmatch, refined_depth, depth_gt
     return loss
 
 
-def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=3):
+def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=3,
+                           weights_normal=None, normal_gt_mode='hard'):
     """
     计算基于离线 GT SVD 的绝对法向余弦损失（严格的三角面级别）。
+    支持 hard 模式（原 0.08m 二值硬截断）与 soft 模式（0.08~0.16m 连续物理软衰减加权）。
     """
     if is_gt_planar is None or n_gt is None:
         return torch.tensor(0.0, device=n_pred.device, requires_grad=True)
@@ -840,6 +887,7 @@ def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=
         # 将 list of tensors 转为单个张量 [B, N]
         planar_list = []
         gt_norm_list = []
+        weight_list = []
         for b in range(B):
             planar_b = is_gt_planar[b].bool().to(n_pred.device)
             gt_norm_b = n_gt[b].to(n_pred.device)
@@ -854,30 +902,49 @@ def compute_normal_gt_loss(n_pred, n_gt, is_gt_planar, pixel_counts, min_pixels=
             planar_list.append(planar_b)
             gt_norm_list.append(gt_norm_b)
             
+            if weights_normal is not None and isinstance(weights_normal, list):
+                w_b = weights_normal[b].float().to(n_pred.device)
+                if w_b.shape[0] < num_tri:
+                    w_b = F.pad(w_b, (0, num_tri - w_b.shape[0]), value=0.0)
+                elif w_b.shape[0] > num_tri:
+                    w_b = w_b[:num_tri]
+                weight_list.append(w_b)
+            
         mask_planar = torch.stack(planar_list, dim=0) # [B, N]
         n_gt_tensor = torch.stack(gt_norm_list, dim=0) # [B, N, 3]
+        w_norm_tensor = torch.stack(weight_list, dim=0) if len(weight_list) > 0 else None
     else:
         mask_planar = is_gt_planar.bool().to(n_pred.device)
         n_gt_tensor = n_gt.to(n_pred.device)
         if mask_planar.dim() == 3:
             mask_planar = mask_planar.squeeze(-1)
+        w_norm_tensor = weights_normal.float().to(n_pred.device) if weights_normal is not None else None
+        if w_norm_tensor is not None and w_norm_tensor.dim() == 3:
+            w_norm_tensor = w_norm_tensor.squeeze(-1)
 
-    # 1. 真实深度必须极度平坦 (mask_planar)
-    # 2. 覆盖像素点不能太少 (抗噪声)
-    # 不再强制约束法线朝向 (n_z < 0)，因为 SVD 提取的本征向量可能有随机符号
-    valid_mask = mask_planar & (pixel_counts >= min_pixels)
-    
-    if valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=n_pred.device, requires_grad=True)
-    
     # 余弦相似度损失: 取绝对值，完美兼容真值法线正反朝向！
     cos_sim = (n_pred * n_gt_tensor).sum(dim=-1)
-    loss = (1.0 - torch.abs(cos_sim))[valid_mask].mean()
-    return loss
+    loss_tri = 1.0 - torch.abs(cos_sim)
+
+    if normal_gt_mode == 'soft' and w_norm_tensor is not None:
+        # 👑 软加权监督：w_norm > 0 且有效像素点充足
+        valid_mask = (w_norm_tensor > 0.0) & (pixel_counts >= min_pixels)
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=n_pred.device, requires_grad=True)
+        effective_w = w_norm_tensor * valid_mask.float()
+        loss = (loss_tri * effective_w).sum() / (effective_w.sum() + 1e-6)
+        return loss
+    else:
+        # 🛡️ 保持原有的 hard 基准逻辑
+        valid_mask = mask_planar & (pixel_counts >= min_pixels)
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=n_pred.device, requires_grad=True)
+        loss = loss_tri[valid_mask].mean()
+        return loss
 
 
 def compute_pixel_d2n_normal_loss(depth_pixel_pred, depth_gt, intrinsics, mask=None, cliff_threshold=0.8,
-                                   W_plane_pixel=None, threshold_low=0.3, threshold_high=0.8):
+                                   W_plane_pixel=None, threshold_low=0.2, threshold_high=0.8):
     """
     P1: 像素级 D2N 几何正则化损失 (Pixel-Level Differentiable Normal Loss with SmoothStep Gating)
     利用可微差分算子从 Stage 1 原生像素级深度求出预测法向量，

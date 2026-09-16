@@ -447,7 +447,7 @@ class PatchmatchNet(nn.Module):
         # 注入高度工程集成的 Stage 0 抛光引擎
         self.stage0_refiner = Stage0RefinementNet_V2(in_channels=13)
 
-    def forward(self, imgs, proj_matrices,intrinsics_mats,depth_min, depth_max,vertexs,lines,triangles,depth_stage_1,lambda_c, lambda_s,current_temp):
+    def forward(self, imgs, proj_matrices, intrinsics_mats, depth_min, depth_max, vertexs, lines, triangles, depth_stage_1, lambda_c, lambda_s, current_temp=1.0, compute_edge_pixels=False):
         
 
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
@@ -556,7 +556,7 @@ class PatchmatchNet(nn.Module):
                 # ================================================================
                     # 对数据进行一个转化，会在里面得到边的像素集合，以及三角面的顶点和质点（归一化的）
                     # 传入原分辨率的图片，里面会进行一个归一化操作 传入的是原分辨率的
-                tri_infos = batch_convert_to_tri_infos_new(vertexs, lines, triangles, height * 2, width * 2, device)
+                tri_infos = batch_convert_to_tri_infos_new(vertexs, lines, triangles, height * 2, width * 2, device, compute_edge_pixels=compute_edge_pixels)
 
                 del vertexs,lines,triangles
 

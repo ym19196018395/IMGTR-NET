@@ -99,18 +99,19 @@ class EdgeHead(nn.Module):
 
         return orthogonal_metric_diff
 
-    def extract_static_features(self, feat, tri_infos, dense_depth=None, intrinsics=None):
+    def extract_static_features(self, feat, tri_infos, dense_depth=None, intrinsics=None, pixel_step=0.875):
         """
         【EdgeHead·常数流形寄存器】只在循环外执行 O(1) 一次。
-        物理机制：利用固定深度图反解出 3D 空间中死死焊接的探测点云位移向量 vec_L2R，作为循环内的常数铁锚。
+        物理机制：利用固定深度图反解出 3D 空间中死死焊接的 5 点探测点云位移向量 vec_L2R，作为循环内的常数铁锚。
+        pixel_step 默认 0.875px，对应 Stage 0 探针步长 1.75px (1.75 / 2 = 0.875)，物理尺度 1:1 绝对对齐。
         """
         device = feat.device
         B, C, H, W = feat.shape
         feat_proj = self.proj(feat)
 
         static_feats_list = []
-        pixel_step = 1.25
         step_tensor = torch.tensor([pixel_step * (2.0 / W), pixel_step * (2.0 / H)], device=device).view(1, 2)
+        t_weights = torch.tensor([0.3, 0.4, 0.5, 0.6, 0.7], device=device).view(1, 5, 1)
 
         for b in range(B):
             current_edges = tri_infos[0]['edges_list'][b].to(device)
@@ -118,7 +119,7 @@ class EdgeHead(nn.Module):
             E = current_edges.shape[0]
 
             if E == 0:
-                static_feats_list.append((None, None, None))
+                static_feats_list.append((None, None))
                 continue
 
             # 1. 提取中点高维图像环境特征
@@ -126,29 +127,34 @@ class EdgeHead(nn.Module):
             mid_grid = midpoints_norm.unsqueeze(0).unsqueeze(2)
             feat_mid = F.grid_sample(curr_feat_map, mid_grid, align_corners=True).view(feat_proj.shape[1], E).permute(1, 0)
 
-            # 2. 🪐【核心重构】：计算 3D 视锥绝对坐标位移差常数张量
+            # 2. 🪐【核心重构】：计算 5 点 3D 视锥绝对坐标位移差常数张量
             if dense_depth is not None and intrinsics is not None:
                 curr_dense_depth = dense_depth[b].unsqueeze(0).detach()
                 endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
+                v1 = endpoints[:, 0, :]  # [E, 2]
+                v2 = endpoints[:, 1, :]  # [E, 2]
+
+                # 5 个采样点沿边插值 [E, 5, 2]
+                pts_on_edge = (1.0 - t_weights) * v1.unsqueeze(1) + t_weights * v2.unsqueeze(1)
 
                 # 探测点正交方向偏转
-                edge_vec = endpoints[:, 1, :] - endpoints[:, 0, :]
+                edge_vec = v2 - v1  # [E, 2]
                 ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
                 ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)
-                scaled_ortho = ortho_vec * step_tensor
+                scaled_ortho = (ortho_vec * step_tensor).unsqueeze(1)  # [E, 1, 2]
 
-                probe_left_grid = (midpoints_norm + scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
-                probe_right_grid = (midpoints_norm - scaled_ortho).unsqueeze(0).unsqueeze(2).clamp(-1.0, 1.0)
+                probe_left_grid = (pts_on_edge + scaled_ortho).clamp(-1.0, 1.0)   # [E, 5, 2]
+                probe_right_grid = (pts_on_edge - scaled_ortho).clamp(-1.0, 1.0)  # [E, 5, 2]
 
-                # 重采样固定深度场
-                d_left = F.grid_sample(curr_dense_depth, probe_left_grid, align_corners=True).view(E)
-                d_right = F.grid_sample(curr_dense_depth, probe_right_grid, align_corners=True).view(E)
+                # 重采样固定深度场 (view 保证 E=1 维度安全)
+                d_left = F.grid_sample(curr_dense_depth, probe_left_grid.view(1, E, 5, 2), align_corners=True).view(E, 5)
+                d_right = F.grid_sample(curr_dense_depth, probe_right_grid.view(1, E, 5, 2), align_corners=True).view(E, 5)
 
                 # 像素坐标反解反投影
-                u_left = (probe_left_grid[0, :, 0, 0] + 1.0) / 2.0 * (W - 1)
-                v_left = (probe_left_grid[0, :, 0, 1] + 1.0) / 2.0 * (H - 1)
-                u_right = (probe_right_grid[0, :, 0, 0] + 1.0) / 2.0 * (W - 1)
-                v_right = (probe_right_grid[0, :, 0, 1] + 1.0) / 2.0 * (H - 1)
+                u_left = (probe_left_grid[:, :, 0] + 1.0) / 2.0 * (W - 1)
+                v_left = (probe_left_grid[:, :, 1] + 1.0) / 2.0 * (H - 1)
+                u_right = (probe_right_grid[:, :, 0] + 1.0) / 2.0 * (W - 1)
+                v_right = (probe_right_grid[:, :, 1] + 1.0) / 2.0 * (H - 1)
 
                 curr_K = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
                 fx, fy = curr_K[0, 0], curr_K[1, 1]
@@ -157,16 +163,16 @@ class EdgeHead(nn.Module):
                 # 熔炼出 3D 绝对空间点云常数
                 X_L = (u_left - cx) * d_left / fx
                 Y_L = (v_left - cy) * d_left / fy
-                P_left = torch.stack([X_L, Y_L, d_left], dim=1)  # [E, 3]
+                P_left = torch.stack([X_L, Y_L, d_left], dim=-1)  # [E, 5, 3]
 
                 X_R = (u_right - cx) * d_right / fx
                 Y_R = (v_right - cy) * d_right / fy
-                P_right = torch.stack([X_R, Y_R, d_right], dim=1)  # [E, 3]
+                P_right = torch.stack([X_R, Y_R, d_right], dim=-1)  # [E, 5, 3]
 
-                # 刚性备份常数位移向量，死死寄存
-                vec_L2R = P_right - P_left  # [E, 3]
+                # 刚性备份常数位移向量，死死寄存 [E, 5, 3]
+                vec_L2R = P_right - P_left  # [E, 5, 3]
             else:
-                vec_L2R = torch.zeros((E, 3), device=device)
+                vec_L2R = torch.zeros((E, 5, 3), device=device)
 
             static_feats_list.append((feat_mid, vec_L2R))
 
@@ -201,15 +207,16 @@ class EdgeHead(nn.Module):
             planes_t1 = current_planes[idx1]
             planes_t2 = current_planes[idx2]
 
-            # 🎯 【动态特征一：随法向自愈而协同沉降的稠密点到面垂直距离】
+            # 🎯 【动态特征一：随法向自愈而协同沉降的稠密点到面垂直距离 (5点中位数)】
             # 查表提取两端更新后的高纯度法向量
-            n_left = planes_t1[:, :3]
-            n_right = planes_t2[:, :3]
+            n_left = planes_t1[:, :3].unsqueeze(1)    # [E, 1, 3]
+            n_right = planes_t2[:, :3].unsqueeze(1)   # [E, 1, 3]
             
             # 无任何采样开销，原位稀疏点乘！假断层信号会随朝向变准而瞬间塌陷归零！
-            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * n_left, dim=1, keepdim=True))
-            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * n_right, dim=1, keepdim=True))
-            dense_depth_diff = torch.max(dist_to_plane_L, dist_to_plane_R).clamp(max=500.0) # [E, 1]
+            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * n_left, dim=-1))      # [E, 5]
+            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * n_right, dim=-1))  # [E, 5]
+            pt2plane_5pts = torch.max(dist_to_plane_L, dist_to_plane_R)           # [E, 5]
+            dense_depth_diff = torch.median(pt2plane_5pts, dim=1, keepdim=True).values.clamp(max=500.0) # [E, 1]
 
             # 🎯 【动态特征二：全新解析面方程几何视差距离（保持动态）】
             plane_depth_diff = self._compute_analytical_depth_diff(
@@ -268,7 +275,7 @@ class EdgeHead(nn.Module):
         """
         兼容性接口：保留原始 forward 调用习惯，但底层由动静分离逻辑支撑。
         """
-        static_feats = self.extract_static_features(feat, tri_infos, dense_depth)
+        static_feats = self.extract_static_features(feat, tri_infos, dense_depth, intrinsics=intrinsics)
         H, W = feat.shape[2], feat.shape[3]
         return self.dynamic_forward(static_feats, tri_infos, tri_planes, intrinsics, H, W)
 
@@ -276,11 +283,11 @@ class EdgeHead(nn.Module):
 class EdgeLabelGenerator:
     '''
     终极版：专门针对 C0 连续性（深度遮挡断裂）的伪标签生成器
-    采用 Point-to-Plane 物理垂直距离判定，完美免疫倾斜墙面，
+    采用 5 点采样中位数 Point-to-Plane 物理垂直距离判定，完美免疫倾斜墙面与狭长三角形越界，
     并将 C1 连续性（法向折痕）的阻断任务完全交由传播模块的 gate_net 自适应学习。
     '''
 
-    def __init__(self, pt2plane_threshold=0.4, pixel_step=1.25):
+    def __init__(self, pt2plane_threshold=0.4, pixel_step=1.75):
         # 绝对物理阈值：点到平面垂直距离（单位通常为米）
         # 0.4 米足以抓出遮挡边缘（如车顶到地面），同时放过平滑的斜面和连通的折痕
         self.pt2plane_threshold = pt2plane_threshold
@@ -296,6 +303,7 @@ class EdgeLabelGenerator:
         step_u = self.pixel_step * (2.0 / W0)
         step_v = self.pixel_step * (2.0 / H0)
         step_tensor = torch.tensor([step_u, step_v], device=device).view(1, 2)
+        t_weights = torch.tensor([0.3, 0.4, 0.5, 0.6, 0.7], device=device).view(1, 5, 1)
 
         for b in range(B):
             pred_alphas = pred_alphas_list[b]
@@ -307,11 +315,11 @@ class EdgeLabelGenerator:
                 valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=device))
                 continue
 
-            # 1. 获取端点与中点
+            # 1. 获取端点并在内核心区沿边采样 5 点 (t in [0.3, 0.7]，防狭长端点越界)
             endpoints = tri_infos[0]['edges_endpoints'][b].to(device)
-            v1 = endpoints[:, 0, :]  # [E, 2]
+            v1 = endpoints[:, 0, :]  # [E, 2]·
             v2 = endpoints[:, 1, :]  # [E, 2]
-            midpoints = (v1 + v2) / 2.0  # [E, 2]
+            pts_on_edge = (1.0 - t_weights) * v1.unsqueeze(1) + t_weights * v2.unsqueeze(1)  # [E, 5, 2]
 
             # 2. 计算正交法向量 (Orthogonal Vector)
             edge_vec = v2 - v1  # [E, 2]
@@ -319,10 +327,10 @@ class EdgeLabelGenerator:
             ortho_vec = torch.stack([-edge_vec[:, 1], edge_vec[:, 0]], dim=-1)
             ortho_vec = F.normalize(ortho_vec, p=2, dim=-1)  # [E, 2]
 
-            # 3. 生成探测点 (Probe Points) 并防越界
-            scaled_ortho = ortho_vec * step_tensor  # [E, 2]
-            probe_left = (midpoints + scaled_ortho).clamp(-1.0, 1.0)
-            probe_right = (midpoints - scaled_ortho).clamp(-1.0, 1.0)
+            # 3. 生成 5 组探测点 (Probe Points) 并防越界
+            scaled_ortho = (ortho_vec * step_tensor).unsqueeze(1)  # [E, 1, 2]
+            probe_left = (pts_on_edge + scaled_ortho).clamp(-1.0, 1.0)   # [E, 5, 2]
+            probe_right = (pts_on_edge - scaled_ortho).clamp(-1.0, 1.0)  # [E, 5, 2]
 
             # --- 提取当前 Batch 的内参 ---
             curr_K = intrinsics[b] if intrinsics.dim() == 3 else intrinsics
@@ -330,59 +338,61 @@ class EdgeLabelGenerator:
             cx, cy = curr_K[0, 2], curr_K[1, 2]
 
             # --- 采样深度和法向 ---
-            depth_b = gt_depth_map[b:b + 1]  # [1, 1, H0, W0]
+            depth_b = gt_depth_map[b:b + 1]    # [1, 1, H0, W0]
             normal_b = gt_normal_map[b:b + 1]  # [1, 3, H0, W0]
 
-            # 🔥 安全维度处理：使用 view() 和 permute() 保证 E=1 时不会崩溃
-            depth_left = F.grid_sample(depth_b, probe_left.view(1, E, 1, 2), align_corners=True).view(E)
-            depth_right = F.grid_sample(depth_b, probe_right.view(1, E, 1, 2), align_corners=True).view(E)
+            # 🔥 安全维度处理：使用 view(E, 5) 保证 E=1 时不会崩溃
+            depth_left = F.grid_sample(depth_b, probe_left.view(1, E, 5, 2), align_corners=True).view(E, 5)
+            depth_right = F.grid_sample(depth_b, probe_right.view(1, E, 5, 2), align_corners=True).view(E, 5)
 
-            normal_left = F.grid_sample(normal_b, probe_left.view(1, E, 1, 2), align_corners=True).view(3, E).permute(1,
-                                                                                                                      0)
-            normal_right = F.grid_sample(normal_b, probe_right.view(1, E, 1, 2), align_corners=True).view(3, E).permute(
-                1, 0)
+            normal_left = F.grid_sample(normal_b, probe_left.view(1, E, 5, 2), align_corners=True).view(3, E, 5).permute(1, 2, 0)
+            normal_right = F.grid_sample(normal_b, probe_right.view(1, E, 5, 2), align_corners=True).view(3, E, 5).permute(1, 2, 0)
 
             # =======================================================
             # 核心降维打击：计算 3D 点坐标 (X, Y, Z)
             # =======================================================
             # 把 [-1, 1] 的坐标转回像素坐标 [0, W0-1]
-            u_left = (probe_left[:, 0] + 1.0) / 2.0 * (W0 - 1)
-            v_left = (probe_left[:, 1] + 1.0) / 2.0 * (H0 - 1)
-            u_right = (probe_right[:, 0] + 1.0) / 2.0 * (W0 - 1)
-            v_right = (probe_right[:, 1] + 1.0) / 2.0 * (H0 - 1)
+            u_left = (probe_left[:, :, 0] + 1.0) / 2.0 * (W0 - 1)
+            v_left = (probe_left[:, :, 1] + 1.0) / 2.0 * (H0 - 1)
+            u_right = (probe_right[:, :, 0] + 1.0) / 2.0 * (W0 - 1)
+            v_right = (probe_right[:, :, 1] + 1.0) / 2.0 * (H0 - 1)
 
             # 射线反投影
             X_L = (u_left - cx) * depth_left / fx
             Y_L = (v_left - cy) * depth_left / fy
-            P_left = torch.stack([X_L, Y_L, depth_left], dim=1)  # [E, 3]
+            P_left = torch.stack([X_L, Y_L, depth_left], dim=-1)  # [E, 5, 3]
 
             X_R = (u_right - cx) * depth_right / fx
             Y_R = (v_right - cy) * depth_right / fy
-            P_right = torch.stack([X_R, Y_R, depth_right], dim=1)  # [E, 3]
+            P_right = torch.stack([X_R, Y_R, depth_right], dim=-1)  # [E, 5, 3]
 
             # =======================================================
-            # 唯一判定: 真正的遮挡断层 (Point-to-Plane Distance)
+            # 唯一判定: 真正的遮挡断层 (Point-to-Plane Distance 5点中位数)
             # =======================================================
-            vec_L2R = P_right - P_left  # [E, 3]
+            vec_L2R = P_right - P_left  # [E, 5, 3]
 
             # 计算 P_right 到 "P_left所在平面" 的垂直距离: D = |(P_R - P_L) · N_L|
-            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * normal_left, dim=1))  # [E]
+            dist_to_plane_L = torch.abs(torch.sum(vec_L2R * normal_left, dim=-1))  # [E, 5]
 
             # 对称地，计算 P_left 到 "P_right所在平面" 的垂直距离
-            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * normal_right, dim=1))  # [E]
+            dist_to_plane_R = torch.abs(torch.sum((-vec_L2R) * normal_right, dim=-1))  # [E, 5]
 
-            # 取两者较大的那个作为最终距离（增加鲁棒性）
-            pt2plane_dist = torch.max(dist_to_plane_L, dist_to_plane_R)
+            # 5 点分别取双向最大
+            pt2plane_dist_5pts = torch.max(dist_to_plane_L, dist_to_plane_R)  # [E, 5]
 
-            # 断裂条件：点到平面距离大于物理阈值
-            is_break = pt2plane_dist > self.pt2plane_threshold
+            # 沿采样点维度取中位数，彻底过滤孤立噪点
+            median_pt2plane = torch.median(pt2plane_dist_5pts, dim=1).values  # [E]
+
+            # 断裂条件：中位数点到平面距离大于物理阈值
+            is_break = median_pt2plane > self.pt2plane_threshold
             labels = is_break.float()
 
             # =======================================================
             # 掩码与边界处理
             # =======================================================
-            # 有效掩码：探测的两个点都必须有 GT 深度 (排除边界黑边干扰)
-            valid_mask = (depth_left > 1e-4) & (depth_right > 1e-4)
+            # 有效掩码：至少 3 个采样点具备 GT 深度 (排除边界黑边干扰与偶然缺失)
+            pts_valid = (depth_left > 1e-4) & (depth_right > 1e-4)
+            valid_mask = pts_valid.sum(dim=-1) >= 3
 
             # --- 强制边界边断裂 ---
             # 如果这条边只属于一个三角形 (边界边)，必须强制为断裂

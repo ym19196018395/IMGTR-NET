@@ -314,7 +314,7 @@ def norm_pixel_coords(pixels, old_W, old_H):
     return scaled_pixels
 
 
-def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, scale_ratio=1.0):
+def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, scale_ratio=1.0, compute_edge_pixels=False):
     """
     适配数组/张量格式的lines，生成三角形的【原始】顶点、质心，以及缩放/归一化后的边信息。
     优化：移除了对顶点和质心的缩放操作，直接返回原始坐标。
@@ -349,6 +349,8 @@ def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, sca
     }
 
     # -------------------------- 1. 获取原始顶点和质心 (不缩放) --------------------------
+    if isinstance(vertexs, torch.Tensor):
+        vertexs = vertexs.cpu().numpy()
     # 预先将所有顶点转换为 float32 方便计算
     # vertexs 是 (Nv, 2)
     # 不进行缩放，因为后面统一归一化
@@ -427,13 +429,12 @@ def convert_to_tri_infos_normal_new(vertexs, lines, triangles, H, W, device, sca
         p1 = (vertexs[v1_id][0], vertexs[v1_id][1])
         p2 = (vertexs[v2_id][0], vertexs[v2_id][1])
 
-        # 假设 bresenham_line 返回的是 list of (x,y)
-        edge_pixels_original = bresenham_line(p1, p2)
-
-        # 归一化像素坐标 (依赖外部函数 norm_pixel_coords)
-        # 这里的 H, W 是原图尺寸，norm_pixel_coords 应该将其映射到特定区间(如 [-1,1] 或 [0,1])
-        # 这部分保持你原有的逻辑，因为它通常用于 EdgeHead 的 grid_sample
-        edge_pixels_scaled = norm_pixel_coords(edge_pixels_original, W, H)
+        # 仅在需要可视化输出时执行沉重的纯 Python Bresenham 光栅化
+        if compute_edge_pixels:
+            edge_pixels_original = bresenham_line(p1, p2)
+            edge_pixels_scaled = norm_pixel_coords(edge_pixels_original, W, H)
+        else:
+            edge_pixels_scaled = None
 
         # 添加边信息
         tri_infos['edges'].append({
@@ -1036,7 +1037,7 @@ def batch_convert_to_tri_infos(vertexs_batch, lines_batch, triangles_batch, H, W
     return new_tri_infos
 
 
-def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, H, W, device, scale_ratio=1.0):
+def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, H, W, device, scale_ratio=1.0, compute_edge_pixels=False):
     """
     批量转换多个样本。（适配顶点坐标为(x, y)格式）
     优化点：合并循环，统一在最后一步进行 [-1, 1] 归一化，移除了中间冗余的缩放操作。
@@ -1095,9 +1096,9 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
 
     # 合并后的单次遍历
     for b in range(len(vertexs_batch)):
-        # 1. 提取单个样本数据
-        vertexs = vertexs_batch[b].cpu().numpy()  # (Nv, 2)
-        lines = lines_batch[b]  # tensor (Ne, 4)
+        # 1. 提取单个样本数据 (兼容 CPU numpy 与 GPU Tensor，杜绝强制同步)
+        vertexs = vertexs_batch[b].cpu().numpy() if isinstance(vertexs_batch[b], torch.Tensor) else vertexs_batch[b]  # (Nv, 2)
+        lines = lines_batch[b]  # tensor (Ne, 4) 或 numpy (Ne, 4)
 
         # 新增：初始化当前样本的 tri_id_map (-1 表示无效/背景)
         current_tri_id_map = torch.full((H, W), -1, dtype=torch.long, device=device)
@@ -1109,9 +1110,9 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
 
         # 遍历当前样本的所有三角形
         for tri_idx, tri in enumerate(triangles_batch[b]):
-            # 解析数据
-            v_ids = tri[0].cpu().numpy()
-            l_ids = tri[1].cpu().numpy()
+            # 解析数据 (若是 CPU numpy 直接复用，消除每步数千次 CUDA 强制阻塞同步)
+            v_ids = tri[0].cpu().numpy() if isinstance(tri[0], torch.Tensor) else tri[0]
+            l_ids = tri[1].cpu().numpy() if isinstance(tri[1], torch.Tensor) else tri[1]
             pts = tri[2]  # tensor (M, 2) (x, y) on device
 
             # === 🔥 核心新增逻辑：生成 tri_id_map ===
@@ -1187,7 +1188,7 @@ def batch_convert_to_tri_infos_new(vertexs_batch, lines_batch, triangles_batch, 
         # 3. 获取原始坐标的三角形信息 (不进行缩放)
         # ===============================================================
         # 注意：这里我们传入 H, W 主要是为了 edge_pixels 的处理，vertex 不受 scale_ratio 影响
-        tri_info = convert_to_tri_infos_normal_new(vertexs, lines, current_triangles_data, H, W, device, scale_ratio)
+        tri_info = convert_to_tri_infos_normal_new(vertexs, lines, current_triangles_data, H, W, device, scale_ratio, compute_edge_pixels=compute_edge_pixels)
 
         # test 分别可视化边和三角图并保存，可视化正常=========================================
         # scale_ratio=0.5

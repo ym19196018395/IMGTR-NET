@@ -297,8 +297,29 @@ class MVSDataset(Dataset):
                     degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
                     tri_conf[degrade_mask] = 0.75
                     
-                    # --- NEW LOGIC: Offline physical planar mask ---
+                    # --- NEW LOGIC: Offline physical planar mask & continuous soft weights ---
                     is_gt_planar = (tri_conf > 0.60) & (tri_err95 < 0.08)
+                    
+                    # 👑 连续软加权：法向监督权重 W_norm(e) 与 置信度损失衰减权重 W_loss_conf(e)
+                    # 1. 法向连续加权 W_norm: <0.08: 1.0; 0.08~0.12: 0.8->0.2 (平滑衰减，聚焦抢救刚性倾斜屋面); >=0.12: 彻底关闸归零 (阻断碎步道与植被杂质)
+                    tri_weight_normal = np.zeros_like(tri_err95, dtype=np.float32)
+                    valid_conf = tri_conf > 0.60
+                    
+                    mask_norm_1 = valid_conf & (tri_err95 < 0.08)
+                    mask_norm_2 = valid_conf & (tri_err95 >= 0.08) & (tri_err95 < 0.12)
+                    
+                    tri_weight_normal[mask_norm_1] = 1.0
+                    tri_weight_normal[mask_norm_2] = 0.8 - 0.6 * ((tri_err95[mask_norm_2] - 0.08) / 0.04)
+                    
+                    # 2. 置信度平面 Hinge 损失衰减权重 W_loss_conf:
+                    # 目标恒为 0.80 坚决鼓励成面，但在 0.08~0.12m 仅按 0.8->0.2 衰减惩罚力度（留出物理瓦片容差，不逼死网络）
+                    # >=0.12: 0.0 (不施加平面 Hinge 损失)
+                    tri_weight_conf = np.zeros_like(tri_err95, dtype=np.float32)
+                    mask_conf_1 = valid_conf & (tri_err95 < 0.08)
+                    mask_conf_2 = valid_conf & (tri_err95 >= 0.08) & (tri_err95 < 0.12)
+                    
+                    tri_weight_conf[mask_conf_1] = 1.0
+                    tri_weight_conf[mask_conf_2] = 0.8 - 0.6 * ((tri_err95[mask_conf_2] - 0.08) / 0.04)
                     
                     # 兼容新老版 npz (保存 tri_svd_plane 或 tri_svd_normal)
                     if 'tri_svd_plane' in npz_data:
@@ -410,7 +431,10 @@ class MVSDataset(Dataset):
                 "tri_conf_cleaned": tri_conf_cleaned,
                 "tri_normal_cleaned": tri_normal_cleaned,
                 "tri_plane_cleaned": tri_plane_cleaned,
-                "is_gt_planar": is_gt_planar
+                "is_gt_planar": is_gt_planar,
+                "tri_err95": tri_err95,
+                "tri_weight_normal": tri_weight_normal,
+                "tri_weight_conf": tri_weight_conf
                 }
 
 
@@ -421,7 +445,7 @@ def collate_keep_list(batch):
     out = {}
     keys = batch[0].keys()
     for k in keys:
-        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned', 'is_gt_planar']:
+        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned', 'is_gt_planar', 'tri_err95', 'tri_weight_normal', 'tri_weight_conf']:
             out[k] = [b[k] for b in batch]
         else:
             out[k] = default_collate([b[k] for b in batch])

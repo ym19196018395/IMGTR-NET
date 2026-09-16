@@ -53,6 +53,7 @@ parser.add_argument('--lrepochs', type=str, default="10,12,14:2",
 parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 
 parser.add_argument('--batch_size', type=int, default=12, help='train batch size')
+parser.add_argument('--num_workers', type=int, default=4, help='number of workers for DataLoader')
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
 parser.add_argument('--logdir', default='./checkpoints/debug', help='the directory to save checkpoints/logs')
 parser.add_argument('--resume', default=False, action='store_true', help='continue to train the model')
@@ -79,6 +80,12 @@ parser.add_argument('--run_big_eval', action='store_true', help='After training,
 parser.add_argument('--big_eval_dataset', default='dtu_whu_eval_big', help='dataset name for big eval')
 parser.add_argument('--big_eval_testpath', default='/home/ym/Experiment/Datas/WHU_MVS_dataset', help='test data path for big eval')
 parser.add_argument('--big_eval_testlist', default='lists/whu/bigtest.txt', help='test list file for big eval')
+
+# 👑 平面监督软加权解耦实验开关 (Hard vs Soft)
+parser.add_argument('--normal_gt_mode', default='hard', choices=['hard', 'soft'],
+                    help='宏观法向量真值监督模式: hard(原0.08m二值截断) 或 soft(0.08~0.16m连续物理软衰减加权)')
+parser.add_argument('--conf_gt_mode', default='hard', choices=['hard', 'soft'],
+                    help='平面置信度真值监督模式: hard(原0.08m二值硬目标) 或 soft(0.08~0.16m连续软目标)')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -112,9 +119,14 @@ if args.dataset == 'dtu_whu':
     test_dataset = MVSDataset(args.trainpath, args.vallist, "test", 5, robust_train=False)
 
 # 进行了一个修改，对于有些数据不进行默认collate
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list, num_workers=8,
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list,
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=(args.num_workers > 0),
                             drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list, num_workers=4,
+TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,
+                           num_workers=max(2, args.num_workers // 2) if args.num_workers > 0 else 0,
+                           pin_memory=True,
+                           persistent_workers=(args.num_workers > 0),
                            drop_last=False)
 
 # ym-modified 为了探测问题 num_workers设置为0
@@ -238,31 +250,42 @@ def  train():
                 'optimizer': optimizer.state_dict()},
                 "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
 
-        avg_test_scalars = DictAverageMeter()
-        for batch_idx, sample in enumerate(TestImgLoader):
-            start_time = time.time()
-            global_step = len(TrainImgLoader) * epoch_idx + batch_idx
-            do_summary = global_step % args.summary_freq == 0
-            # do_summary_test = global_step % (10*args.summary_freq) == 0
-            do_summary_image = global_step % (10 * args.summary_freq) == 0
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image,
-                                                              global_step=global_step, total_steps=total_steps)
-            loss_depth = scalar_outputs['loss_depth']
-            loss_alpha_sup=scalar_outputs['loss_alpha_sup']
-            if do_summary:
-                save_scalars(logger, 'test', scalar_outputs, global_step)
-            if do_summary_image:
-                save_images(logger, 'test', image_outputs, global_step)
-            avg_test_scalars.update(scalar_outputs)
-            del scalar_outputs, image_outputs
-            print(
-                'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
-                    epoch_idx, args.epochs, batch_idx,
-                    len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
-                    time.time() - start_time))
+        current_epoch = epoch_idx + 1
+        if current_epoch <= 16:
+            do_validation = (current_epoch % 4 == 0) or (current_epoch == args.epochs)
+        elif current_epoch <= 26:
+            do_validation = (current_epoch % 2 == 0) or (current_epoch == args.epochs)
+        else:
+            do_validation = True
 
-        save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
-        print("avg_test_scalars:", avg_test_scalars.mean())
+        if do_validation:
+            avg_test_scalars = DictAverageMeter()
+            for batch_idx, sample in enumerate(TestImgLoader):
+                start_time = time.time()
+                global_step = len(TrainImgLoader) * epoch_idx + batch_idx
+                do_summary = global_step % args.summary_freq == 0
+                # do_summary_test = global_step % (10*args.summary_freq) == 0
+                do_summary_image = global_step % (10 * args.summary_freq) == 0
+                loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary_image,
+                                                                  global_step=global_step, total_steps=total_steps)
+                loss_depth = scalar_outputs['loss_depth']
+                loss_alpha_sup=scalar_outputs['loss_alpha_sup']
+                if do_summary:
+                    save_scalars(logger, 'test', scalar_outputs, global_step)
+                if do_summary_image:
+                    save_images(logger, 'test', image_outputs, global_step)
+                avg_test_scalars.update(scalar_outputs)
+                del scalar_outputs, image_outputs
+                print(
+                    'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
+                        epoch_idx, args.epochs, batch_idx,
+                        len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
+                        time.time() - start_time))
+
+            save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
+            print("avg_test_scalars:", avg_test_scalars.mean())
+        else:
+            print(f"Epoch {epoch_idx}/{args.epochs}: 处于前期/中期快速探索阶段，跳过当前轮验证（阶梯验证调度：<=16轮每4轮一次，<=26轮每2轮一次），直接进入下一轮训练...")
         print("当前时间（time模块）：", time.ctime())
         gc.collect()
 
@@ -535,20 +558,20 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # lines_batch = []
     # triangles_batch = []
 
-    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    vertexs_batch = sample['vertexs']  # 保持在 CPU numpy，消除 GPU 显存占用与无谓搬运
+    lines_batch = sample['lines']      # 保持在 CPU numpy，消除 GPU 显存占用与无谓搬运
     triangles_batch = []
     for tri_list in sample['triangles']:  # tri_list 是一个 sample 的 triangles
         tri_processed = []
         for t in tri_list:
-            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-            l_ids = torch.from_numpy(t['line_ids']).to(device)
-            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len
+            v_ids = t['vertex_ids']    # 保持 CPU numpy，避免循环内反复 .cpu().numpy() 引起千次 CUDA 强制同步
+            l_ids = t['line_ids']      # 保持 CPU numpy，避免循环内反复 .cpu().numpy() 引起千次 CUDA 强制同步
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len，需在 GPU 端构建 tri_id_map
             tri_processed.append((v_ids, l_ids, pts))
         triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过，同时也跳过超轻量几何变长列表的直接转换
-    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar"]
+    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar", "tri_err95", "tri_weight_normal", "tri_weight_conf"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
     # 手动转换并移动到 GPU
@@ -556,6 +579,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
     if 'is_gt_planar' in sample:
         sample_cuda['is_gt_planar'] = [torch.from_numpy(v).to(device).bool() for v in sample['is_gt_planar']]
+    if 'tri_weight_normal' in sample:
+        sample_cuda['tri_weight_normal'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_weight_normal']]
+    if 'tri_weight_conf' in sample:
+        sample_cuda['tri_weight_conf'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_weight_conf']]
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
@@ -574,7 +601,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     max_lambda_n_pix = 0.0  # 微观像素级 D2N 法向峰值（已关闭，彻底释放 FeatureNet 泛化能力）
     max_lambda_n_0 = 0.0
     max_lambda_cost = 0.0  # 完全关闭代价裕量损失，彻底断绝对 FeatureNet 特征底座的反向梯度污染
-    weight_alpha = 0.15    # 辅助边分类损失降权，防止绑架总梯度范数
+    weight_alpha = 0.05    # 辅助边分类损失降权，防止绑架总梯度范数
+    weight_sparsity = 0.01 # 稀疏性正则微弱系数，由0.05降至0.01，防止alphas.mean()常数项绑架总损失或吓退真实断裂
     max_lambda_dnc_s1 = 0.05 * 50
     max_lambda_plane = 0.10  # 辅助平面置信度分类损失降权，作为正则项介入
 
@@ -587,8 +615,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     lambda_n_pix = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_pix, end_ratio=0.75) if max_lambda_n_pix > 0.0 else 0.0
 
     # 2. 连通性约束 (强几何缝合，等 edge_head 充分预热学会断裂后再缓坡介入)：
-    # 0.30 启动，0.55 满载，0.85 开始松绑，底线保留 5%
-    lambda_c = get_smooth_weight_with_decay(progress, 0.30, 0.55, 0.85, max_lambda_c, end_ratio=0.05)
+    # 0.30 启动，0.55 满载，0.85 开始松绑，底线保留 20%
+    lambda_c = get_smooth_weight_with_decay(progress, 0.30, 0.55, 0.85, max_lambda_c, end_ratio=0.20)
 
     # 3. 光滑性约束 (曲率平滑，晚启动，最后微调局部细节)：
     # 0.40 启动，0.65 满载，0.80 开始松绑，底线保留 40%
@@ -609,7 +637,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'],
-                    lambda_c,lambda_s,current_temp)
+                    lambda_c,lambda_s,current_temp, compute_edge_pixels=do_summary_image)
 
     depth_est = outputs["refined_depth"]
 
@@ -710,7 +738,9 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         valid_mask=valid_mask_s1,
         intrinsics=ref_intrinsics,
         tri_conf_gt=sample_cuda["tri_conf_cleaned"],
-        is_gt_planar=sample_cuda.get("is_gt_planar", None)
+        is_gt_planar=sample_cuda.get("is_gt_planar", None),
+        tri_weight_conf=sample_cuda.get("tri_weight_conf", None),
+        conf_gt_mode=args.conf_gt_mode
     )
     outputs["output_plane"]["W_plane_gt_pixel"] = W_GT_pixel
 
@@ -723,8 +753,11 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         gt_normal_map_s1_list = []
         
         for b in range(B):
-            # 将 bool 掩码转为 float (True变为1.0, False变为0.0)，映射到 TensorBoard
-            tri_conf_b = sample_cuda['is_gt_planar'][b].float()     # [N_tri]
+            # 将真值置信度映射到 TensorBoard (soft 模式下使用连续软目标，hard 模式下使用二值掩码)
+            if args.conf_gt_mode == 'soft' and "tri_weight_conf" in sample_cuda:
+                tri_conf_b = sample_cuda['tri_weight_conf'][b].float()
+            else:
+                tri_conf_b = sample_cuda['is_gt_planar'][b].float()
             tri_normal_b = sample_cuda['tri_normal_cleaned'][b] # [N_tri, 3]
             tri_id_map_b = tri_id_map[b]                        # [H_s1, W_s1]
             
@@ -753,15 +786,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # 1. 计算宏观平面级法向量损失 (每个三角面参数对比 GT SVD 法向)
     normal_loss_tri = torch.tensor(0.0, device=device)
-    if "is_gt_planar" in sample_cuda and "tri_normal_cleaned" in sample_cuda:
+    if ("is_gt_planar" in sample_cuda or "tri_weight_normal" in sample_cuda) and "tri_normal_cleaned" in sample_cuda:
         pixel_counts = outputs["output_plane"]["pixel_counts"] # [B, N_tri]
         
         normal_loss_tri = compute_normal_gt_loss(
             n_pred=outputs["output_plane"]["final_plane"][..., :3],
             n_gt=sample_cuda["tri_normal_cleaned"],
-            is_gt_planar=sample_cuda["is_gt_planar"],
+            is_gt_planar=sample_cuda.get("is_gt_planar", None),
             pixel_counts=pixel_counts,
-            min_pixels=3
+            min_pixels=3,
+            weights_normal=sample_cuda.get("tri_weight_normal", None),
+            normal_gt_mode=args.normal_gt_mode
         )
 
     # 2. 计算微观像素级 D2N 法向损失（带权重门控判断：若 max_lambda_n_pix <= 0 则彻底跳过计算，零计算开销）
@@ -773,7 +808,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
             mask=valid_mask_s1,
             cliff_threshold=0.8,
             W_plane_pixel=outputs["output_plane"].get("W_plane_pixel", None),
-            threshold_low=0.3,
+            threshold_low=0.2,
             threshold_high=0.8
         )
     else:
@@ -793,10 +828,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     else:
         cost_margin_loss = torch.tensor(0.0, device=device)
 
-    # 边缘监督 Loss
-    # 乘上一个权重再，加上边断裂损失，防止预测头损失过小
-
-    loss_alpha_sup=loss_alpha_raw * weight_alpha + loss_sparsity_raw
+    # 边缘监督 Loss：分类损失与稀疏性惩罚均加权融合，使总体能级收拢至健康区间 (~0.04)
+    loss_alpha_sup = loss_alpha_raw * weight_alpha + loss_sparsity_raw * weight_sparsity
 
     # 3.连续性正则化 Loss (Geometric Smoothness)
     # 因为它是正则化项，绝不能喧宾夺主。建议权重设为 0.1 ~ 0.5
@@ -810,14 +843,14 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     loss_dnc_s1 = loss_dnc_s1 * lambda_dnc_s1
 
     # 总损失：原版主深度损失 + 独立平面深度损失 + 边断裂损失 + 连续性损失 + 光滑性约束 + 法向量损失 + cost损失 + DNC损失 + 平面置信度
-    lambda_plane_depth = 1.0  # 平面深度加权损失系数（1.0 严格保持与原方案数学等价，消融时可置为 0.0）
-    loss = loss_depth + (loss_depth_plane * lambda_plane_depth) + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1 + loss_plane_s1
+    lambda_plane_depth = 1.0  # 平面深度提权
+    loss_depth_plane_weighted = loss_depth_plane * lambda_plane_depth
+    loss = loss_depth + loss_depth_plane_weighted + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1 + loss_plane_s1
 
     # 边断裂损失
     loss.backward()
 
-    # todo：将梯度限制maxmax_norm以内
-    # ← 必须在这里，backward 之后才有梯度可以裁剪
+    # 恢复全局梯度裁剪：为包含 GNN、SVD 法向与点到面几何多任务提供数值阻尼，防止极端视差梯度尖峰
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
 
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
@@ -825,8 +858,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     scalar_outputs = {"loss": loss,
                       "loss_depth": loss_depth,
-                      "loss_depth_plane": loss_depth_plane,
-                      "loss_depth_total": loss_depth + loss_depth_plane,
+                      "loss_depth_plane": loss_depth_plane_weighted,
+                      "loss_depth_total": loss_depth + loss_depth_plane_weighted,
                       "loss_alpha_sup": loss_alpha_sup,
                       "continuity_loss": continuity_loss,
                       "smoothness_loss": smoothness_loss,
@@ -850,16 +883,17 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     )
 
     image_outputs = {}
-
-    pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
-    planar_mae_val, pixel_mae_val, _ , planar_err_masked , _= compute_stage1_flat_region_mae_tensors(
-        outputs, pixel_depth_s1, depth_gt['stage_1'], device
-    )
+    planar_mae_val = 0.0
+    pixel_mae_val = 0.0
 
     # ====================================================
     # 4.可视化
     # ====================================================
     if do_summary_image:
+        pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
+        planar_mae_val, pixel_mae_val, _ , planar_err_masked , _= compute_stage1_flat_region_mae_tensors(
+            outputs, pixel_depth_s1, depth_gt['stage_1'], device
+        )
         # ================ 生成断裂图 ===============================================
         image_outputs_pre = generate_edge_alpha_overlays(
             ref_imgs=sample["imgs"]['stage_0'][:, 0],  # 注意取 ref 图
@@ -1029,8 +1063,9 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # threshold = 8mm
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
-    scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
-    scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
+    if do_summary_image:
+        scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
+        scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 
@@ -1042,20 +1077,20 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # ====================================================
     # 1. 数据准备 (与 train_sample 严格对齐)
     # ====================================================
-    vertexs_batch = [torch.from_numpy(v).to(device) for v in sample['vertexs']]
-    lines_batch = [torch.from_numpy(v).to(device) for v in sample['lines']]
+    vertexs_batch = sample['vertexs']  # 保持在 CPU numpy，消除 GPU 显存占用与无谓搬运
+    lines_batch = sample['lines']      # 保持在 CPU numpy，消除 GPU 显存占用与无谓搬运
     triangles_batch = []
     for tri_list in sample['triangles']:
         tri_processed = []
         for t in tri_list:
-            v_ids = torch.from_numpy(t['vertex_ids']).to(device)
-            l_ids = torch.from_numpy(t['line_ids']).to(device)
-            pts = torch.from_numpy(t['valid_points']).to(device)
+            v_ids = t['vertex_ids']    # 保持 CPU numpy，避免循环内反复 .cpu().numpy() 引起千次 CUDA 强制同步
+            l_ids = t['line_ids']      # 保持 CPU numpy，避免循环内反复 .cpu().numpy() 引起千次 CUDA 强制同步
+            pts = torch.from_numpy(t['valid_points']).to(device)  # variable len，需在 GPU 端构建 tri_id_map
             tri_processed.append((v_ids, l_ids, pts))
         triangles_batch.append(tri_processed)
 
     # ym-modify 重写了一下对于cdt—data数据进行了一个跳过，同时也跳过超轻量几何变长列表的直接转换
-    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned"]
+    skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar", "tri_err95", "tri_weight_normal", "tri_weight_conf"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
     # 手动转换并移动到 GPU
@@ -1079,7 +1114,7 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch, depth_gt['stage_1'],
-                    max_lambda_c, max_lambda_s,current_temp)
+                    max_lambda_c, max_lambda_s, current_temp, compute_edge_pixels=detailed_summary)
 
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]
@@ -1197,14 +1232,17 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     else:
         cost_margin_loss = torch.tensor(0.0, device=device)
 
-    weight_alpha = 0.15
-    loss_alpha_sup = loss_alpha_raw * weight_alpha + loss_sparsity_raw
+    weight_alpha = 0.05
+    weight_sparsity = 0.01
+    loss_alpha_sup = loss_alpha_raw * weight_alpha + loss_sparsity_raw * weight_sparsity
     continuity_loss = outputs["continuity_loss"] * max_lambda_c
     smoothness_loss = outputs["smoothness_loss"] * max_lambda_s
     normal_loss = normal_loss * max_lambda_n
     # DNC 损失
     loss_dnc_s1 = loss_dnc_s1 * max_lambda_dnc_s1
-    loss = loss_depth + loss_depth_plane + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1
+    lambda_plane_depth = 1.0
+    loss_depth_plane_weighted = loss_depth_plane * lambda_plane_depth
+    loss = loss_depth + loss_depth_plane_weighted + loss_alpha_sup + continuity_loss + smoothness_loss + normal_loss + cost_margin_loss + loss_dnc_s1
 
     # ====================================================
     # 4. 指标统计与可视化记录
@@ -1212,8 +1250,8 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     scalar_outputs = {
         "loss": loss,
         "loss_depth": loss_depth,
-        "loss_depth_plane": loss_depth_plane,
-        "loss_depth_total": loss_depth + loss_depth_plane,
+        "loss_depth_plane": loss_depth_plane_weighted,
+        "loss_depth_total": loss_depth + loss_depth_plane_weighted,
         "loss_alpha_sup": loss_alpha_sup,
         "continuity_loss": continuity_loss,
         "smoothness_loss": smoothness_loss,
@@ -1223,13 +1261,14 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     }
 
     image_outputs = {}
-
-    pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
-    planar_mae_val, pixel_mae_val, _ , planar_err_masked , _ = compute_stage1_flat_region_mae_tensors(
-        outputs, pixel_depth_s1, depth_gt['stage_1'], device
-    )
+    planar_mae_val = 0.0
+    pixel_mae_val = 0.0
 
     if detailed_summary:
+        pixel_depth_s1 = depth_patchmatch['stage_1'][-1]
+        planar_mae_val, pixel_mae_val, _ , planar_err_masked , _ = compute_stage1_flat_region_mae_tensors(
+            outputs, pixel_depth_s1, depth_gt['stage_1'], device
+        )
         image_outputs_pre = generate_edge_alpha_overlays(
             ref_imgs=sample["imgs"]['stage_0'][:, 0],
             edge_alphas_list=outputs["edge_alphas"],
@@ -1358,8 +1397,9 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     # threshold = 8mm
     scalar_outputs["thres8mm_error"] = Thres_metrics(depth_est['stage_0'], depth_gt['stage_0'], mask['stage_0'] > 0.5,
                                                      8)
-    scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
-    scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
+    if detailed_summary:
+        scalar_outputs["stage1_flat_region_mae"] = planar_mae_val
+        scalar_outputs["stage1_flat_region_pixel_mae"] = pixel_mae_val
 
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
 
