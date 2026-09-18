@@ -27,79 +27,98 @@ cudnn.benchmark = True
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='WHU-MVS GeoMVSNet 独立基准评测适配脚本 (遵循 whu-mvs-benchmark-adapter 规范)'
+        description='WHU-MVS DiffMVS / CasDiffMVS (TPAMI 2025) 独立基准评测适配脚本 (遵循 whu-mvs-benchmark-adapter 规范)'
     )
     # 数据集与路径配置
     parser.add_argument('--dataset', default='dtu_whu', help='select dataset (default: dtu_whu)')
     parser.add_argument('--testpath', default='/home/ym/Experiment/Datas/WHU_MVS_dataset',
                         help='WHU dataset root path')
-    parser.add_argument('--testlist', default='lists/whu/minitest.txt',
+    parser.add_argument('--testlist', default='lists/whu/newtest.txt',
                         help='testing scan list file (e.g. lists/whu/minitest.txt or newtest.txt)')
-    parser.add_argument('--loadckpt', required=True, help='path to GeoMVSNet checkpoint (.ckpt)')
-    parser.add_argument('--geomvsnet_code_dir', default='',
-                        help='path to GeoMVSNet source code directory')
+    parser.add_argument('--loadckpt', required=True, help='path to DiffMVS / CasDiffMVS checkpoint (.ckpt)')
+    parser.add_argument('--diffmvs_code_dir', default='',
+                        help='path to DiffMVS source code directory (e.g. /home/ym/Experiment/diffmvs-main)')
     parser.add_argument('--mask_dir', default='./outputs_minitest',
                         help='directory containing 同源 stage0_planar_mask_{file_id}.png (for Table 2)')
-    parser.add_argument('--outdir', default='./outputs_geomvsnet',
+    parser.add_argument('--outdir', default='./outputs_diffmvs',
                         help='output directory to save reports and depth predictions')
 
     # 批次与硬件设置
     parser.add_argument('--batch_size', type=int, default=1, help='testing batch size (recommend 1 to prevent OOM)')
     parser.add_argument('--n_views', type=int, default=5, help='number of views per sample')
     parser.add_argument('--num_workers', type=int, default=4, help='num_workers for DataLoader')
-    parser.add_argument('--seed', type=int, default=1, help='random seed')
+    parser.add_argument('--seed', type=int, default=123, help='random seed')
     parser.add_argument('--save_depth', action='store_true', default=False,
                         help='save predicted depth maps in .pfm and 16-bit .png format')
 
-    # GeoMVSNet 网络超参数 (与官方 opts.py 完全对齐)
-    parser.add_argument('--levels', type=int, default=4, help='levels of cascade stages')
-    parser.add_argument('--hypo_plane_num_stages', nargs='+', type=int, default=[8, 8, 4, 4],
-                        help='number of depth hypothesis planes for stages 1 to 4 (default: 8 8 4 4)')
-    parser.add_argument('--depth_interal_ratio_stages', nargs='+', type=float, default=[0.5, 0.5, 0.5, 1.0],
-                        help='depth interval ratio for stages 1 to 4 (default: 0.5 0.5 0.5 1.0)')
-    parser.add_argument('--feat_base_channel', type=int, default=8, help='base channels of FPN')
-    parser.add_argument('--reg_base_channel', type=int, default=8, help='base channels of 2D RegNet')
-    parser.add_argument('--group_cor_dim_stages', nargs='+', type=int, default=[8, 8, 4, 4],
-                        help='group correlation dimensions for stages 1 to 4 (default: 8 8 4 4)')
+    # DiffMVS / CasDiffMVS 核心超参数 (与官方 test_dtu_casdiffmvs.sh 完全对齐)
+    parser.add_argument('--numdepth_initial', type=int, default=48,
+                        help='number of depth samples in depth initialization')
+    parser.add_argument('--numdepth', type=int, default=384,
+                        help='1.0/numdepth is the sampling interval in inverse depth space')
+    parser.add_argument('--ddim_eta', nargs="+", type=float, default=[0.0, 1.0, 1.0],
+                        help='eta for ddim')
+    parser.add_argument('--scale', nargs="+", type=float, default=[0.0, 0.5, 0.1],
+                        help='scale of noise in diffusion')
+    parser.add_argument('--timesteps', nargs="+", type=int, default=[1000, 1000, 1000],
+                        help='total diffusion timesteps')
+    parser.add_argument('--sampling_timesteps', nargs="+", type=int, default=[0, 1, 1],
+                        help='DDIM sampling timesteps')
+    parser.add_argument('--hidden_dim', nargs="+", type=int, default=[0, 32, 20],
+                        help='feature dimension of hidden states for each stage')
+    parser.add_argument('--context_dim', nargs="+", type=int, default=[32, 32, 16],
+                        help='context dimension for each stage')
+    parser.add_argument('--stage_iters', nargs="+", type=int, default=[1, 3, 3],
+                        help='diffusion update iterations for each stage')
+    parser.add_argument('--cost_dim_stage', nargs="+", type=int, default=[4, 4, 4],
+                        help='feature dimension of group-wise correlation for each stage')
+    parser.add_argument('--CostNum', nargs="+", type=int, default=[0, 4, 4],
+                        help='number of new samples in each diffusion timestep')
+    parser.add_argument('--unet_dim', nargs="+", type=int, default=[0, 16, 8],
+                        help='base feature dimension of unet for each stage')
+    parser.add_argument('--min_radius', type=float, default=0.125,
+                        help='min scale factor for sampling radius')
+    parser.add_argument('--max_radius', type=float, default=8.0,
+                        help='max scale factor for sampling radius')
+    parser.add_argument('--conf_weight', type=float, default=0.05,
+                        help='weight for confidence learning')
+    parser.add_argument('--depth_interals_ratio', nargs="+", type=float, default=[4.0, 2.0, 1.0],
+                        help='sampling interval ratio of inverse depth across stages')
 
     return parser.parse_args()
 
 
-class GeoMVSNetWrapper(nn.Module):
+class DiffMVSWrapper(nn.Module):
     """
-    WHU-MVS 基准测试适配包装器：将 WHU DataLoader 输出无缝转换为 GeoMVSNet 输入
+    WHU-MVS 基准测试适配包装器：将 WHU DataLoader 输出无缝转换为 CasDiffMVS 输入
     遵循 whu-mvs-benchmark-adapter 专家规范 (Mode A: 包装器模式)
     """
-    def __init__(self, geomvsnet_class, levels=4, hypo_plane_num_stages=[48, 32, 16, 8],
-                 depth_interal_ratio_stages=[2.0, 1.0, 0.5, 0.25],
-                 feat_base_channel=8, reg_base_channel=8,
-                 group_cor_dim_stages=[8, 8, 8, 4]):
+    def __init__(self, casdiffmvs_class, args):
         super().__init__()
-        self.net = geomvsnet_class(
-            levels=levels,
-            hypo_plane_num_stages=hypo_plane_num_stages,
-            depth_interal_ratio_stages=depth_interal_ratio_stages,
-            feat_base_channel=feat_base_channel,
-            reg_base_channel=reg_base_channel,
-            group_cor_dim_stages=group_cor_dim_stages
+        self.numdepth = args.numdepth
+        depth_interals_ratio = [int(r) if r.is_integer() else r for r in args.depth_interals_ratio]
+        self.net = casdiffmvs_class(
+            args=args,
+            depth_interals_ratio=depth_interals_ratio,
+            test=True
         )
 
     def forward(self, sample_cuda, n_views=5):
         B = sample_cuda["depth_min"].shape[0]
-        device = sample_cuda["depth_min"].device
+        dev = sample_cuda["depth_min"].device
 
-        # 1. 转换图像列表: List[B, 3, H, W]
-        # WHU DataLoader stage_0 是全分辨率原图 [B, N, 3, H, W]
+        # 1. 转换图像列表: List[B, 3, H, W] (WHU stage_0 为全分辨率原图 [0, 1] 归一化)
         imgs = [sample_cuda["imgs"]["stage_0"][:, i] for i in range(n_views)]
 
-        # 2. 构造绝对米制深度范围: [B, 2]
-        depth_values = torch.stack([
-            sample_cuda["depth_min"].view(B).float(),
-            sample_cuda["depth_max"].view(B).float()
-        ], dim=-1)
+        # 2. 构造视差空间线性采样网格 (Disparity Linear Sampling)
+        # DiffMVS 约定: disp_min = 1.0 / depth_max, disp_max = 1.0 / depth_min
+        disp_min = 1.0 / sample_cuda["depth_max"].view(B, 1).float()
+        disp_max = 1.0 / sample_cuda["depth_min"].view(B, 1).float()
+        t = torch.linspace(0.0, 1.0, steps=self.numdepth, device=dev, dtype=torch.float32).view(1, -1)
+        depth_values = disp_min + t * (disp_max - disp_min)  # [B, numdepth]
 
-        # 3. 构造 GeoMVSNet 多阶段投影矩阵与内参字典
-        # 层级对应关系：GeoMVSNet stage1~stage4 <-> WHU stage_3~stage_0 (从粗到细)
+        # 3. 构造 DiffMVS 多阶段投影矩阵字典 [B, N, 2, 4, 4]
+        # 层级映射：DiffMVS stage1~stage4 <-> WHU stage_3~stage_0 (从 1/8 粗阶段到 1/1 原图)
         stage_mapping = [
             ("stage1", "stage_3"),  # 1/8 粗阶段
             ("stage2", "stage_2"),  # 1/4
@@ -108,37 +127,37 @@ class GeoMVSNetWrapper(nn.Module):
         ]
 
         proj_matrices_dict = {}
-        intrinsics_dict = {}
-
-        for geo_st, whu_st in stage_mapping:
+        for diff_st, whu_st in stage_mapping:
             P = sample_cuda["proj_matrices"][whu_st]       # [B, N, 4, 4]
             K = sample_cuda["intrinsics_mats"][whu_st]     # [B, N, 3, 3]
 
             # 精确代数求解外参: [R|t] = K^{-1} @ P[:3, :4]
             K_inv = torch.inverse(K)
-            extrinsic = torch.eye(4, device=device, dtype=torch.float32).repeat(B, n_views, 1, 1)
+            extrinsic = torch.eye(4, device=dev, dtype=torch.float32).repeat(B, n_views, 1, 1)
             extrinsic[:, :, :3, :4] = torch.matmul(K_inv, P[:, :, :3, :4])
 
-            # 封装为 GeoMVSNet 期望的 [B, N, 2, 4, 4] 打包格式
-            proj_mat_geo = torch.zeros(B, n_views, 2, 4, 4, device=device, dtype=torch.float32)
-            proj_mat_geo[:, :, 0, :4, :4] = extrinsic
-            proj_mat_geo[:, :, 1, :3, :3] = K
+            # 封装为 DiffMVS 期望的 [B, N, 2, 4, 4] 打包格式
+            proj_mat = torch.zeros(B, n_views, 2, 4, 4, device=dev, dtype=torch.float32)
+            proj_mat[:, :, 0, :4, :4] = extrinsic
+            proj_mat[:, :, 1, :3, :3] = K
 
-            proj_matrices_dict[geo_st] = proj_mat_geo
-            intrinsics_dict[geo_st] = K[:, 0]  # 参考视角内参 [B, 3, 3]
+            proj_matrices_dict[diff_st] = proj_mat
 
-        # 4. GeoMVSNet 前向推理
+        # 4. DiffMVS 前向推理 (test=True 模式)
         outputs = self.net(
             imgs=imgs,
             proj_matrices=proj_matrices_dict,
-            intrinsics_matrices=intrinsics_dict,
             depth_values=depth_values
         )
 
-        # 5. 提取最高分辨率 Stage 4 预测深度 (以米为单位)
-        # GeoMVSNet outputs 结构: outputs["stage4"]["depth"] 形状为 [B, H, W]
-        depth_pred = outputs["stage4"]["depth"].unsqueeze(1)  # [B, 1, H, W]
-        confidence = outputs["stage4"]["photometric_confidence"].unsqueeze(1) # [B, 1, H, W]
+        # 5. 提取最高分辨率预测深度图 (以绝对物理米 meters 为单位)
+        # outputs["depth"][-1] 形状为 [B, H, W]
+        depth_pred = outputs["depth"][-1].unsqueeze(1)  # [B, 1, H, W]
+
+        # 提取全分辨率置信度 (若可用)
+        conf_list = outputs.get("photometric_confidence", [])
+        confidence = conf_list[-1].unsqueeze(1) if len(conf_list) > 0 else None
+
         return depth_pred, confidence
 
 
@@ -167,26 +186,26 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     print("=" * 85)
-    print("WHU-MVS 基准适配评估系统: GeoMVSNet (CVPR 2023)")
+    print("WHU-MVS 基准适配评估系统: DiffMVS / CasDiffMVS (IEEE TPAMI 2025)")
     print("=" * 85)
     print_args(args)
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # 1. 动态导入外部 GeoMVSNet 源码
-    geomvsnet_root = os.path.abspath(args.geomvsnet_code_dir)
-    if geomvsnet_root and os.path.isdir(geomvsnet_root):
-        if geomvsnet_root not in sys.path:
-            sys.path.insert(0, geomvsnet_root)
-        print(f"[Import] 已成功挂载 GeoMVSNet 代码路径: {geomvsnet_root}")
+    # 1. 动态导入外部 DiffMVS 源码
+    diffmvs_root = os.path.abspath(args.diffmvs_code_dir)
+    if diffmvs_root and os.path.isdir(diffmvs_root):
+        if diffmvs_root not in sys.path:
+            sys.path.insert(0, diffmvs_root)
+        print(f"[Import] 已成功挂载 DiffMVS 代码路径: {diffmvs_root}")
     else:
-        print(f"[Warning] 未指定或未找到 --geomvsnet_code_dir: {geomvsnet_root}，尝试从本地环境直接导入...")
+        print(f"[Warning] 未指定或未找到 --diffmvs_code_dir: {diffmvs_root}，尝试从系统环境导入...")
 
     try:
-        from models.geomvsnet import GeoMVSNet
+        from models.diffusion import CasDiffMVS
     except ImportError as e:
         raise ImportError(
-            f"🚨 无法导入 GeoMVSNet 模型！请确认 --geomvsnet_code_dir 参数指向正确的 GeoMVSNet 源码目录。\n"
+            f"🚨 无法导入 CasDiffMVS 模型！请确认 --diffmvs_code_dir 参数指向正确的 DiffMVS 源码目录。\n"
             f"原始错误: {e}"
         )
 
@@ -204,14 +223,9 @@ def main():
     print(f"[Dataset] 测试样本总量: {total_samples} 张图像 (共 {len(test_loader)} 个批次)\n")
 
     # 3. 实例化适配包装模型并载入权重
-    model = GeoMVSNetWrapper(
-        geomvsnet_class=GeoMVSNet,
-        levels=args.levels,
-        hypo_plane_num_stages=args.hypo_plane_num_stages,
-        depth_interal_ratio_stages=args.depth_interal_ratio_stages,
-        feat_base_channel=args.feat_base_channel,
-        reg_base_channel=args.reg_base_channel,
-        group_cor_dim_stages=args.group_cor_dim_stages
+    model = DiffMVSWrapper(
+        casdiffmvs_class=CasDiffMVS,
+        args=args
     ).to(device)
 
     print(f"[Model] 载入 Checkpoint 权重: {args.loadckpt}")
@@ -222,7 +236,6 @@ def main():
         clean_k = k[7:] if k.startswith('module.') else k
         cleaned_state[clean_k] = v
 
-    # 载入底层 GeoMVSNet 权重
     missing, unexpected = model.net.load_state_dict(cleaned_state, strict=False)
     if len(missing) > 0:
         print(f"[Model Warning] 缺失参数 (前10个): {missing[:10]}")
@@ -248,7 +261,7 @@ def main():
             sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
             # 前向推理
-            depth_est, confidence = model(sample_cuda, n_views=args.n_views) # [B, 1, H, W]
+            depth_est, confidence = model(sample_cuda, n_views=args.n_views)  # [B, 1, H, W]
 
             depth_gt = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
             mask_gt = (sample_cuda["mask"]["stage_0"] > 0.5)
@@ -315,15 +328,15 @@ def main():
                     depth_save_dir = os.path.join(args.outdir, scan, "depths")
                     os.makedirs(depth_save_dir, exist_ok=True)
                     d_s0_np = d_est_b[0, 0].cpu().numpy()
-                    save_pfm(os.path.join(depth_save_dir, f"geomvsnet_depth_{file_id}.pfm"), d_s0_np)
+                    save_pfm(os.path.join(depth_save_dir, f"diffmvs_depth_{file_id}.pfm"), d_s0_np)
                     depth_png_s0 = np.clip(d_s0_np * 64.0, 0, 65535).astype(np.uint16)
-                    cv2.imwrite(os.path.join(depth_save_dir, f"geomvsnet_depth_{file_id}.png"), depth_png_s0)
+                    cv2.imwrite(os.path.join(depth_save_dir, f"diffmvs_depth_{file_id}.png"), depth_png_s0)
 
             cur_idx = batch_idx + 1
             step_time = time.time() - step_start
             planar_str = f"{s0_planar_mae:.4f}m" if not math.isnan(s0_planar_mae) else "N/A"
             print(f"[{cur_idx:03d}/{len(test_loader):03d}] Scan: {scan} | Img: {file_id} | "
-                  f"GeoMVSNet MAE: {s0_mae:.4f}m | Planar MAE: {planar_str} | Time: {step_time:.2f}s")
+                  f"DiffMVS MAE: {s0_mae:.4f}m | Planar MAE: {planar_str} | Time: {step_time:.2f}s")
 
     eval_duration = time.time() - start_eval_time
     print("\n" + "=" * 85)
@@ -362,7 +375,7 @@ def main():
     }
 
     report_lines = []
-    report_lines.append("# WHU-MVS 基准对比评测报告: GeoMVSNet (CVPR 2023)\n")
+    report_lines.append("# WHU-MVS 基准对比评测报告: DiffMVS / CasDiffMVS (IEEE TPAMI 2025)\n")
     report_lines.append(f"- **模型权重**: `{args.loadckpt}`")
     report_lines.append(f"- **测试列表**: `{args.testlist}`")
     report_lines.append(f"- **测试图像总量**: {overall_summary['count']} 张")
@@ -378,7 +391,7 @@ def main():
             f"{s['stage0_thres4mm_err']*100:.2f}% | {s['stage0_thres8mm_err']*100:.2f}% |"
         )
     report_lines.append(
-        f"| **GeoMVSNet (平均)** | **{overall_summary['count']}** | **{overall_summary['stage0_mae']:.4f}** | "
+        f"| **DiffMVS (平均)** | **{overall_summary['count']}** | **{overall_summary['stage0_mae']:.4f}** | "
         f"**{overall_summary['stage0_thres1mm_err']*100:.2f}%** | **{overall_summary['stage0_thres2mm_err']*100:.2f}%** | "
         f"**{overall_summary['stage0_thres4mm_err']*100:.2f}%** | **{overall_summary['stage0_thres8mm_err']*100:.2f}%** |"
     )
@@ -390,23 +403,23 @@ def main():
         p_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
         c_str = f"{s['stage0_curved_mae']:.4f}" if not math.isnan(s['stage0_curved_mae']) else "N/A"
         report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% |")
-    
+
     op_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
     oc_str = f"{overall_summary['stage0_curved_mae']:.4f}" if not math.isnan(overall_summary['stage0_curved_mae']) else "N/A"
     report_lines.append(
-        f"| **GeoMVSNet (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** |"
+        f"| **DiffMVS (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** |"
     )
 
     report_text = "\n".join(report_lines)
     print("\n" + report_text)
 
     # 保存报告与指标 JSON
-    report_file = os.path.join(args.outdir, "geomvsnet_evaluation_report.md")
+    report_file = os.path.join(args.outdir, "diffmvs_evaluation_report.md")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(report_text)
     print(f"\n[Output] 完整评估报表已保存至: {report_file}")
 
-    json_file = os.path.join(args.outdir, "geomvsnet_records.json")
+    json_file = os.path.join(args.outdir, "diffmvs_records.json")
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump({"overall": overall_summary, "by_scan": summary_by_scan, "records": all_sample_records}, f, indent=2)
     print(f"[Output] 详细样本指标记录已保存至: {json_file}")

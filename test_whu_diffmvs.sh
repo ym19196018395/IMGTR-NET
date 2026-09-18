@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# WHU-MVS 基准对比评测运行脚本: GeoMVSNet (CVPR 2023)
-# 遵循 whu-mvs-benchmark-adapter 专家规范 (模式 A: 包装器接入)
+# WHU-MVS 基准对比评测运行脚本: DiffMVS / CasDiffMVS (IEEE TPAMI 2025)
+# 遵循 whu-mvs-benchmark-adapter 专家规范 (模式 A: 包装器接入与同源切片)
 # ==============================================================================
 
 # ==============================================================================
@@ -12,14 +12,14 @@
 # 本项目 PatchmatchNet 代码根目录 (服务器实际路径)
 PATCHMATCHNET_DIR="${PATCHMATCHNET_DIR:-/home/ym/Experiment/PatchmatchNet-new}"
 
-# 外部 GeoMVSNet 源码根目录 (服务器实际路径)
-GEOMVSNET_DIR="${GEOMVSNET_DIR:-/home/myao/GeoMVSNet-master}"
+# 外部 DiffMVS 源码根目录 (服务器实际路径)
+DIFFMVS_DIR="${DIFFMVS_DIR:-/home/ym/Experiment/diffmvs-main}"
 
-# GeoMVSNet 预训练模型权重 (.ckpt)
-DEFAULT_CKPT="./checkpoints/geomvsnet_whu_train/model_000013.ckpt"
+# DiffMVS 模型权重 (.ckpt)
+DEFAULT_CKPT="./checkpoints/diffmvs_whu_train/model_000015.ckpt"
 CKPT_FILE="${1:-$DEFAULT_CKPT}"
 
-# WHU 数据集根目录与测试切片列表
+# WHU 数据集根目录与测试切片列表 (默认绑定 640 张标准全量测试集)
 MVS_TESTING="${MVS_TESTING:-/home/ym/Experiment/Datas/WHU_MVS_dataset}"
 TEST_LIST="${TEST_LIST:-lists/whu/newtest.txt}"
 
@@ -27,8 +27,8 @@ TEST_LIST="${TEST_LIST:-lists/whu/newtest.txt}"
 # 若之前运行过 test_whu.sh 并开启了 --save_masks，可直接指定其 outputs 目录
 MASK_DIR="${MASK_DIR:-${PATCHMATCHNET_DIR}/outputs_minitest}"
 
-# 评测输出目录 (保存 Markdown 双表报表和 json 记录)
-OUT_DIR="./outputs_geomvsnet"
+# 评测输出目录 (保存 Markdown 双表报表和 json 详细记录)
+OUT_DIR="./outputs_diffmvs"
 
 # ==============================================================================
 # 2. GPU 设备与运行参数配置
@@ -39,14 +39,14 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 mkdir -p txt_logs
 mkdir -p "${OUT_DIR}"
 timestamp=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="txt_logs/test_whu_geomvsnet_${timestamp}.log"
+LOG_FILE="txt_logs/test_whu_diffmvs_${timestamp}.log"
 
 echo "=============================================================================="
-echo "启动 WHU-MVS GeoMVSNet 基准适配独立评测系统"
+echo "启动 WHU-MVS DiffMVS / CasDiffMVS 基准适配独立评测系统"
 echo "GPU ID               : ${GPU_ID}"
 echo "PatchmatchNet 目录   : ${PATCHMATCHNET_DIR}"
-echo "GeoMVSNet 代码目录   : ${GEOMVSNET_DIR}"
-echo "GeoMVSNet 权重路径   : ${CKPT_FILE}"
+echo "DiffMVS 代码目录     : ${DIFFMVS_DIR}"
+echo "DiffMVS 权重路径     : ${CKPT_FILE}"
 echo "WHU 测试集路径       : ${MVS_TESTING}"
 echo "测试列表             : ${TEST_LIST}"
 echo "同源平面掩码目录     : ${MASK_DIR}"
@@ -68,19 +68,32 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # 4. 执行适配评测
-python test_whu_geomvsnet.py \
+python test_whu_diffmvs.py \
     --dataset dtu_whu \
     --testpath "${MVS_TESTING}" \
     --testlist "${TEST_LIST}" \
     --loadckpt "${CKPT_FILE}" \
-    --geomvsnet_code_dir "${GEOMVSNET_DIR}" \
+    --diffmvs_code_dir "${DIFFMVS_DIR}" \
     --mask_dir "${MASK_DIR}" \
     --outdir "${OUT_DIR}" \
     --batch_size 1 \
     --n_views 5 \
     --num_workers 4 \
+    --numdepth_initial 48 \
+    --numdepth 384 \
+    --scale 0.0 0.5 0.1 \
+    --sampling_timesteps 0 1 1 \
+    --ddim_eta 0 1 1 \
+    --stage_iters 1 3 3 \
+    --cost_dim_stage 4 4 4 \
+    --CostNum 0 4 4 \
+    --hidden_dim 0 32 20 \
+    --context_dim 32 32 16 \
+    --unet_dim 0 16 8 \
+    --min_radius 0.125 \
+    --max_radius 8.0 \
     "$@" 2>&1 | tee "${LOG_FILE}"
 
 echo "=============================================================================="
-echo "评测完成！完整报表已生成至: ${OUT_DIR}/geomvsnet_evaluation_report.md"
+echo "评测完成！完整报表已生成至: ${OUT_DIR}/diffmvs_evaluation_report.md"
 echo "=============================================================================="

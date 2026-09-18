@@ -2168,20 +2168,19 @@ class DensePlaneFitter(nn.Module)   :
 
         valid_points = points_flat[valid_mask]
         valid_ids = global_tri_ids[valid_mask].long().clamp(min=0, max=total_bins - 1)
-        valid_points_64 = valid_points.double()
-        pt_x, pt_y, pt_z = valid_points_64[:, 0], valid_points_64[:, 1], valid_points_64[:, 2]
+        pt_z = valid_points[:, 2]
 
-        # 🪐 算软门控：放宽大分辨率温标线至 4% 融合 Sigmoid 核，绞杀悬崖滑坡点
-        laplacian_flat_raw = sampled_laplacian.view(-1)[valid_mask].double()
+        # 🪐 算软门控：放宽大分辨率温标线至 4% 融合 Sigmoid 核，绞杀悬崖滑坡点 (原生 float32)
+        laplacian_flat_raw = sampled_laplacian.view(-1)[valid_mask].float()
         adaptive_tau_lap = (pt_z * 0.04).clamp(min=0.15, max=2.0)
         valid_geo_weights = torch.sigmoid(-16.0 * (laplacian_flat_raw - adaptive_tau_lap))
         valid_geo_weights = torch.clamp(valid_geo_weights, min=1e-3, max=1.0)
 
-        # 寄存计数器分母
-        ones_v = torch.ones_like(valid_ids, dtype=torch.float64)
-        counts = torch.zeros(total_bins, device=device, dtype=torch.float64)
+        # 寄存计数器分母 (float32)
+        ones_v = torch.ones_like(valid_ids, dtype=torch.float32)
+        counts = torch.zeros(total_bins, device=device, dtype=torch.float32)
         counts.scatter_add_(0, valid_ids, ones_v)
-        counts_for_cov = torch.zeros(total_bins, device=device, dtype=torch.float64)
+        counts_for_cov = torch.zeros(total_bins, device=device, dtype=torch.float32)
         counts_for_cov.scatter_add_(0, valid_ids, valid_geo_weights)
 
         # 面积覆盖率门限互锁
@@ -2189,74 +2188,80 @@ class DensePlaneFitter(nn.Module)   :
         low_coverage_mask = (weight_coverage < 0.30) & (counts > 5.0)
         valid_fit_mask = (counts > 3.0) & (~low_coverage_mask)
 
-        # 🚀 收集轨道 A 分子统计量（纯平权 OLS）
-        sum_P_ols = torch.zeros(total_bins, 3, device=device, dtype=torch.float64)
-        sum_P_ols.index_add_(0, valid_ids, valid_points_64)
-        sum_xx_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_x)
-        sum_xy_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_y)
-        sum_xz_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_z)
-        sum_yy_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_y)
-        sum_yz_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_z)
-        sum_zz_ols = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_z * pt_z)
-
-        # 🚀 收集轨道 B 分子统计量（各项异性 WLS）
-        weighted_points = valid_points_64 * valid_geo_weights.unsqueeze(1)
-        sum_P_wls = torch.zeros(total_bins, 3, device=device, dtype=torch.float64)
-        sum_P_wls.index_add_(0, valid_ids, weighted_points)
-        pt_x_w = pt_x * valid_geo_weights
-        pt_y_w = pt_y * valid_geo_weights
-        pt_z_w = pt_z * valid_geo_weights
-        sum_xx_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_x_w)
-        sum_xy_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_y_w)
-        sum_xz_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_x * pt_z_w)
-        sum_yy_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_y_w)
-        sum_yz_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_y * pt_z_w)
-        sum_zz_wls = torch.zeros(total_bins, device=device, dtype=torch.float64).scatter_add_(0, valid_ids, pt_z * pt_z_w)
-
-        # 解算解析去中心化重心
+        # =====================================================================
+        # 👑 [Pass 1]: 极速解算一阶解析质心 (OLS 与 WLS，原生 FP32 零数值抵消)
+        # =====================================================================
+        sum_P_ols = torch.zeros(total_bins, 3, device=device, dtype=torch.float32)
+        sum_P_ols.index_add_(0, valid_ids, valid_points)
         centroids_ols = torch.nan_to_num(sum_P_ols / counts.clamp(min=1.0).unsqueeze(1), nan=0.0)
+
+        weighted_points = valid_points * valid_geo_weights.unsqueeze(1)
+        sum_P_wls = torch.zeros(total_bins, 3, device=device, dtype=torch.float32)
+        sum_P_wls.index_add_(0, valid_ids, weighted_points)
         centroids_wls = torch.nan_to_num(sum_P_wls / counts_for_cov.clamp(min=1e-6).unsqueeze(1), nan=0.0)
         centroids_wls = torch.where(valid_fit_mask.unsqueeze(1), centroids_wls, centroids_ols)
 
-        # 提取核心几何防伪特征：三角形内部深度的真实绝对标准差 z_std
-        mean_z_wls = centroids_wls[:, 2]
-        var_z = (sum_zz_wls / counts_for_cov.clamp(min=1e-6)) - (mean_z_wls ** 2)
-        z_std_out = torch.sqrt(var_z.clamp(min=1e-6)).float()
+        # =====================================================================
+        # 👑 [Pass 2]: 局部两步去中心化微元外积 (彻底规避灾难性大数相减，天然半正定)
+        # =====================================================================
+        # 点云减去所属三角形质心，数值尺度由 [10~20m] 暴降至 [-0.1m, +0.1m] 局部微元，彻底消除大数平方抵消
+        delta_P_ols = valid_points - centroids_ols[valid_ids]
+        delta_P_wls = valid_points - centroids_wls[valid_ids]
+
+        dx_ols, dy_ols, dz_ols = delta_P_ols[:, 0], delta_P_ols[:, 1], delta_P_ols[:, 2]
+        dx_wls, dy_wls, dz_wls = delta_P_wls[:, 0], delta_P_wls[:, 1], delta_P_wls[:, 2]
+
+        # 🚀 收集轨道 A 二阶中心散度 (纯平权 OLS)
+        cov_xx_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_ols * dx_ols)
+        cov_xy_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_ols * dy_ols)
+        cov_xz_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_ols * dz_ols)
+        cov_yy_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dy_ols * dy_ols)
+        cov_yz_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dy_ols * dz_ols)
+        cov_zz_ols = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dz_ols * dz_ols)
+
+        # 🚀 收集轨道 B 二阶中心散度 (各向异性 WLS)
+        dx_wls_w = dx_wls * valid_geo_weights
+        dy_wls_w = dy_wls * valid_geo_weights
+        dz_wls_w = dz_wls * valid_geo_weights
+        cov_xx_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_wls * dx_wls_w)
+        cov_xy_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_wls * dy_wls_w)
+        cov_xz_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dx_wls * dz_wls_w)
+        cov_yy_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dy_wls * dy_wls_w)
+        cov_yz_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dy_wls * dz_wls_w)
+        cov_zz_wls = torch.zeros(total_bins, device=device, dtype=torch.float32).scatter_add_(0, valid_ids, dz_wls * dz_wls_w)
+
+        # 严格同构去中心化协方差（直接由微元外积构成，天然保证半正定性！）
+        covariance_ols = torch.stack([
+            cov_xx_ols, cov_xy_ols, cov_xz_ols,
+            cov_xy_ols, cov_yy_ols, cov_yz_ols,
+            cov_xz_ols, cov_yz_ols, cov_zz_ols
+        ], dim=1).reshape(total_bins, 3, 3) / counts.clamp(min=1.0).view(-1, 1, 1)
+
+        covariance_wls = torch.stack([
+            cov_xx_wls, cov_xy_wls, cov_xz_wls,
+            cov_xy_wls, cov_yy_wls, cov_yz_wls,
+            cov_xz_wls, cov_yz_wls, cov_zz_wls
+        ], dim=1).reshape(total_bins, 3, 3) / counts_for_cov.clamp(min=1e-6).view(-1, 1, 1)
+
+        # 提取核心几何防伪特征：三角形内部深度的真实绝对标准差 z_std（由协方差对角线元素天然非负保证）
+        var_z = covariance_wls[:, 2, 2].clamp(min=0.0)
+        z_std_out = torch.sqrt(var_z.clamp(min=1e-6))
         
         # 🎯 物理学防伪升级：计算无尺度绝对斜率 normalized_slope = z_std / sqrt(pixel_count)
         # 此特征严格对齐大屋顶与悬崖面，是极佳的一维线性可分流形
-        normalized_slope = z_std_out / torch.sqrt(counts_for_cov.clamp(min=1.0)).float()
+        normalized_slope = z_std_out / torch.sqrt(counts_for_cov.clamp(min=1.0))
 
-        # 严格同构去中心化协方差改正
-        sum_PPt_ols = torch.stack([
-            sum_xx_ols, sum_xy_ols, sum_xz_ols,
-            sum_xy_ols, sum_yy_ols, sum_yz_ols,
-            sum_xz_ols, sum_yz_ols, sum_zz_ols
-        ], dim=1).reshape(total_bins, 3, 3)
-        covariance_ols = sum_PPt_ols - torch.bmm(
-            sum_P_ols.unsqueeze(2), sum_P_ols.unsqueeze(1)
-        ) / counts.clamp(min=1.0).view(-1, 1, 1)
-
-        sum_PPt_wls = torch.stack([
-            sum_xx_wls, sum_xy_wls, sum_xz_wls,
-            sum_xy_wls, sum_yy_wls, sum_yz_wls,
-            sum_xz_wls, sum_yz_wls, sum_zz_wls
-        ], dim=1).reshape(total_bins, 3, 3)
-        covariance_wls = sum_PPt_wls - torch.bmm(
-            sum_P_wls.unsqueeze(2), sum_P_wls.unsqueeze(1)
-        ) / counts_for_cov.clamp(min=1e-6).view(-1, 1, 1)
-
-        # 刚性正则化对角摄动，拉开奇异值，保护后向可微求导
+        # 刚性正则化对角摄动，拉开奇异值，保护后向可微求导 (原生 FP32)
         covariance_ols = torch.nan_to_num(covariance_ols, nan=0.0)
         covariance_wls = torch.nan_to_num(covariance_wls, nan=0.0)
         perturb_matrix = torch.diag(
-            torch.tensor([1.0, 10.0, 100.0], device=device, dtype=torch.float64)
+            torch.tensor([1.0, 10.0, 100.0], device=device, dtype=torch.float32)
         ).unsqueeze(0) * 1e-4
         covariance_ols = covariance_ols + perturb_matrix
         covariance_wls = covariance_wls + perturb_matrix
 
         safe_matrix = torch.diag(
-            torch.tensor([100.0, 10.0, 1.0], device=device, dtype=torch.float64)
+            torch.tensor([100.0, 10.0, 1.0], device=device, dtype=torch.float32)
         ).unsqueeze(0)
         covariance_ols_safe = torch.where(
             (counts > 3.0).view(-1, 1, 1).expand_as(covariance_ols),
@@ -2273,16 +2278,11 @@ class DensePlaneFitter(nn.Module)   :
         surface_variation_out = torch.full((total_bins,), 0.333, device=device, dtype=torch.float32)
 
         # =====================================================================
-        # Step 4: 高维谱分解求导与对称自旋十字星假设池繁衍
+        # Step 4: 原生 FP32 谱分解求导与对称自旋十字星假设池繁衍 (彻底解除算力锁)
         # =====================================================================
         try:
-            vals_ols, vecs_ols = torch.linalg.eigh(covariance_ols_safe.double())
-            vals_wls, vecs_wls = torch.linalg.eigh(covariance_wls_safe.double())
-            vals_wls, vecs_ols, vecs_wls = (
-                vals_wls.float(),
-                vecs_ols.float(),
-                vecs_wls.float(),
-            )
+            vals_ols, vecs_ols = torch.linalg.eigh(covariance_ols_safe)
+            vals_wls, vecs_wls = torch.linalg.eigh(covariance_wls_safe)
 
             # 提取无量纲局部表面粗糙度变差作为神经自适应旋钮
             surface_variation = (vals_wls[:, 0] / (vals_wls.sum(dim=1) + 1e-6)).detach()
@@ -2293,8 +2293,8 @@ class DensePlaneFitter(nn.Module)   :
             e_tangent_1 = F.normalize(vecs_wls[:, :, 2], dim=1)  # 主延展切向量
             e_tangent_2 = F.normalize(vecs_wls[:, :, 1], dim=1)  # 次延展切向量
 
-            centroids_ols_f = centroids_ols.float()
-            centroids_wls_f = centroids_wls.float()
+            centroids_ols_f = centroids_ols
+            centroids_wls_f = centroids_wls
 
             for k_idx in range(K):
                 if k_idx == 0:
@@ -2351,7 +2351,7 @@ class DensePlaneFitter(nn.Module)   :
 
         except RuntimeError as e:
             print(f"[HYPO GEN] 谱矩阵简并报错，启动全平行熔断保底: {e}")
-            safe_z = centroids_ols[:, 2:3].float().clamp(min=0.1)
+            safe_z = centroids_ols[:, 2:3].clamp(min=0.1)
             hypotheses_pool[:, :, :3] = 0.0
             hypotheses_pool[:, :, 2] = -1.0
             hypotheses_pool[:, :, 3:4] = safe_z.unsqueeze(1).expand(-1, K, -1)
@@ -2363,7 +2363,7 @@ class DensePlaneFitter(nn.Module)   :
             d_min_val, d_max_val = depth_bounds_flat()
             n_test = hypotheses_pool[:, 0, :3]
             d_test = hypotheses_pool[:, 0, 3:4]
-            rays = centroids_ols.float()
+            rays = centroids_ols
             denom = torch.sum(n_test * rays, dim=1, keepdim=True)
             denom_safe = torch.where(
                 denom.abs() < 1e-4, torch.sign(denom + 1e-10) * 1e-4, denom
