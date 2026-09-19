@@ -595,7 +595,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 连续性约束和光滑性约束权重
     # max_lambda_c = 40.0
     # max_lambda_s = 1.0
-    max_lambda_c = 0.0
+    max_lambda_c = 0.2
     max_lambda_s = 0.0
     max_lambda_n_tri = 1.0  # 宏观平面级法向峰值（完全恢复至创造 0.185m/0.106m 黄金记录时的 1.0，贡献约 0.05）
     max_lambda_n_pix = 0.0  # 微观像素级 D2N 法向峰值（已关闭，彻底释放 FeatureNet 泛化能力）

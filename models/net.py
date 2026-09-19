@@ -650,7 +650,7 @@ class PatchmatchNet(nn.Module):
                     src_projs=self.proj_matrices_1[1:],
                     tri_id_map=tri_id_map_tensor,
                     max_tri_num=W_plane_tri.shape[1],
-                    base_depth_thresh=0.12,
+                    base_depth_thresh=0.10,
                     pixel_dist_thresh=1.2,
                     normal_ref=pixel_normal_s1_pure
                 )
@@ -662,7 +662,7 @@ class PatchmatchNet(nn.Module):
                 W_plane_tri_pre_cc = W_plane_tri.clone().detach()
 
                 # Sigmoid 陡峭连续软压制门控 (tau=0.40 严格对齐 Pre-GNN 门限, T=0.04, min_penalty=0.25)
-                tau_deg = 0.40
+                tau_deg = 0.50
                 temperature = 0.04
                 min_penalty = 0.25
                 penalty = min_penalty + (1.0 - min_penalty) * torch.sigmoid((max_ratio_deg - tau_deg) / temperature)

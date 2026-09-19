@@ -35,7 +35,7 @@ MVS_TRAINING="/home/ym/Experiment/Datas/WHU_MVS_dataset"
 timestamp=$(date +%Y%m%d_%H%M%S)
 
 # 指定默认 GPU（可覆盖）：优先使用外部环境变量 GPU_ID，否则回退到 2（与 launch.json 示例一致）
-export GPU_ID=3
+export GPU_ID=1
 
 python train_whu.py --dataset dtu_whu --batch_size 4 --epochs 38 \
 --patchmatch_iteration 1 2 2 --patchmatch_range 6 4 2 \
@@ -43,9 +43,9 @@ python train_whu.py --dataset dtu_whu --batch_size 4 --epochs 38 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --lrepochs "25,29,34:2" \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train26 \
+--logdir ./checkpoints/tensorboard_train29 \
 --normal_gt_mode soft --conf_gt_mode hard \
 --run_big_eval \
-2>&1 | tee txt_logs/${timestamp}_26_38epochs_PostGNN双严收敛.log \
+2>&1 | tee txt_logs/${timestamp}_29_将上采样残差网络替换成凸组合上采样,暂时开启连续性约束,平面约束权重加大.log \
  "$@"
 

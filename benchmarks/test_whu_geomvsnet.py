@@ -7,6 +7,11 @@ import math
 import cv2
 import numpy as np
 
+# 确保项目根目录在 sys.path 中，以便无缝导入 datasets, utils 等模块
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # 控制 GPU ID：优先使用外部环境变量 GPU_ID，其次 CUDA_VISIBLE_DEVICES，默认 '0'
 _gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
 os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu_choice)
@@ -33,7 +38,7 @@ def parse_args():
     parser.add_argument('--dataset', default='dtu_whu', help='select dataset (default: dtu_whu)')
     parser.add_argument('--testpath', default='/home/ym/Experiment/Datas/WHU_MVS_dataset',
                         help='WHU dataset root path')
-    parser.add_argument('--testlist', default='lists/whu/minitest.txt',
+    parser.add_argument('--testlist', default='lists/whu/newtest.txt',
                         help='testing scan list file (e.g. lists/whu/minitest.txt or newtest.txt)')
     parser.add_argument('--loadckpt', required=True, help='path to GeoMVSNet checkpoint (.ckpt)')
     parser.add_argument('--geomvsnet_code_dir', default='',
@@ -86,10 +91,9 @@ class GeoMVSNetWrapper(nn.Module):
 
     def forward(self, sample_cuda, n_views=5):
         B = sample_cuda["depth_min"].shape[0]
-        device = sample_cuda["depth_min"].device
+        dev = sample_cuda["depth_min"].device
 
         # 1. 转换图像列表: List[B, 3, H, W]
-        # WHU DataLoader stage_0 是全分辨率原图 [B, N, 3, H, W]
         imgs = [sample_cuda["imgs"]["stage_0"][:, i] for i in range(n_views)]
 
         # 2. 构造绝对米制深度范围: [B, 2]
@@ -99,7 +103,6 @@ class GeoMVSNetWrapper(nn.Module):
         ], dim=-1)
 
         # 3. 构造 GeoMVSNet 多阶段投影矩阵与内参字典
-        # 层级对应关系：GeoMVSNet stage1~stage4 <-> WHU stage_3~stage_0 (从粗到细)
         stage_mapping = [
             ("stage1", "stage_3"),  # 1/8 粗阶段
             ("stage2", "stage_2"),  # 1/4
@@ -114,13 +117,11 @@ class GeoMVSNetWrapper(nn.Module):
             P = sample_cuda["proj_matrices"][whu_st]       # [B, N, 4, 4]
             K = sample_cuda["intrinsics_mats"][whu_st]     # [B, N, 3, 3]
 
-            # 精确代数求解外参: [R|t] = K^{-1} @ P[:3, :4]
             K_inv = torch.inverse(K)
-            extrinsic = torch.eye(4, device=device, dtype=torch.float32).repeat(B, n_views, 1, 1)
+            extrinsic = torch.eye(4, device=dev, dtype=torch.float32).repeat(B, n_views, 1, 1)
             extrinsic[:, :, :3, :4] = torch.matmul(K_inv, P[:, :, :3, :4])
 
-            # 封装为 GeoMVSNet 期望的 [B, N, 2, 4, 4] 打包格式
-            proj_mat_geo = torch.zeros(B, n_views, 2, 4, 4, device=device, dtype=torch.float32)
+            proj_mat_geo = torch.zeros(B, n_views, 2, 4, 4, device=dev, dtype=torch.float32)
             proj_mat_geo[:, :, 0, :4, :4] = extrinsic
             proj_mat_geo[:, :, 1, :3, :3] = K
 
@@ -136,9 +137,8 @@ class GeoMVSNetWrapper(nn.Module):
         )
 
         # 5. 提取最高分辨率 Stage 4 预测深度 (以米为单位)
-        # GeoMVSNet outputs 结构: outputs["stage4"]["depth"] 形状为 [B, H, W]
         depth_pred = outputs["stage4"]["depth"].unsqueeze(1)  # [B, 1, H, W]
-        confidence = outputs["stage4"]["photometric_confidence"].unsqueeze(1) # [B, 1, H, W]
+        confidence = outputs["stage4"]["photometric_confidence"].unsqueeze(1)  # [B, 1, H, W]
         return depth_pred, confidence
 
 
@@ -162,6 +162,7 @@ def safe_thres_error(depth_est, depth_gt, mask, thres):
 
 
 def main():
+    os.chdir(PROJECT_ROOT)
     args = parse_args()
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
@@ -174,13 +175,25 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     # 1. 动态导入外部 GeoMVSNet 源码
-    geomvsnet_root = os.path.abspath(args.geomvsnet_code_dir)
+    geomvsnet_root = os.path.abspath(args.geomvsnet_code_dir) if args.geomvsnet_code_dir else ""
+    if not (geomvsnet_root and os.path.isdir(geomvsnet_root)):
+        candidates = [
+            "/home/myao/GeoMVSNet-master",
+            "/home/ym/Experiment/GeoMVSNet-master",
+            os.path.abspath(os.path.join(PROJECT_ROOT, "..", "GeoMVSNet-master")),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                geomvsnet_root = c
+                print(f"[Auto-Detect] 自动探测并挂载 GeoMVSNet 源码路径: {geomvsnet_root}")
+                break
+
     if geomvsnet_root and os.path.isdir(geomvsnet_root):
         if geomvsnet_root not in sys.path:
             sys.path.insert(0, geomvsnet_root)
         print(f"[Import] 已成功挂载 GeoMVSNet 代码路径: {geomvsnet_root}")
     else:
-        print(f"[Warning] 未指定或未找到 --geomvsnet_code_dir: {geomvsnet_root}，尝试从本地环境直接导入...")
+        print(f"[Warning] 未指定或未找到 --geomvsnet_code_dir: {geomvsnet_root}，尝试从系统环境导入...")
 
     try:
         from models.geomvsnet import GeoMVSNet
@@ -222,7 +235,6 @@ def main():
         clean_k = k[7:] if k.startswith('module.') else k
         cleaned_state[clean_k] = v
 
-    # 载入底层 GeoMVSNet 权重
     missing, unexpected = model.net.load_state_dict(cleaned_state, strict=False)
     if len(missing) > 0:
         print(f"[Model Warning] 缺失参数 (前10个): {missing[:10]}")
@@ -248,7 +260,7 @@ def main():
             sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
             # 前向推理
-            depth_est, confidence = model(sample_cuda, n_views=args.n_views) # [B, 1, H, W]
+            depth_est, confidence = model(sample_cuda, n_views=args.n_views)
 
             depth_gt = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
             mask_gt = (sample_cuda["mask"]["stage_0"] > 0.5)
@@ -390,7 +402,7 @@ def main():
         p_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
         c_str = f"{s['stage0_curved_mae']:.4f}" if not math.isnan(s['stage0_curved_mae']) else "N/A"
         report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% |")
-    
+
     op_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
     oc_str = f"{overall_summary['stage0_curved_mae']:.4f}" if not math.isnan(overall_summary['stage0_curved_mae']) else "N/A"
     report_lines.append(

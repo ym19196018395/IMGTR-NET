@@ -5,27 +5,40 @@
 # 严格遵守 whu-mvs-benchmark-adapter 规范 (轻量过程监控 + 极小验证集 minitest)
 # ==============================================================================
 
-# ==============================================================================
-# 1. 服务器实际路径配置 (可在执行前修改或通过外部环境变量传入)
-# ==============================================================================
-# 本项目代码根目录
-PATCHMATCHNET_DIR="${PATCHMATCHNET_DIR:-/home/ym/Experiment/PatchmatchNet-new}"
+# 自动解析当前脚本目录与 PatchmatchNet 项目根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCHMATCHNET_DIR="${PATCHMATCHNET_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
-# GeoMVSNet 源码根目录
-GEOMVSNET_DIR="${GEOMVSNET_DIR:-/home/myao/GeoMVSNet-master/}"
+# 1. 严格进入项目根目录执行，确保工作空间与路径基准完全统一
+cd "${PATCHMATCHNET_DIR}" || exit 1
+
+# ==============================================================================
+# 2. 关键路径配置 (显式绝对路径锚定，绝不因脚本位置改变而错位)
+# ==============================================================================
+
+# GeoMVSNet 源码根目录 (优先环境变量，自动兼容服务器多用户路径)
+if [ -z "${GEOMVSNET_DIR}" ]; then
+    if [ -d "/home/myao/GeoMVSNet-master" ]; then
+        GEOMVSNET_DIR="/home/myao/GeoMVSNet-master"
+    elif [ -d "/home/ym/Experiment/GeoMVSNet-master" ]; then
+        GEOMVSNET_DIR="/home/ym/Experiment/GeoMVSNet-master"
+    else
+        GEOMVSNET_DIR="/home/myao/GeoMVSNet-master"
+    fi
+fi
 
 # WHU 数据集根目录
 MVS_TRAINING="${MVS_TRAINING:-/home/ym/Experiment/Datas/WHU_MVS_dataset}"
-TRAIN_LIST="lists/whu/newtrain.txt"
+TRAIN_LIST="${TRAIN_LIST:-${PATCHMATCHNET_DIR}/lists/whu/newtrain.txt}"
 
 # 验证集 (强制绑定极小集 80 张 minitest.txt，严禁全量评测拖慢训练)
-VAL_LIST="lists/whu/minitest.txt"
+VAL_LIST="${VAL_LIST:-${PATCHMATCHNET_DIR}/lists/whu/minitest.txt}"
 
-# Checkpoint 与 TensorBoard 保存目录
-LOG_DIR="./checkpoints/geomvsnet_whu_train"
+# Checkpoint 与 TensorBoard 保存目录 (统一保存在项目根目录下的 checkpoints/)
+LOG_DIR="${LOG_DIR:-${PATCHMATCHNET_DIR}/checkpoints/geomvsnet_whu_train}"
 
 # ==============================================================================
-# 2. GPU 与训练超参数配置
+# 3. GPU 与训练超参数配置
 # ==============================================================================
 export GPU_ID="${GPU_ID:-2}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
@@ -35,10 +48,10 @@ BATCH_SIZE="${BATCH_SIZE:-2}"
 EPOCHS="${EPOCHS:-16}"
 LR="${LR:-0.001}"
 
-mkdir -p txt_logs
+mkdir -p "${PATCHMATCHNET_DIR}/txt_logs"
 mkdir -p "${LOG_DIR}"
 timestamp=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="txt_logs/train_whu_geomvsnet_${timestamp}.log"
+LOG_FILE="${PATCHMATCHNET_DIR}/txt_logs/train_whu_geomvsnet_${timestamp}.log"
 
 echo "=============================================================================="
 echo "启动 WHU-MVS GeoMVSNet 从零训练流程"
@@ -54,16 +67,8 @@ echo "权重保存目录       : ${LOG_DIR}"
 echo "日志输出文件       : ${LOG_FILE}"
 echo "=============================================================================="
 
-# 3. 检查并进入工作目录
-if [ ! -d "${PATCHMATCHNET_DIR}" ]; then
-    echo "⚠️ 警告: 未找到指定的 PatchmatchNet 目录: ${PATCHMATCHNET_DIR}"
-    echo "请检查并在脚本中配置正确的 PATCHMATCHNET_DIR 路径！"
-else
-    cd "${PATCHMATCHNET_DIR}" || exit 1
-fi
-
-# 4. 执行训练 (后台运行或前台打印)
-python train_whu_geomvsnet.py \
+# 4. 执行训练
+python "${SCRIPT_DIR}/train_whu_geomvsnet.py" \
     --dataset dtu_whu \
     --trainpath "${MVS_TRAINING}" \
     --trainlist "${TRAIN_LIST}" \
@@ -81,5 +86,5 @@ python train_whu_geomvsnet.py \
 echo "=============================================================================="
 echo "训练彻底完成！"
 echo "最终收敛权重保存在: ${LOG_DIR}/model_$(printf "%06d" $((EPOCHS - 1))).ckpt"
-echo "接下来请执行收官独立评测脚本: ./test_whu_geomvsnet.sh ${LOG_DIR}/model_$(printf "%06d" $((EPOCHS - 1))).ckpt"
+echo "接下来请执行收官独立评测脚本: ./benchmarks/test_whu_geomvsnet.sh ${LOG_DIR}/model_$(printf "%06d" $((EPOCHS - 1))).ckpt"
 echo "=============================================================================="

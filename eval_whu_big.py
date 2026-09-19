@@ -173,16 +173,16 @@ cudnn.benchmark = True
 parser = argparse.ArgumentParser(description='Predict depth, filter, and fuse')
 parser.add_argument('--model', default='PatchmatchNet', help='select model')
 
-parser.add_argument('--dataset', default='dtu_yao_eval', help='select dataset')
-parser.add_argument('--testpath', help='testing data path')
-parser.add_argument('--testlist', help='testing scan list')
+parser.add_argument('--dataset', default='dtu_whu_eval_big', help='select dataset')
+parser.add_argument('--testpath', default='/home/ym/Experiment/Datas/WHU_MVS_dataset', help='testing data path')
+parser.add_argument('--testlist', default='lists/whu/bigtest.txt', help='testing scan list')
 
 parser.add_argument('--batch_size', type=int, default=1, help='testing batch size')
 parser.add_argument('--n_views', type=int, default=5, help='num of view')
 
 
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
-parser.add_argument('--outdir', default='./outputs', help='output dir')
+parser.add_argument('--outdir', default='./outputs_big_planar_comparison', help='output dir')
 parser.add_argument('--display', action='store_true', help='display depth images and masks')
 
 parser.add_argument('--patchmatch_iteration', nargs='+', type=int, default=[1,2,2], 
@@ -198,9 +198,11 @@ parser.add_argument('--propagate_neighbors', nargs='+', type=int, default=[0,8,1
 parser.add_argument('--evaluate_neighbors', nargs='+', type=int, default=[9,9,9], 
         help='num of neighbors for adaptive matching cost aggregation of adaptive evaluation on stages 1,2,3')
 
-parser.add_argument('--geo_pixel_thres', type=float, default=1, help='pixel threshold for geometric consistency filtering')
-parser.add_argument('--geo_depth_thres', type=float, default=0.01, help='depth threshold for geometric consistency filtering')
+parser.add_argument('--geo_pixel_thres', type=float, default=3.0, help='pixel threshold for geometric consistency filtering')
+parser.add_argument('--geo_depth_thres', type=float, default=0.05, help='depth threshold for geometric consistency filtering')
 parser.add_argument('--photo_thres', type=float, default=0.8, help='threshold for photometric consistency filtering')
+parser.add_argument('--max_export_samples', type=int, default=2, help='maximum samples to export in planar comparison experiment')
+parser.add_argument('--lambda_c', type=float, default=1.0, help='continuity loss weight for evaluation diagnostic')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -3073,9 +3075,760 @@ def save_depth_cross_check():
                 cv2.imwrite(mask_filename, mask_img)
                 cv2.imwrite(mask_single_filename, mask_img)
 
+# ==============================================================================
+# 👑 【实验专精】平面区域点云、Mesh 网格导出与微观深度浮动残差诊断系统
+# ==============================================================================
+
+def save_point_cloud_ply(filename, points_xyz, colors_rgb):
+    """保存 3D 点云至标准 PLY 文件"""
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    vertex_dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                    ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+    vertex_all = np.empty(len(points_xyz), dtype=vertex_dtype)
+    vertex_all['x'] = points_xyz[:, 0]
+    vertex_all['y'] = points_xyz[:, 1]
+    vertex_all['z'] = points_xyz[:, 2]
+    vertex_all['red'] = colors_rgb[:, 0]
+    vertex_all['green'] = colors_rgb[:, 1]
+    vertex_all['blue'] = colors_rgb[:, 2]
+
+    el = PlyElement.describe(vertex_all, 'vertex')
+    PlyData([el], text=False).write(filename)
+
+
+def save_mesh_ply(filename, vertices_xyz, faces_tri, normals_xyz=None, colors_rgb=None):
+    """
+    保存 3D 三角网格至标准二进制 Little-Endian PLY 文件 (100% 兼容 MeshLab, CloudCompare, Blender)
+    支持写入精确法向量 (normals_xyz) 和顶点颜色 (colors_rgb)
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    N_v = len(vertices_xyz)
+    N_f = len(faces_tri)
+    if colors_rgb is None:
+        colors_rgb = np.full((N_v, 3), 220, dtype=np.uint8)
+
+    has_normals = (normals_xyz is not None and len(normals_xyz) == N_v)
+
+    with open(filename, 'wb') as f:
+        header = (
+            f"ply\n"
+            f"format binary_little_endian 1.0\n"
+            f"element vertex {N_v}\n"
+            f"property float x\n"
+            f"property float y\n"
+            f"property float z\n"
+        )
+        if has_normals:
+            header += (
+                f"property float nx\n"
+                f"property float ny\n"
+                f"property float nz\n"
+            )
+        header += (
+            f"property uchar red\n"
+            f"property uchar green\n"
+            f"property uchar blue\n"
+            f"element face {N_f}\n"
+            f"property list uchar int vertex_indices\n"
+            f"end_header\n"
+        )
+        f.write(header.encode('ascii'))
+
+        if has_normals:
+            v_dtype = [
+                ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
+                ('r', 'u1'), ('g', 'u1'), ('b', 'u1')
+            ]
+            v_data = np.zeros(N_v, dtype=v_dtype)
+            v_data['x'] = vertices_xyz[:, 0]
+            v_data['y'] = vertices_xyz[:, 1]
+            v_data['z'] = vertices_xyz[:, 2]
+            v_data['nx'] = normals_xyz[:, 0]
+            v_data['ny'] = normals_xyz[:, 1]
+            v_data['nz'] = normals_xyz[:, 2]
+            v_data['r'] = colors_rgb[:, 0]
+            v_data['g'] = colors_rgb[:, 1]
+            v_data['b'] = colors_rgb[:, 2]
+        else:
+            v_dtype = [
+                ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                ('r', 'u1'), ('g', 'u1'), ('b', 'u1')
+            ]
+            v_data = np.zeros(N_v, dtype=v_dtype)
+            v_data['x'] = vertices_xyz[:, 0]
+            v_data['y'] = vertices_xyz[:, 1]
+            v_data['z'] = vertices_xyz[:, 2]
+            v_data['r'] = colors_rgb[:, 0]
+            v_data['g'] = colors_rgb[:, 1]
+            v_data['b'] = colors_rgb[:, 2]
+
+        f.write(v_data.tobytes())
+
+        if N_f > 0:
+            f_data = np.zeros(N_f, dtype=[
+                ('n', 'u1'), ('i0', '<i4'), ('i1', '<i4'), ('i2', '<i4')
+            ])
+            f_data['n'] = 3
+            f_data['i0'] = faces_tri[:, 0]
+            f_data['i1'] = faces_tri[:, 1]
+            f_data['i2'] = faces_tri[:, 2]
+            f_data.tofile(f)
+
+
+def cdt_triangles_to_3d_mesh(triangles, vertexs_2d, planes, intrinsics, extrinsics,
+                             W_plane_tri=None, depth_min=1.0, depth_max=1000.0,
+                             conf_threshold=None, color_mode='clay'):
+    """
+    【CAD 级独立面片网格升维】
+    将 2D CDT 三角网格结合 GNN 预测的平面方程 (n_x, n_y, n_z, d) 升维重构为 3D 三角多边形网格面片。
+    采用 Triangle Soup 模式 (独立面片，面与面之间不强行共享公共边顶点)：
+    若相邻两三角形高度或倾角不一致，在 3D 中将呈现真实的物理阶跃台阶或接缝，方便在 CloudCompare 中诊断连续性与高低起伏！
+
+    参数:
+        triangles: 三角形拓扑列表，每个项含 'vertex_ids'
+        vertexs_2d: [N_v, 2] 像素坐标 (u, v)
+        planes: [N_tri, 4] 相机坐标系下的平面方程 (nx, ny, nz, d)
+        intrinsics: [3, 3] 相机内参 K_0
+        extrinsics: [4, 4] 相机外参 E (世界系到相机系)
+        W_plane_tri: [N_tri] 平面置信度
+        depth_min, depth_max: 有效深度上下界 (用于过滤无穷远及退化飞刺)
+        conf_threshold: 置信度阈值 (如 0.8)，若设定则只保留大于等于该阈值的平面
+        color_mode: 'clay'(纯净白模), 'random'(随机对比明亮面片色), 'normal'(法向 RGB 姿态色), 'confidence'(置信度热力色)
+    """
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    cx = float(intrinsics[0, 2])
+    cy = float(intrinsics[1, 2])
+
+    inv_E = np.linalg.inv(extrinsics)
+    R_inv = inv_E[:3, :3]
+    t_inv = inv_E[:3, 3]
+
+    num_tri = min(len(triangles), len(planes))
+    valid_vertices = []
+    valid_normals = []
+    valid_colors = []
+    valid_faces = []
+
+    cmap_jet = plt.get_cmap('jet')
+
+    face_count = 0
+    for i in range(num_tri):
+        conf_i = float(W_plane_tri[i]) if W_plane_tri is not None else 1.0
+        if conf_threshold is not None and conf_i < conf_threshold:
+            continue
+
+        nx, ny, nz, d = planes[i]
+        n_c = np.array([nx, ny, nz], dtype=np.float32)
+        n_len = np.linalg.norm(n_c)
+        if n_len < 1e-6:
+            continue
+        n_c = n_c / n_len
+        d_norm = d / n_len
+
+        t_item = triangles[i]
+        v_ids = t_item['vertex_ids']
+        if isinstance(v_ids, torch.Tensor):
+            v_ids = v_ids.cpu().numpy()
+        elif not isinstance(v_ids, np.ndarray):
+            v_ids = np.asarray(v_ids)
+
+        if len(v_ids) < 3:
+            continue
+
+        pts_2d = vertexs_2d[v_ids[:3]]  # [3, 2]
+
+        pts_cam = []
+        is_valid_tri = True
+        for k in range(3):
+            u, v = float(pts_2d[k, 0]), float(pts_2d[k, 1])
+            rx = (u - cx) / fx
+            ry = (v - cy) / fy
+            rz = 1.0
+
+            denom = n_c[0] * rx + n_c[1] * ry + n_c[2] * rz
+            if np.abs(denom) < 1e-5:
+                is_valid_tri = False
+                break
+
+            zc = -d_norm / denom
+            if zc <= 0.0:
+                zc = np.abs(zc)
+
+            if zc < (0.05 * depth_min) or zc > (5.0 * depth_max):
+                is_valid_tri = False
+                break
+
+            pts_cam.append(np.array([zc * rx, zc * ry, zc], dtype=np.float32))
+
+        if not is_valid_tri or len(pts_cam) < 3:
+            continue
+
+        pts_cam = np.stack(pts_cam, axis=0)  # [3, 3]
+        pts_world = np.matmul(pts_cam, R_inv.T) + t_inv.reshape(1, 3)  # [3, 3]
+
+        n_world = np.matmul(R_inv, n_c)
+        n_w_len = np.linalg.norm(n_world)
+        if n_w_len > 1e-6:
+            n_world = n_world / n_w_len
+        else:
+            n_world = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        if color_mode == 'clay':
+            tri_color = np.array([220, 220, 220], dtype=np.uint8)
+        elif color_mode == 'random':
+            # 黄金角散列生成明亮高对比度伪彩，确保相邻三角形色差显著
+            hue = ((i * 137.50776405003785) % 360.0) / 360.0
+            sat = 0.70 + 0.25 * ((i % 5) / 4.0)
+            val = 0.85 + 0.15 * ((i % 3) / 2.0)
+            h_i = int(hue * 6.0)
+            f_h = hue * 6.0 - h_i
+            p = val * (1.0 - sat)
+            q = val * (1.0 - f_h * sat)
+            t_h = val * (1.0 - (1.0 - f_h) * sat)
+            if h_i == 0: r_c, g_c, b_c = val, t_h, p
+            elif h_i == 1: r_c, g_c, b_c = q, val, p
+            elif h_i == 2: r_c, g_c, b_c = p, val, t_h
+            elif h_i == 3: r_c, g_c, b_c = p, q, val
+            elif h_i == 4: r_c, g_c, b_c = t_h, p, val
+            else: r_c, g_c, b_c = val, p, q
+            tri_color = np.clip(np.array([r_c, g_c, b_c]) * 255.0, 0, 255).astype(np.uint8)
+        elif color_mode == 'normal':
+            tri_color = np.clip((n_world * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+        elif color_mode == 'confidence':
+            tri_color = (np.array(cmap_jet(float(np.clip(conf_i, 0.0, 1.0)))[:3]) * 255.0).astype(np.uint8)
+        else:
+            tri_color = np.array([210, 210, 210], dtype=np.uint8)
+
+        base_idx = face_count * 3
+        valid_vertices.append(pts_world)
+        valid_normals.append(np.tile(n_world.reshape(1, 3), (3, 1)))
+        valid_colors.append(np.tile(tri_color.reshape(1, 3), (3, 1)))
+        valid_faces.append([base_idx, base_idx + 1, base_idx + 2])
+
+        face_count += 1
+
+    if face_count == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+
+    all_verts = np.concatenate(valid_vertices, axis=0).astype(np.float32)
+    all_normals = np.concatenate(valid_normals, axis=0).astype(np.float32)
+    all_colors = np.concatenate(valid_colors, axis=0).astype(np.uint8)
+    all_faces = np.array(valid_faces, dtype=np.int32)
+
+    return all_verts, all_faces, all_normals, all_colors
+
+
+def evaluate_mesh_edge_continuity(lines, vertexs_2d, planes, intrinsics, W_plane_tri=None):
+    """
+    量化评估 CDT 网格在相邻三角面公共边处的连续性与阶跃台阶 (Step Discontinuity)
+    """
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    cx = float(intrinsics[0, 2])
+    cy = float(intrinsics[1, 2])
+
+    steps_all = []
+    steps_planar = []
+    normal_angles_all = []
+    normal_angles_planar = []
+
+    num_tri = len(planes)
+    for line in lines:
+        if len(line) < 4:
+            continue
+        p1, p2, f1, f2 = int(line[0]), int(line[1]), int(line[2]), int(line[3])
+        if f1 < 0 or f2 < 0 or f1 == f2 or f1 >= num_tri or f2 >= num_tri:
+            continue
+
+        n1, d1 = planes[f1, :3], planes[f1, 3]
+        n2, d2 = planes[f2, :3], planes[f2, 3]
+
+        cos_sim = np.dot(n1, n2) / (np.linalg.norm(n1) * np.linalg.norm(n2) + 1e-8)
+        ang_deg = np.degrees(np.arccos(np.clip(cos_sim, -1.0, 1.0)))
+
+        is_valid_edge = True
+        edge_deltas = []
+        for p_idx in [p1, p2]:
+            u, v = float(vertexs_2d[p_idx, 0]), float(vertexs_2d[p_idx, 1])
+            rx = (u - cx) / fx
+            ry = (v - cy) / fy
+            rz = 1.0
+
+            denom1 = n1[0] * rx + n1[1] * ry + n1[2] * rz
+            denom2 = n2[0] * rx + n2[1] * ry + n2[2] * rz
+            if np.abs(denom1) < 1e-5 or np.abs(denom2) < 1e-5:
+                is_valid_edge = False
+                break
+            z1 = -d1 / denom1
+            z2 = -d2 / denom2
+            if z1 <= 0.0: z1 = np.abs(z1)
+            if z2 <= 0.0: z2 = np.abs(z2)
+            edge_deltas.append(np.abs(z1 - z2))
+
+        if not is_valid_edge or len(edge_deltas) < 2:
+            continue
+
+        mean_step = float(np.mean(edge_deltas))
+        steps_all.append(mean_step)
+        normal_angles_all.append(ang_deg)
+
+        if W_plane_tri is not None:
+            w1 = float(W_plane_tri[f1])
+            w2 = float(W_plane_tri[f2])
+            if w1 >= 0.80 and w2 >= 0.80:
+                steps_planar.append(mean_step)
+                normal_angles_planar.append(ang_deg)
+
+    return {
+        "step_all_mean": float(np.mean(steps_all)) if steps_all else 0.0,
+        "step_all_median": float(np.median(steps_all)) if steps_all else 0.0,
+        "step_all_max": float(np.max(steps_all)) if steps_all else 0.0,
+        "step_planar_mean": float(np.mean(steps_planar)) if steps_planar else 0.0,
+        "step_planar_median": float(np.median(steps_planar)) if steps_planar else 0.0,
+        "step_planar_max": float(np.max(steps_planar)) if steps_planar else 0.0,
+        "angle_planar_mean": float(np.mean(normal_angles_planar)) if normal_angles_planar else 0.0,
+        "num_shared_edges": len(steps_all),
+        "num_planar_edges": len(steps_planar),
+    }
+
+
+def depth_to_world_points(depth_map, intrinsics, extrinsics, valid_mask=None):
+    """
+    将深度图点反投影到世界坐标系
+    """
+    H, W = depth_map.shape
+    y, x = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+    if valid_mask is None:
+        valid_mask = (depth_map > 1e-3)
+    else:
+        valid_mask = valid_mask & (depth_map > 1e-3)
+
+    if not valid_mask.any():
+        return np.zeros((0, 3), dtype=np.float32), valid_mask
+
+    x_v = x[valid_mask].astype(np.float32)
+    y_v = y[valid_mask].astype(np.float32)
+    d_v = depth_map[valid_mask].astype(np.float32)
+
+    homo = np.stack([x_v, y_v, np.ones_like(x_v)], axis=0) * d_v
+    xyz_ref = np.matmul(np.linalg.inv(intrinsics), homo)
+
+    homo_ref = np.vstack([xyz_ref, np.ones((1, xyz_ref.shape[1]), dtype=np.float32)])
+    xyz_world = np.matmul(np.linalg.inv(extrinsics), homo_ref)[:3].T
+    return xyz_world.astype(np.float32), valid_mask
+
+
+def depth_to_mesh(depth_map, intrinsics, extrinsics, colors_rgb, valid_mask=None, max_depth_step=0.20):
+    """
+    基于深度图构建紧致三角网格，在深度突变处自动断开，防止遮挡拉膜飞面
+    """
+    H, W = depth_map.shape
+    if valid_mask is None:
+        valid_mask = (depth_map > 1e-3)
+    else:
+        valid_mask = valid_mask & (depth_map > 1e-3)
+
+    vert_id_grid = np.full((H, W), -1, dtype=np.int32)
+    valid_indices = np.argwhere(valid_mask)
+    for new_id, (r, c) in enumerate(valid_indices):
+        vert_id_grid[r, c] = new_id
+
+    xyz_world, _ = depth_to_world_points(depth_map, intrinsics, extrinsics, valid_mask)
+    vert_colors = colors_rgb[valid_mask]
+
+    v00 = vert_id_grid[:-1, :-1]
+    v01 = vert_id_grid[:-1, 1:]
+    v10 = vert_id_grid[1:, :-1]
+    v11 = vert_id_grid[1:, 1:]
+    d00 = depth_map[:-1, :-1]
+    d01 = depth_map[:-1, 1:]
+    d10 = depth_map[1:, :-1]
+    d11 = depth_map[1:, 1:]
+
+    valid_t1 = (v00 >= 0) & (v10 >= 0) & (v01 >= 0) & \
+               (np.maximum.reduce([np.abs(d00 - d10), np.abs(d10 - d01), np.abs(d01 - d00)]) < max_depth_step)
+    f1 = np.stack([v00[valid_t1], v10[valid_t1], v01[valid_t1]], axis=-1)
+
+    valid_t2 = (v01 >= 0) & (v10 >= 0) & (v11 >= 0) & \
+               (np.maximum.reduce([np.abs(d01 - d10), np.abs(d10 - d11), np.abs(d11 - d01)]) < max_depth_step)
+    f2 = np.stack([v01[valid_t2], v10[valid_t2], v11[valid_t2]], axis=-1)
+
+    faces = np.concatenate([f1, f2], axis=0).astype(np.int32) if (len(f1) > 0 or len(f2) > 0) else np.zeros((0, 3), dtype=np.int32)
+    return xyz_world, faces, vert_colors
+
+
+def export_planar_geometry_comparison(max_samples=2):
+    """
+    👑 【大图诊断主函数】
+    针对前 max_samples 张大图（默认 2 张），执行以下完整对比实验：
+    1. 导出 Stage 1 Fused Mesh 面片与双色点云 (.ply)
+    2. 导出 Stage 0 深度点云与残差浮动热力点云 (.ply)
+    3. 导出 GT 真实参考点云 (.ply)
+    4. 导出 2D 平面置信度与状态掩码 (.png)
+    5. 精准量化残差在平面区域引入的浮动量 (MAE, RMSE, Std, MaxDev) 及真值 MAE 对比
+    """
+    MVSDataset = find_dataset_def(args.dataset)
+    test_dataset = MVSDataset(args.testpath, args.testlist, "test", args.n_views)
+    test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,
+                             num_workers=0, drop_last=False)
+
+    model = PatchmatchNet(
+        patchmatch_interval_scale=args.patchmatch_interval_scale,
+        propagation_range=args.patchmatch_range,
+        patchmatch_iteration=args.patchmatch_iteration,
+        patchmatch_num_sample=args.patchmatch_num_sample,
+        propagate_neighbors=args.propagate_neighbors,
+        evaluate_neighbors=args.evaluate_neighbors
+    )
+    model.to(device)
+
+    print(f"\n==============================================================================")
+    print(f"👑 启动 WHU MVS 平面几何与深度浮动对比实验 (目标样本数: {max_samples})")
+    print(f"模型权重: {args.loadckpt}")
+    print(f"输出根目录: {args.outdir}")
+    print(f"==============================================================================\n")
+
+    if max_samples is None:
+        max_samples = getattr(args, 'max_export_samples', 2)
+
+    try:
+        state_dict = torch.load(args.loadckpt, map_location=device, weights_only=False)
+    except TypeError:
+        state_dict = torch.load(args.loadckpt, map_location=device)
+    ckpt_model_state = state_dict.get('model', state_dict)
+    current_model_state = model.state_dict()
+    filtered_state = {k: v for k, v in ckpt_model_state.items() if k in current_model_state}
+    model.load_state_dict(filtered_state, strict=False)
+    model.eval()
+
+    with torch.no_grad():
+        for batch_idx, sample in enumerate(test_loader):
+            if batch_idx >= max_samples:
+                print(f"\n[Done] 已完成前 {max_samples} 个大图样本的导出与分析！")
+                break
+
+            # 兼容多种数据集格式安全提取样本标识
+            if "filename" in sample:
+                fn_item = sample["filename"]
+                filename_raw = fn_item[0] if isinstance(fn_item, (list, tuple)) else str(fn_item)
+            elif hasattr(test_dataset, "metas") and batch_idx < len(test_dataset.metas):
+                meta_item = test_dataset.metas[batch_idx]
+                if isinstance(meta_item, (list, tuple)) and len(meta_item) >= 2:
+                    filename_raw = f"{meta_item[0]}_{meta_item[1]}"
+                else:
+                    filename_raw = str(meta_item)
+            else:
+                filename_raw = f"sample_{batch_idx:03d}"
+
+            clean_name = filename_raw.replace('{}', '').replace('/', '_').replace('\\', '_').strip('_')
+            if not clean_name:
+                clean_name = f"sample_{batch_idx:03d}"
+            
+            sample_out_dir = os.path.join(args.outdir, "planar_mesh_comparison", f"{batch_idx:02d}_{clean_name}")
+            os.makedirs(sample_out_dir, exist_ok=True)
+            print(f"\n>>> 正在处理第 [{batch_idx+1}/{max_samples}] 个样本: {clean_name}")
+            print(f"    输出目录: {sample_out_dir}")
+
+            # 1. 准备 CDT 几何输入 (参考图 view 0，支持多层嵌套与单层结构自适应适配)
+            v_ref = sample['vertexs'][0]
+            if isinstance(v_ref, (list, tuple)) and len(v_ref) > 0:
+                v_ref = v_ref[0]
+            v_ref_np = v_ref.cpu().numpy() if isinstance(v_ref, torch.Tensor) else np.asarray(v_ref)
+            vertexs_batch = [torch.from_numpy(v_ref_np).to(device)]
+
+            l_ref = sample['lines'][0]
+            if isinstance(l_ref, (list, tuple)) and len(l_ref) > 0:
+                l_ref = l_ref[0]
+            l_ref_np = l_ref.cpu().numpy() if isinstance(l_ref, torch.Tensor) else np.asarray(l_ref)
+            lines_batch = [torch.from_numpy(l_ref_np).to(device)]
+
+            t_ref_list = sample['triangles'][0]
+            if isinstance(t_ref_list, (list, tuple)) and len(t_ref_list) > 0 and isinstance(t_ref_list[0], (list, tuple)):
+                t_ref_list = t_ref_list[0]
+            tri_processed = []
+            for t in t_ref_list:
+                v_ids = torch.from_numpy(t['vertex_ids']).to(device) if isinstance(t['vertex_ids'], np.ndarray) else t['vertex_ids'].to(device)
+                l_ids = torch.from_numpy(t['line_ids']).to(device) if isinstance(t['line_ids'], np.ndarray) else t['line_ids'].to(device)
+                pts = torch.from_numpy(t['valid_points']).to(device) if isinstance(t['valid_points'], np.ndarray) else t['valid_points'].to(device)
+                tri_processed.append((v_ids, l_ids, pts))
+            triangles_batch = [tri_processed]
+
+            skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "tri_plane_cleaned"]
+            sample_cuda = tocuda(sample, device=device, skip_keys=skip)
+
+            depth_gt_dict = sample_cuda.get("depth", None)
+            depth_stage_1 = depth_gt_dict['stage_1'] if (depth_gt_dict is not None and 'stage_1' in depth_gt_dict) else None
+
+            # 2. 模型前向推断
+            outputs = model(
+                sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
+                sample_cuda["depth_min"], sample_cuda["depth_max"],
+                vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
+                args.lambda_c, 0.0, 0.55
+            )
+
+            # 3. 提取核心深度与置信度张量
+            d1_plane = outputs["depth_patchmatch"]["stage_1"][-1][0, 0].detach().cpu().numpy()
+            d1_pixel = outputs["output_plane"]["depth_stage1_pixels"][0, 0].detach().cpu().numpy()
+            w_pixel_s1 = outputs["output_plane"]["W_plane_pixel"][0, 0].detach().cpu().numpy()
+            mask_planar_s1 = (w_pixel_s1 >= 0.80)
+            depth_s1_fused = np.where(mask_planar_s1, d1_plane, d1_pixel)
+
+            depth_s0 = outputs["refined_depth"]["stage_0"][0, 0].detach().cpu().numpy()
+            w_plane_s0 = outputs["output_plane"]["W_plane_s0"][0, 0].detach().cpu().numpy()
+            is_planar_s0 = outputs["output_plane"]["is_planar_s0"][0, 0].detach().cpu().numpy()
+
+            H0, W0 = depth_s0.shape
+            H1, W1 = depth_s1_fused.shape
+
+            # 4. 相机内参及外参 (世界坐标)
+            K_0 = sample["intrinsics_mats"]['stage_0'][0, 0].cpu().numpy()
+            K_1 = sample["intrinsics_mats"]['stage_1'][0, 0].cpu().numpy()
+            P_0 = sample["proj_matrices"]['stage_0'][0, 0].cpu().numpy()
+            E = np.eye(4, dtype=np.float32)
+            E[:3, :4] = np.matmul(np.linalg.inv(K_0), P_0[:3, :4])
+
+            # 5. 参考图 RGB 纹理提取
+            ref_img_raw = sample["imgs"]['stage_0'][0, 0].permute(1, 2, 0).cpu().numpy()
+            if ref_img_raw.min() < 0.0:
+                ref_rgb_uint8_s0 = np.clip((ref_img_raw * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+            elif ref_img_raw.max() <= 1.0:
+                ref_rgb_uint8_s0 = np.clip(ref_img_raw * 255.0, 0, 255).astype(np.uint8)
+            else:
+                ref_rgb_uint8_s0 = np.clip(ref_img_raw, 0, 255).astype(np.uint8)
+            ref_rgb_uint8_s1 = cv2.resize(ref_rgb_uint8_s0, (W1, H1), interpolation=cv2.INTER_AREA)
+
+            # 6. 真值深度与掩码
+            gt_depth_s0 = None
+            gt_mask_s0 = None
+            if "depth" in sample and "stage_0" in sample["depth"] and sample["depth"]["stage_0"] is not None:
+                gt_depth_s0 = np.squeeze(sample["depth"]["stage_0"][0].cpu().numpy())
+                if "mask" in sample and "stage_0" in sample["mask"] and sample["mask"]["stage_0"] is not None:
+                    gt_mask_s0 = np.squeeze(sample["mask"]["stage_0"][0].cpu().numpy()) > 0.5
+                else:
+                    gt_mask_s0 = (gt_depth_s0 > 1e-3)
+
+            # --------------------------------------------------------------------------
+            # 👑 导出 1: 2D 平面置信度与状态掩码图像
+            # --------------------------------------------------------------------------
+            # A. Stage 0 连续置信度热力图 (Jet 伪彩)
+            cmap_jet = plt.get_cmap('jet')
+            conf_rgb_s0 = (cmap_jet(np.clip(w_plane_s0, 0.0, 1.0))[..., :3] * 255.0).astype(np.uint8)
+            cv2.imwrite(os.path.join(sample_out_dir, "stage0_planar_confidence.png"), cv2.cvtColor(conf_rgb_s0, cv2.COLOR_RGB2BGR))
+
+            # B. Stage 0 二值平面硬掩码 (255: 平面, 0: 曲面)
+            mask_img_s0 = (is_planar_s0.astype(np.uint8) * 255)
+            cv2.imwrite(os.path.join(sample_out_dir, "stage0_planar_mask.png"), mask_img_s0)
+
+            # C. Stage 1 二值平面硬掩码
+            mask_img_s1 = (mask_planar_s1.astype(np.uint8) * 255)
+            cv2.imwrite(os.path.join(sample_out_dir, "stage1_planar_mask.png"), mask_img_s1)
+
+            # --------------------------------------------------------------------------
+            # 👑 导出 2: Stage 1 网格面片与点云资产
+            # --------------------------------------------------------------------------
+            # 2.1 密集像素级重构网格 (带航拍 RGB 纹理)
+            valid_s1 = (depth_s1_fused > 1e-3)
+            mesh_xyz_s1, mesh_faces_s1, mesh_colors_s1 = depth_to_mesh(
+                depth_s1_fused, K_1, E, ref_rgb_uint8_s1, valid_mask=valid_s1, max_depth_step=0.20
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_fused_dense_mesh.ply"), mesh_xyz_s1, mesh_faces_s1, colors_rgb=mesh_colors_s1)
+
+            # 2.2 👑 CDT CAD 级宏观多边形面片 (Triangle Soup, 暴露出真实的三角面高低、阶跃与接缝)
+            final_planes = outputs["output_plane"]["final_plane"][0].detach().cpu().numpy()
+            w_plane_tri = outputs["output_plane"]["W_plane_tri"][0].detach().cpu().numpy()
+            if w_plane_tri.ndim > 1:
+                w_plane_tri = w_plane_tri.squeeze(-1)
+
+            d_min_val = float(sample["depth_min"][0]) if "depth_min" in sample else 1.0
+            d_max_val = float(sample["depth_max"][0]) if "depth_max" in sample else 1000.0
+
+            # A. 纯净白模面片网格 (Clay Mesh - 浅灰白，打光最显几何起伏、接缝与阶跃台阶)
+            cdt_v_clay, cdt_f_clay, cdt_n_clay, cdt_c_clay = cdt_triangles_to_3d_mesh(
+                t_ref_list, v_ref_np, final_planes, K_0, E,
+                W_plane_tri=w_plane_tri, depth_min=d_min_val, depth_max=d_max_val,
+                conf_threshold=None, color_mode='clay'
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_cdt_mesh_clay.ply"),
+                          cdt_v_clay, cdt_f_clay, normals_xyz=cdt_n_clay, colors_rgb=cdt_c_clay)
+
+            # B. 随机高对比明亮色网格 (Random Color Mesh - 面片边界分明，一眼辨认多边形拓扑与拼接)
+            cdt_v_rand, cdt_f_rand, cdt_n_rand, cdt_c_rand = cdt_triangles_to_3d_mesh(
+                t_ref_list, v_ref_np, final_planes, K_0, E,
+                W_plane_tri=w_plane_tri, depth_min=d_min_val, depth_max=d_max_val,
+                conf_threshold=None, color_mode='random'
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_cdt_mesh_random_colors.ply"),
+                          cdt_v_rand, cdt_f_rand, normals_xyz=cdt_n_rand, colors_rgb=cdt_c_rand)
+
+            # C. 法向姿态色谱网格 (Normal RGB Mesh - 朝向一致的屋顶同色，倾角偏移/翘起立刻现形)
+            cdt_v_norm, cdt_f_norm, cdt_n_norm, cdt_c_norm = cdt_triangles_to_3d_mesh(
+                t_ref_list, v_ref_np, final_planes, K_0, E,
+                W_plane_tri=w_plane_tri, depth_min=d_min_val, depth_max=d_max_val,
+                conf_threshold=None, color_mode='normal'
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_cdt_mesh_normal_color.ply"),
+                          cdt_v_norm, cdt_f_norm, normals_xyz=cdt_n_norm, colors_rgb=cdt_c_norm)
+
+            # D. 平面置信度热力网格 (Confidence Heatmap Mesh - 红/橙为高置信度真平面，蓝/绿为曲面)
+            cdt_v_conf, cdt_f_conf, cdt_n_conf, cdt_c_conf = cdt_triangles_to_3d_mesh(
+                t_ref_list, v_ref_np, final_planes, K_0, E,
+                W_plane_tri=w_plane_tri, depth_min=d_min_val, depth_max=d_max_val,
+                conf_threshold=None, color_mode='confidence'
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_cdt_mesh_confidence.ply"),
+                          cdt_v_conf, cdt_f_conf, normals_xyz=cdt_n_conf, colors_rgb=cdt_c_conf)
+
+            # E. 纯平面专属白模网格 (Planar Only Clay Mesh - 仅保留置信度 >= 0.8 的绝对平面面片)
+            cdt_v_p, cdt_f_p, cdt_n_p, cdt_c_p = cdt_triangles_to_3d_mesh(
+                t_ref_list, v_ref_np, final_planes, K_0, E,
+                W_plane_tri=w_plane_tri, depth_min=d_min_val, depth_max=d_max_val,
+                conf_threshold=0.80, color_mode='clay'
+            )
+            save_mesh_ply(os.path.join(sample_out_dir, "stage1_cdt_mesh_planar_only_clay.ply"),
+                          cdt_v_p, cdt_f_p, normals_xyz=cdt_n_p, colors_rgb=cdt_c_p)
+
+            # 2.3 点云 A: 原生 RGB
+            pts_s1, _ = depth_to_world_points(depth_s1_fused, K_1, E, valid_mask=valid_s1)
+            save_point_cloud_ply(os.path.join(sample_out_dir, "stage1_fused_points_rgb.ply"), pts_s1, ref_rgb_uint8_s1[valid_s1])
+
+            # 2.4 点云 B: 平面 (绿) vs 曲面 (蓝) 分割着色
+            colors_planar_s1 = np.zeros_like(ref_rgb_uint8_s1)
+            colors_planar_s1[mask_planar_s1] = [0, 230, 70]     # 翠绿 (Planar)
+            colors_planar_s1[~mask_planar_s1] = [30, 80, 200]   # 宝蓝 (Curved)
+            save_point_cloud_ply(os.path.join(sample_out_dir, "stage1_fused_points_planar_color.ply"), pts_s1, colors_planar_s1[valid_s1])
+
+            # --------------------------------------------------------------------------
+            # 👑 导出 3: Stage 0 点云与残差浮动热力着色
+            # --------------------------------------------------------------------------
+            valid_s0 = (depth_s0 > 1e-3)
+            pts_s0, _ = depth_to_world_points(depth_s0, K_0, E, valid_mask=valid_s0)
+
+            # 点云 A: 原生 RGB
+            save_point_cloud_ply(os.path.join(sample_out_dir, "stage0_points_rgb.ply"), pts_s0, ref_rgb_uint8_s0[valid_s0])
+
+            # 点云 B: 平面 (绿) vs 曲面 (蓝)
+            colors_planar_s0 = np.zeros_like(ref_rgb_uint8_s0)
+            colors_planar_s0[is_planar_s0] = [0, 230, 70]
+            colors_planar_s0[~is_planar_s0] = [30, 80, 200]
+            save_point_cloud_ply(os.path.join(sample_out_dir, "stage0_points_planar_color.ply"), pts_s0, colors_planar_s0[valid_s0])
+
+            # 点云 C: 浮动残差绝对值热力点云 (|Z_s0 - Z_s1_fused_up|)
+            depth_s1_fused_up = cv2.resize(depth_s1_fused, (W0, H0), interpolation=cv2.INTER_NEAREST)
+            depth_diff_s0_s1 = np.abs(depth_s0 - depth_s1_fused_up)
+            # 归一化到 0 ~ 0.05m (50mm) 热力色谱
+            norm_diff = np.clip(depth_diff_s0_s1[valid_s0] / 0.05, 0.0, 1.0)
+            colors_diff_heat = (cmap_jet(norm_diff)[..., :3] * 255.0).astype(np.uint8)
+            save_point_cloud_ply(os.path.join(sample_out_dir, "stage0_points_drift_heatmap.ply"), pts_s0, colors_diff_heat)
+
+            # 2D 浮动残差热力图
+            diff_heat_2d = (cmap_jet(np.clip(depth_diff_s0_s1 / 0.05, 0.0, 1.0))[..., :3] * 255.0).astype(np.uint8)
+            diff_heat_2d[~is_planar_s0] = 0  # 非平面区刷黑
+            cv2.imwrite(os.path.join(sample_out_dir, "depth_float_planar_heatmap.png"), cv2.cvtColor(diff_heat_2d, cv2.COLOR_RGB2BGR))
+
+            # --------------------------------------------------------------------------
+            # 👑 导出 4: GT 真实点云 (如果有真值)
+            # --------------------------------------------------------------------------
+            if gt_depth_s0 is not None:
+                valid_gt = (gt_depth_s0 > 1e-3) & gt_mask_s0
+                pts_gt, _ = depth_to_world_points(gt_depth_s0, K_0, E, valid_mask=valid_gt)
+                save_point_cloud_ply(os.path.join(sample_out_dir, "gt_points_rgb.ply"), pts_gt, ref_rgb_uint8_s0[valid_gt])
+
+            # --------------------------------------------------------------------------
+            # 👑 计算 4 大量化浮动指标表
+            # --------------------------------------------------------------------------
+            eval_planar_mask = is_planar_s0 & valid_s0
+            if gt_mask_s0 is not None:
+                eval_planar_mask = eval_planar_mask & gt_mask_s0
+
+            n_planar = int(np.sum(eval_planar_mask))
+            n_valid_gt = int(np.sum(gt_mask_s0)) if gt_mask_s0 is not None else int(np.sum(valid_s0))
+            planar_ratio = n_planar / max(n_valid_gt, 1)
+
+            # 1. 深度浮动残差 (MAE, RMSE, Std, MaxDev)
+            diff_planar_eval = depth_diff_s0_s1[eval_planar_mask]
+            mae_float_planar = np.mean(diff_planar_eval) if n_planar > 0 else 0.0
+            rmse_float_planar = np.sqrt(np.mean(diff_planar_eval ** 2)) if n_planar > 0 else 0.0
+            std_float_planar = np.std(diff_planar_eval) if n_planar > 0 else 0.0
+            max_float_planar = np.max(diff_planar_eval) if n_planar > 0 else 0.0
+
+            # 2. 对 GT 的平面精度对比
+            mae_gt_s1_planar = 0.0
+            mae_gt_s0_planar = 0.0
+            delta_mae_planar = 0.0
+            mae_gt_s1_global = 0.0
+            mae_gt_s0_global = 0.0
+            delta_mae_global = 0.0
+
+            if gt_depth_s0 is not None and gt_mask_s0 is not None:
+                if n_planar > 0:
+                    mae_gt_s1_planar = np.mean(np.abs(depth_s1_fused_up[eval_planar_mask] - gt_depth_s0[eval_planar_mask]))
+                    mae_gt_s0_planar = np.mean(np.abs(depth_s0[eval_planar_mask] - gt_depth_s0[eval_planar_mask]))
+                    delta_mae_planar = mae_gt_s0_planar - mae_gt_s1_planar
+
+                mae_gt_s1_global = np.mean(np.abs(depth_s1_fused_up[gt_mask_s0] - gt_depth_s0[gt_mask_s0]))
+                mae_gt_s0_global = np.mean(np.abs(depth_s0[gt_mask_s0] - gt_depth_s0[gt_mask_s0]))
+                delta_mae_global = mae_gt_s0_global - mae_gt_s1_global
+
+            # 3. CDT 三角网格公共边连续性与阶跃台阶 (Step Discontinuity) 诊断
+            edge_metrics = evaluate_mesh_edge_continuity(l_ref_np, v_ref_np, final_planes, K_0, W_plane_tri=w_plane_tri)
+
+            # 打印与保存报告
+            rep = []
+            rep.append("=" * 80)
+            rep.append(f"👑 WHU MVS 平面几何与深度浮动诊断报告: {clean_name}")
+            rep.append("=" * 80)
+            rep.append(f"图像尺寸 (Stage 0)   : {W0} x {H0}")
+            rep.append(f"全图有效真值像素数   : {n_valid_gt}")
+            rep.append(f"判定平面区域像素数   : {n_planar} ({planar_ratio*100:.2f}%)")
+            rep.append("")
+            rep.append("--- 1. 平面区域 Stage 0 深度浮动统计 (Stage 0 vs Stage 1 Fused) ---")
+            rep.append(f"  * 平均扰动绝对幅度 (MAE Drift) : {mae_float_planar:.4f} m ({mae_float_planar*1000.0:.2f} mm)")
+            rep.append(f"  * 均方根形变误差   (RMSE Drift): {rmse_float_planar:.4f} m ({rmse_float_planar*1000.0:.2f} mm)")
+            rep.append(f"  * 离散度标准差     (Std Drift) : {std_float_planar:.4f} m ({std_float_planar*1000.0:.2f} mm)")
+            rep.append(f"  * 最大局部漂移     (Max Dev)   : {max_float_planar:.4f} m ({max_float_planar*1000.0:.2f} mm)")
+            rep.append("")
+            rep.append("--- 2. 平面区域真值精度对比 (Planar MAE to GT) ---")
+            rep.append(f"  * Stage 1 Fused 平面区 MAE     : {mae_gt_s1_planar:.4f} m ({mae_gt_s1_planar*1000.0:.2f} mm)")
+            rep.append(f"  * Stage 0 Refined 平面区 MAE   : {mae_gt_s0_planar:.4f} m ({mae_gt_s0_planar*1000.0:.2f} mm)")
+            judge_planar = "[✓ 精度提升]" if delta_mae_planar < 0 else "[! 浮动造成轻微劣化]"
+            rep.append(f"  * 平面精度净收益   (ΔMAE)      : {delta_mae_planar:+.4f} m ({delta_mae_planar*1000.0:+.2f} mm) {judge_planar}")
+            rep.append("")
+            rep.append("--- 3. 全图有效真值精度对比 (Global MAE to GT) ---")
+            rep.append(f"  * Stage 1 Fused 全图 MAE       : {mae_gt_s1_global:.4f} m ({mae_gt_s1_global*1000.0:.2f} mm)")
+            rep.append(f"  * Stage 0 Refined 全图 MAE     : {mae_gt_s0_global:.4f} m ({mae_gt_s0_global*1000.0:.2f} mm)")
+            judge_global = "[✓ 全图提升]" if delta_mae_global < 0 else "[! 全图轻微劣化]"
+            rep.append(f"  * 全图精度净收益   (ΔMAE)      : {delta_mae_global:+.4f} m ({delta_mae_global*1000.0:+.2f} mm) {judge_global}")
+            rep.append("")
+            rep.append("--- 4. CDT 三角面公共边连续性与阶跃台阶 (Edge Continuity & Step Discontinuity) ---")
+            rep.append(f"  * 拓扑内公共边总数             : {edge_metrics['num_shared_edges']}")
+            rep.append(f"  * 全图公共边平均台阶落差       : {edge_metrics['step_all_mean']:.4f} m ({edge_metrics['step_all_mean']*1000.0:.2f} mm)")
+            rep.append(f"  * 全图公共边中位台阶落差       : {edge_metrics['step_all_median']:.4f} m ({edge_metrics['step_all_median']*1000.0:.2f} mm)")
+            rep.append(f"  * 全图公共边最大台阶落差       : {edge_metrics['step_all_max']:.4f} m ({edge_metrics['step_all_max']*1000.0:.2f} mm)")
+            rep.append(f"  * 平面内相邻公共边数           : {edge_metrics['num_planar_edges']}")
+            rep.append(f"  * 平面内相邻三角面平均台阶落差 : {edge_metrics['step_planar_mean']:.4f} m ({edge_metrics['step_planar_mean']*1000.0:.2f} mm)")
+            rep.append(f"  * 平面内相邻三角面中位台阶落差 : {edge_metrics['step_planar_median']:.4f} m ({edge_metrics['step_planar_median']*1000.0:.2f} mm)")
+            rep.append(f"  * 平面内相邻三角面最大台阶落差 : {edge_metrics['step_planar_max']:.4f} m ({edge_metrics['step_planar_max']*1000.0:.2f} mm)")
+            rep.append(f"  * 平面内相邻三角面平均法向夹角 : {edge_metrics['angle_planar_mean']:.2f}°")
+            rep.append("=" * 80)
+
+            report_str = "\n".join(rep)
+            print(report_str)
+
+            report_file = os.path.join(sample_out_dir, "planar_evaluation_report.txt")
+            with open(report_file, "w", encoding="utf-8") as rf:
+                rf.write(report_str)
+            print(f"    ✓ 报告已保存至: {report_file}")
+            print(f"    ✓ 资产已成功导出至: {sample_out_dir}\n")
+
+
 if __name__ == '__main__':
+    # 👑 执行大图平面几何与深度浮动对比实验 (默认前 2 张大图)
+    export_planar_geometry_comparison(max_samples=2)
     # step1. save all the depth maps and the masks in outputs directory
-    save_depth()
+    # save_depth()
     # save_depth_cross_check()
     # img_wh=(768, 384)
     

@@ -11,7 +11,7 @@ OUT_DIR="./outputs_minitest"
 
 # 2. Checkpoint 配置（优先使用命令行第一个参数，若无则使用默认模型权重）
 # 例如: ./test.sh ./checkpoints/tensorboard_train19/model_000033.ckpt
-DEFAULT_CKPT="./checkpoints/tensorboard_train24/model_000033.ckpt"
+DEFAULT_CKPT="./checkpoints/tensorboard_train26/model_000037.ckpt"
 CKPT_FILE="${1:-$DEFAULT_CKPT}"
 
 # 3. GPU 设备配置（默认使用 3 号 GPU，也可通过外部环境变量临时指定：GPU_ID=2 ./test.sh）

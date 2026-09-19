@@ -5,41 +5,52 @@
 # 遵循 whu-mvs-benchmark-adapter 专家规范 (模式 A: 包装器接入与同源切片)
 # ==============================================================================
 
+# 自动解析当前脚本目录与 PatchmatchNet 项目根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCHMATCHNET_DIR="${PATCHMATCHNET_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# 1. 严格进入项目根目录执行，确保工作空间与路径基准完全统一
+cd "${PATCHMATCHNET_DIR}" || exit 1
+
 # ==============================================================================
-# 1. 关键路径配置 (可在执行前通过环境变量覆盖，或直接在此修改默认值)
+# 2. 关键路径配置 (显式绝对路径锚定，绝不因脚本位置改变而错位)
 # ==============================================================================
 
-# 本项目 PatchmatchNet 代码根目录 (服务器实际路径)
-PATCHMATCHNET_DIR="${PATCHMATCHNET_DIR:-/home/ym/Experiment/PatchmatchNet-new}"
-
-# 外部 DiffMVS 源码根目录 (服务器实际路径)
-DIFFMVS_DIR="${DIFFMVS_DIR:-/home/ym/Experiment/diffmvs-main}"
+# 外部 DiffMVS 源码根目录 (优先环境变量，自动兼容服务器多用户路径)
+if [ -z "${DIFFMVS_DIR}" ]; then
+    if [ -d "/home/myao/diffmvs-main" ]; then
+        DIFFMVS_DIR="/home/myao/diffmvs-main"
+    elif [ -d "/home/ym/Experiment/diffmvs-main" ]; then
+        DIFFMVS_DIR="/home/ym/Experiment/diffmvs-main"
+    else
+        DIFFMVS_DIR="/home/myao/diffmvs-main"
+    fi
+fi
 
 # DiffMVS 模型权重 (.ckpt)
-DEFAULT_CKPT="./checkpoints/diffmvs_whu_train/model_000015.ckpt"
+DEFAULT_CKPT="${PATCHMATCHNET_DIR}/checkpoints/diffmvs_whu_train/model_000015.ckpt"
 CKPT_FILE="${1:-$DEFAULT_CKPT}"
 
 # WHU 数据集根目录与测试切片列表 (默认绑定 640 张标准全量测试集)
 MVS_TESTING="${MVS_TESTING:-/home/ym/Experiment/Datas/WHU_MVS_dataset}"
-TEST_LIST="${TEST_LIST:-lists/whu/newtest.txt}"
+TEST_LIST="${TEST_LIST:-${PATCHMATCHNET_DIR}/lists/whu/newtest.txt}"
 
 # 本项目已提前导出的同源平面掩码目录 (用于 Table 2 提取同源平面区 MAE)
-# 若之前运行过 test_whu.sh 并开启了 --save_masks，可直接指定其 outputs 目录
 MASK_DIR="${MASK_DIR:-${PATCHMATCHNET_DIR}/outputs_minitest}"
 
-# 评测输出目录 (保存 Markdown 双表报表和 json 详细记录)
-OUT_DIR="./outputs_diffmvs"
+# 评测输出目录 (保存 Markdown 双表报表和 json 详细记录，统一生成在项目根目录下)
+OUT_DIR="${OUT_DIR:-${PATCHMATCHNET_DIR}/outputs_diffmvs}"
 
 # ==============================================================================
-# 2. GPU 设备与运行参数配置
+# 3. GPU 设备与日志配置
 # ==============================================================================
 export GPU_ID="${GPU_ID:-3}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
-mkdir -p txt_logs
+mkdir -p "${PATCHMATCHNET_DIR}/txt_logs"
 mkdir -p "${OUT_DIR}"
 timestamp=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="txt_logs/test_whu_diffmvs_${timestamp}.log"
+LOG_FILE="${PATCHMATCHNET_DIR}/txt_logs/test_whu_diffmvs_${timestamp}.log"
 
 echo "=============================================================================="
 echo "启动 WHU-MVS DiffMVS / CasDiffMVS 基准适配独立评测系统"
@@ -54,21 +65,13 @@ echo "输出结果目录         : ${OUT_DIR}"
 echo "终端日志文件         : ${LOG_FILE}"
 echo "=============================================================================="
 
-# 3. 检查并进入工作目录
-if [ ! -d "${PATCHMATCHNET_DIR}" ]; then
-    echo "⚠️ 警告: 未找到指定的 PatchmatchNet 目录: ${PATCHMATCHNET_DIR}"
-    echo "请检查并在脚本中配置正确的 PATCHMATCHNET_DIR 路径！"
-else
-    cd "${PATCHMATCHNET_DIR}" || exit 1
-fi
-
 # 消费第一个参数 (CKPT_FILE)，其余参数透传给 python
 if [ "$#" -gt 0 ]; then
     shift
 fi
 
 # 4. 执行适配评测
-python test_whu_diffmvs.py \
+python "${SCRIPT_DIR}/test_whu_diffmvs.py" \
     --dataset dtu_whu \
     --testpath "${MVS_TESTING}" \
     --testlist "${TEST_LIST}" \

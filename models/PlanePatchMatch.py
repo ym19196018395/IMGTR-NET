@@ -608,142 +608,154 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         final_planes = torch.cat([n_new, d_new], dim=-1)
         return final_planes,W_plane_tri_learn
 
-    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs,aligned_midpoints_norm, intrinsics,
-                                H, W,depth_min,depth_max, W_plane_tri=None):
+    def compute_continuity_loss(self, planes, neighbor_indices, edge_probs, aligned_midpoints_norm, intrinsics,
+                                H, W, depth_min, depth_max, W_plane_tri=None, aligned_endpoints_norm=None):
         """
-           基于逆深度的 C0 连续性损失 (防坍缩修正版)
-
-           Args:
-               planes:                [B, N, 4]
-               neighbor_indices:      [B, N, 3] — 每个三角形3条边的对面三角形ID
-               edge_probs:            [B, N, 3] — EdgeHead 输出的断裂概率 (detach 后传入)
-               aligned_midpoints_norm:[B, N, 3, 2] — 每条边的归一化中点坐标
-               intrinsics:            [B, 3, 3]
-               H, W:                  图像尺寸
-           Returns:
-               continuity_loss (scalar), diagnostic_dict
-           """
-        B, N, K, _ = aligned_midpoints_norm.shape  # K=3
+        👑 基于两端点物理连续性约束的 C0 Continuity Loss (Dual-Endpoint Physical Continuity)
+        第一步 (防御性清理):
+            1. 废除求交 .abs(): 保留真实物理有符号深度 Z = -d / (n^T r)，杜绝负深度翻转造成的假性零缝隙。
+               仅保留计算两侧缝隙残差时的绝对值。
+            2. 严格无量纲掠视保护: 采用 c = |n^T r| / (||n|| * ||r||) >= 0.05 门限，全视场尺度自洽。
+            3. 零点保号与先安全求交防 NaN: 显式处理 sign(0)=0，使用安全截断分母求出有限值后再打掩码，杜绝 NaN 扩散。
+            4. 视锥物理有效性: 要求 Z > 0, isfinite, 以及处于 [0.05*d_min, 5.0*d_max] 范围。
+            5. 全维度诊断监控: 统计负深度、掠视角、非有限值过滤量，输出均值、中位数与 90% 缝隙分位数。
+        """
+        B, N, _ = planes.shape
         device = planes.device
+        K = 3
 
-        # ============================================================
-        # Step 1: 像素坐标 + 齐次化
-        # ============================================================
-        px = (aligned_midpoints_norm[..., 0] + 1.0) / 2.0 * (W - 1)  # [B,N,3]
-        py = (aligned_midpoints_norm[..., 1] + 1.0) / 2.0 * (H - 1)  # [B,N,3]
-        ones = torch.ones_like(px)  # [B,N,3]
+        # 辅助函数: 解析求交计算指定 2D 归一化点集处的当前面与邻居面深度
+        def _get_depth_at_norm_pts(pts_norm):
+            # pts_norm: [B, N, 3, 2]
+            px = (pts_norm[..., 0] + 1.0) * 0.5 * (W - 1)
+            py = (pts_norm[..., 1] + 1.0) * 0.5 * (H - 1)
+            ones = torch.ones_like(px)
+            uv_homo = torch.stack([px, py, ones], dim=-1)  # [B, N, 3, 3]
 
-        # [B, N, 3, 3] — 最后一维是 [u, v, 1]
-        uv_homo = torch.stack([px, py, ones], dim=-1)
+            K_inv = torch.inverse(intrinsics)[:, None, None, :, :]  # [B, 1, 1, 3, 3]
+            uv_exp = uv_homo.unsqueeze(-1)  # [B, N, 3, 3, 1]
+            rays = (K_inv @ uv_exp).squeeze(-1)  # [B, N, 3, 3] (保留原射线以求相机坐标系 Z 深度)
+            rays_len = torch.norm(rays, dim=-1, keepdim=True).clamp(min=1e-6)  # [B, N, 3, 1]
 
-        # ============================================================
-        # Step 2: 正确反投影为射线方向
-        # K_inv: [B,3,3] → [B,1,1,3,3] for broadcasting
-        # ============================================================
-        K_inv = torch.inverse(intrinsics)  # [B,3,3]
-        K_inv_exp = K_inv[:, None, None, :, :]  # [B,1,1,3,3]
-        uv_exp = uv_homo.unsqueeze(-1)  # [B,N,3,3,1]
+            # 1. 当前平面深度
+            n_curr = planes[:, :, :3]  # [B, N, 3]
+            d_curr = planes[:, :, 3:]  # [B, N, 1]
+            n_curr_len = torch.norm(n_curr, dim=-1, keepdim=True).clamp(min=1e-6)  # [B, N, 1]
 
-        # K_inv @ [u,v,1]^T = ray_dir, shape: [B,N,3,3]
-        rays = (K_inv_exp @ uv_exp).squeeze(-1)  # [B,N,3,3]
+            denom_curr = (n_curr.unsqueeze(2) * rays).sum(dim=-1)  # [B, N, 3]
+            # 严格无量纲视线-平面夹角判定: c = |n^T r| / (||n|| * ||r||)
+            cos_curr = denom_curr.abs() / (n_curr_len.unsqueeze(2).squeeze(-1) * rays_len.squeeze(-1))  # [B, N, 3]
 
-        # ============================================================
-        # Step 3: 当前平面在中点的深度
-        # planes: [B,N,4] → n:[B,N,3], d:[B,N,1]
-        # ============================================================
-        n_curr = planes[:, :, :3]  # [B,N,3]
-        d_curr = planes[:, :, 3:]  # [B,N,1]
+            # 零点保号与安全截断防 NaN (先求出有限值，再打掩码，杜绝 NaN * 0 污染)
+            sign_curr = torch.sign(denom_curr)
+            sign_curr = torch.where(sign_curr == 0.0, torch.ones_like(sign_curr), sign_curr)
+            denom_curr_safe = torch.where(denom_curr.abs() < 1e-4, sign_curr * 1e-4, denom_curr)
+            d_curr_pt = -d_curr / denom_curr_safe  # [B, N, 3] 真实有符号物理深度
 
-        # [B,N,1,3] × [B,N,3,3] → dot product → [B,N,3]
-        n_curr_exp = n_curr.unsqueeze(2)  # [B,N,1,3]
-        denom_curr = (n_curr_exp * rays).sum(dim=-1)  # [B,N,3]
-        denom_curr = torch.where(torch.abs(denom_curr) < 1e-6, torch.tensor(1e-6, device=device), denom_curr)
-        depth_curr = -d_curr / denom_curr  # [B,N,3]
+            # 2. 邻居平面深度 (严格 detach 阻断反向梯度)
+            batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, K)
+            neigh_planes = planes[batch_idx, neighbor_indices].detach()  # [B, N, 3, 4]
+            n_neigh = neigh_planes[..., :3]  # [B, N, 3, 3]
+            d_neigh = neigh_planes[..., 3:]  # [B, N, 3, 1]
+            n_neigh_len = torch.norm(n_neigh, dim=-1, keepdim=True).clamp(min=1e-6)  # [B, N, 3, 1]
 
-        # ============================================================
-        # Step 4: 邻居平面深度 (完全 detach，作为 target)
-        # ============================================================
-        batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, K)
-        # neighbor_planes: [B,N,3,4]
-        neighbor_planes = planes[batch_idx, neighbor_indices].detach()
+            denom_neigh = (n_neigh * rays).sum(dim=-1, keepdim=True)  # [B, N, 3, 1]
+            cos_neigh = (denom_neigh.abs() / (n_neigh_len * rays_len)).squeeze(-1)  # [B, N, 3]
 
-        n_neigh = neighbor_planes[..., :3]  # [B,N,3,3]
-        d_neigh = neighbor_planes[..., 3:]  # [B,N,3,1]
+            sign_neigh = torch.sign(denom_neigh)
+            sign_neigh = torch.where(sign_neigh == 0.0, torch.ones_like(sign_neigh), sign_neigh)
+            denom_neigh_safe = torch.where(denom_neigh.abs() < 1e-4, sign_neigh * 1e-4, denom_neigh)
+            d_neigh_pt = (-d_neigh / denom_neigh_safe).squeeze(-1)  # [B, N, 3] 真实有符号物理深度
 
-        denom_neigh = (n_neigh * rays).sum(dim=-1, keepdim=True)  # [B,N,3,1]
-        denom_neigh = torch.where(torch.abs(denom_neigh) < 1e-6, torch.tensor(1e-6, device=device), denom_neigh)
-        depth_neigh = (-d_neigh / denom_neigh).squeeze(-1)  # [B,N,3]
+            # 3. 严格视锥与几何有效性检查
+            is_finite = torch.isfinite(d_curr_pt) & torch.isfinite(d_neigh_pt)
+            is_positive = (d_curr_pt > 0.0) & (d_neigh_pt > 0.0)
+            is_range = (d_curr_pt >= 0.05 * depth_min) & (d_curr_pt <= 5.0 * depth_max) & \
+                       (d_neigh_pt >= 0.05 * depth_min) & (d_neigh_pt <= 5.0 * depth_max)
+            is_non_grazing = (cos_curr >= 0.05) & (cos_neigh >= 0.05)
 
-        # ============================================================
-        # Step 5: 深度范围保护 + 逆深度
-        # ============================================================
-        # depth_curr = depth_curr.clamp(min=depth_min, max=depth_max)
-        # depth_neigh = depth_neigh.clamp(min=depth_min, max=depth_max)
-        depth_curr = torch.abs(depth_curr)
-        depth_neigh = torch.abs(depth_neigh)
+            valid_pt = is_finite & is_positive & is_range & is_non_grazing
 
-        inv_curr = 1.0 / depth_curr  # [B,N,3]
-        inv_neigh = 1.0 / depth_neigh  # [B,N,3]
+            # 诊断过滤计数
+            stats = {
+                'neg': (~is_positive).sum(),
+                'grazing': (~is_non_grazing).sum(),
+                'nonfinite': (~is_finite).sum(),
+                'range': (~is_range).sum()
+            }
 
-        # ============================================================
-        # Step 6: 尺度不变的相对深度误差 (Relative Depth Error)
-        # 核心：彻底解决深远场景下的逆深度数值湮灭问题
-        # ============================================================
-        depth_diff = torch.abs(depth_curr - depth_neigh)
-        depth_sum = depth_curr + depth_neigh + 1e-6
+            return d_curr_pt, d_neigh_pt, valid_pt, stats
 
-        # relative_error 范围永远在 [0, 1) 之间
-        relative_error = depth_diff / depth_sum  # [B, N, 3]
+        # 物理平滑 L1 损失 (Huber Loss, beta=0.05m=50mm)
+        def _smooth_l1(diff, beta=0.05):
+            return torch.where(diff < beta, 0.5 * (diff ** 2) / beta, diff - 0.5 * beta)
 
-        # ============================================================
-        # Step 7: Edge 门控
-        # 关键修正：
-        #   (a) edge_probs 必须在调用前已 detach，不参与本损失的梯度
-        #   (b) 用 (1 - prob) 而非 exp(-prob)，门控范围更清晰 [0,1]
-        #   (c) 自环边（边界，idx==自身）权重强制为 0
-        # ============================================================
-        gate = (1.0 - edge_probs)  # [B,N,3], edge_probs 应在外部 detach 传入
+        if aligned_endpoints_norm is not None and aligned_endpoints_norm.shape[-2] == 2:
+            # === 两端点物理连续性评估 ===
+            pts_ep0 = aligned_endpoints_norm[..., 0, :]  # [B, N, 3, 2]
+            pts_ep1 = aligned_endpoints_norm[..., 1, :]  # [B, N, 3, 2]
 
-        # 自环边不施加连续性惩罚（边界天然不连续）
+            d_curr_0, d_neigh_0, valid_0, stats_0 = _get_depth_at_norm_pts(pts_ep0)
+            d_curr_1, d_neigh_1, valid_1, stats_1 = _get_depth_at_norm_pts(pts_ep1)
+
+            # 保留两侧缝隙的绝对值
+            gap_0 = torch.abs(d_curr_0 - d_neigh_0)
+            gap_1 = torch.abs(d_curr_1 - d_neigh_1)
+
+            err_0 = _smooth_l1(gap_0, beta=0.05)
+            err_1 = _smooth_l1(gap_1, beta=0.05)
+            edge_error = 0.5 * (err_0 + err_1)  # [B, N, 3]
+
+            # 双端点均需满足物理有效性
+            valid_depth = valid_0 & valid_1
+            gap_mean_val = 0.5 * (gap_0 + gap_1)
+            stats = {k: stats_0[k] + stats_1[k] for k in stats_0}
+        else:
+            # === 回退单中点评估 ===
+            d_curr_m, d_neigh_m, valid_m, stats = _get_depth_at_norm_pts(aligned_midpoints_norm)
+            gap_m = torch.abs(d_curr_m - d_neigh_m)
+            edge_error = _smooth_l1(gap_m, beta=0.05)
+            valid_depth = valid_m
+            gap_mean_val = gap_m
+
+        # 物理边界门控 (EdgeHead 输出断裂概率高时允许断开)
+        gate = (1.0 - edge_probs) * valid_depth.float()
         is_self_loop = (neighbor_indices == torch.arange(N, device=device)[None, :, None])
         gate = gate.masked_fill(is_self_loop, 0.0)
 
-        # ============================================================
-        # Step 8: 聚合 —— 避免空三角形导致除零
-        # ============================================================
-        # 赋予一个合理的 loss 权重系数（建议 10.0）
-        # 这样算出来的 relative_error (一般在 0.01~0.1 级别)
-        # 乘上 10 之后，能落在 0.1~1.0 之间，与 depth_loss 匹配
-        continuity_scale = 10.0
-
-        # 🪐 引入置信度引导的动态连续性增强 (P0 修复量纲版)
+        # 普适连续性 + 平面共面强化权重 (第一阶段保留稳定权重结构)
         if W_plane_tri is not None:
-            # 直接使用原生未极化置信度
-            W_plane_pure = W_plane_tri.squeeze(-1).detach()
-            W_i = W_plane_pure.unsqueeze(2)
-            batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
-            W_j = W_plane_pure[batch_idx, neighbor_indices]
-            # 采用 min 门控，只有双侧都是高置信度时才实施强连续性约束
-            W_edge_plane = torch.min(W_i, W_j)
-            plane_boost_ratio = 2.0
-            dynamic_scale = continuity_scale * (1.0 + plane_boost_ratio * W_edge_plane)
+            W_pure = W_plane_tri.squeeze(-1).detach()
+            W_i = W_pure.unsqueeze(2)
+            batch_idx = torch.arange(B, device=device)[:, None, None].expand(B, N, K)
+            W_j = W_pure[batch_idx, neighbor_indices]
+            # 基准 1.0 (曲面保真防碎)，高置信度双侧共面最高强化至 2.0
+            planar_weight = 1.0 + torch.min(W_i, W_j)
         else:
-            dynamic_scale = continuity_scale
+            planar_weight = 1.0
 
-        weighted_error = relative_error * gate * dynamic_scale
-
-        # 🚨 P0 核心修复：分母只由 gate 决定，去掉 dynamic_scale，使 scale 真正生效而不被稀释！
         weight_sum = gate.sum().clamp(min=1.0)
-        continuity_loss = weighted_error.sum() / weight_sum
+        continuity_loss = (edge_error * gate * planar_weight).sum() / weight_sum
 
         with torch.no_grad():
-            print(f"[PLANE DIVERSITY]"
-                  f" cont_loss_val={continuity_loss:.6f}"  # 法向量方差，如果接近0则全相同
-                  f" rel_error_mean={relative_error.mean():.6f}"  # 偏移量方差
-                  f" gate_mean={gate.mean():.6f}"
-                  f" weight_sum={weight_sum:.6f}"
-                  f" depth_curr_mean={depth_curr.mean():.4f}"
-                  f" depth_neigh_mean={depth_neigh.mean():.4f}")
+            masked_gap = gap_mean_val[gate > 0.5]
+            if masked_gap.numel() > 0:
+                mean_gap_mm = masked_gap.mean().item() * 1000.0
+                median_gap_mm = masked_gap.median().item() * 1000.0
+                p90_gap_mm = torch.quantile(masked_gap, 0.90).item() * 1000.0
+            else:
+                mean_gap_mm, median_gap_mm, p90_gap_mm = 0.0, 0.0, 0.0
+
+            neg_cnt = stats['neg'].item()
+            grazing_cnt = stats['grazing'].item()
+            nonfinite_cnt = stats['nonfinite'].item()
+            range_cnt = stats['range'].item()
+
+            print(f"[DUAL-ENDPOINT CONTINUITY]"
+                  f" loss={continuity_loss.item():.5f}"
+                  f" gap(mean={mean_gap_mm:.1f}mm, med={median_gap_mm:.1f}mm, p90={p90_gap_mm:.1f}mm)"
+                  f" valid_edges={int(weight_sum.item())}"
+                  f" filtered[neg={neg_cnt}, grazing={grazing_cnt}, nonfinite={nonfinite_cnt}, range={range_cnt}]")
 
         return continuity_loss, 0.0
 
@@ -1351,6 +1363,8 @@ class PlanePatchMatchModule(nn.Module):
 
         # 初始化上一轮代价缓存 (第一轮没有历史，设为 None)
         prev_costs = None
+        aligned_midpoints_norm = None
+        aligned_endpoints_norm = None
         # ==========================================
         # 5. 端到端神经融合传播 (Neural Soft Propagation)
         # ==========================================
@@ -1480,7 +1494,8 @@ class PlanePatchMatchModule(nn.Module):
                 intrinsics=ref_intrinsics,
                 H=H, W=W,
                 depth_min=min(depth_min), depth_max=max(depth_max),
-                W_plane_tri=W_plane_tri.detach()) # 🚨 传入原生未极化的 W_plane_tri
+                W_plane_tri=W_plane_tri.detach(),
+                aligned_endpoints_norm=aligned_endpoints_norm) # 🚨 传入双端点归一化坐标以执行严密线段物理咬合
 
         # 计算光滑性损失
         smoothness_loss = 0.0
