@@ -148,10 +148,10 @@ def compute_gt_planar_soft_confidence(gt_depth_s0, tri_id_s0, intrinsics_s0, sig
 
 def main():
     parser = argparse.ArgumentParser(description="WHU MVS dataset offline preprocessing script")
-    parser.add_argument("--datapath", type=str, default=r"E:\RemoteCodeEx\Datas\WHU_MVS_dataset", help="Dataset path")
-    parser.add_argument("--listfile", type=str, default=r"lists\whu\train.txt", help="List of scans")
-    parser.add_argument("--mode", type=str, default="train", help="Mode: train/val")
-    parser.add_argument("--device", type=str, default="cuda:0", help="GPU device ID")
+    parser.add_argument("--datapath", type=str, default=r"/home/ym/Experiment/Datas/WHU_MVS_dataset/", help="Dataset path")
+    parser.add_argument("--listfile", type=str, default=r"lists/whu/newtest.txt", help="List of scans")
+    parser.add_argument("--mode", type=str, default="test", help="Mode: train/val")
+    parser.add_argument("--device", type=str, default="cuda:1", help="GPU device ID")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
