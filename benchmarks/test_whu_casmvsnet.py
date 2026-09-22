@@ -7,10 +7,11 @@ import math
 import cv2
 import numpy as np
 
-# 确保项目根目录在 sys.path 中，以便无缝导入 datasets, utils 等模块
+# 确保项目根目录强制位于 sys.path[0]，杜绝任何外部 baseline 仓库的 datasets 等同名包产生遮蔽
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+while PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 
 # 控制 GPU ID：优先使用外部环境变量 GPU_ID，其次 CUDA_VISIBLE_DEVICES，默认 '0'
 _gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
@@ -235,11 +236,20 @@ class CasMVSNetWrapper(nn.Module):
             depth_interval=depth_interval
         )
 
-        # 6. 提取最高分辨率 (level 0) 预测深度图 (以绝对物理米 meters 为单位)
-        depth_pred = outputs["depth_0"]  # [B, H_pad, W_pad]
+        # 6. 提取最高分辨率 (level 0 / Stage 0) 与半分辨率 (level 1 / Stage 1) 预测深度图 (以绝对物理米 meters 为单位)
+        depth_pred_s0 = outputs["depth_0"]  # [B, H_pad, W_pad]
         if pad_h > 0 or pad_w > 0:
-            depth_pred = depth_pred[:, :H, :W]
-        depth_pred = depth_pred.unsqueeze(1)  # [B, 1, H, W]
+            depth_pred_s0 = depth_pred_s0[:, :H, :W]
+        depth_pred_s0 = depth_pred_s0.unsqueeze(1)  # [B, 1, H, W]
+
+        depth_pred_s1 = None
+        if "depth_1" in outputs:
+            d1 = outputs["depth_1"]
+            if pad_h > 0 or pad_w > 0:
+                h_1 = H // 2
+                w_1 = W // 2
+                d1 = d1[:, :h_1, :w_1]
+            depth_pred_s1 = d1.unsqueeze(1)  # [B, 1, H//2, W//2]
 
         # 提取全分辨率置信度
         confidence = None
@@ -249,7 +259,7 @@ class CasMVSNetWrapper(nn.Module):
                 conf = conf[:, :H, :W]
             confidence = conf.unsqueeze(1)
 
-        return depth_pred, confidence
+        return depth_pred_s0, depth_pred_s1, confidence
 
 
 def safe_mae(depth_est, depth_gt, mask):
@@ -332,20 +342,99 @@ def main():
                 print(f"[Auto-Detect] 自动探测并挂载 CasMVSNet 源码路径: {casmvsnet_root}")
                 break
 
-    if casmvsnet_root and os.path.isdir(casmvsnet_root):
-        if casmvsnet_root not in sys.path:
-            sys.path.insert(0, casmvsnet_root)
-        print(f"[Import] 已成功挂载 CasMVSNet 代码路径: {casmvsnet_root}")
-    else:
-        print(f"[Warning] 未指定或未找到 --casmvsnet_code_dir: {casmvsnet_root}，尝试从系统环境导入...")
+    # 动态安全挂载外部 CasMVSNet 的 models.mvsnet，杜绝与主仓 models 命名空间冲突
+    old_models = sys.modules.pop('models', None)
+    old_models_sub = {k: sys.modules.pop(k) for k in list(sys.modules.keys()) if k.startswith('models.')}
+    if casmvsnet_root and casmvsnet_root not in sys.path:
+        sys.path.insert(0, casmvsnet_root)
 
     try:
         from models.mvsnet import CascadeMVSNet
+        from models.modules import homo_warp, depth_regression
     except ImportError as e:
         raise ImportError(
             f"🚨 无法导入 CascadeMVSNet 模型！请确认 --casmvsnet_code_dir 参数指向正确的 CasMVSNet 源码目录。\n"
             f"原始错误: {e}"
         )
+    finally:
+        if casmvsnet_root and casmvsnet_root in sys.path:
+            sys.path.remove(casmvsnet_root)
+        if old_models is not None:
+            sys.modules['models'] = old_models
+        sys.modules.update(old_models_sub)
+
+    # 动态修复原版 CasMVSNet 在 eval 模式下因 in-place 操作广播张量导致的崩溃问题:
+    # 官方源码: volume_sum = ref_volume (通过 repeat 得到的 expand 视图)
+    # 在 self.training == False 时执行 volume_sum += warped_volume 抛出错误:
+    # RuntimeError: unsupported operation: more than one element of the written-to tensor refers to a single memory location.
+    def patch_casmvsnet_predict_depth():
+        from einops import rearrange, repeat, reduce
+
+        def safe_predict_depth(self, feats, proj_mats, depth_values, cost_reg):
+            B, V, C, H, W = feats.shape
+            D = depth_values.shape[1]
+
+            ref_feats, src_feats = feats[:, 0], feats[:, 1:]
+            src_feats = rearrange(src_feats, 'b vm1 c h w -> vm1 b c h w')
+            proj_mats = rearrange(proj_mats, 'b vm1 x y -> vm1 b x y')
+
+            ref_volume = rearrange(ref_feats, 'b c h w -> b c 1 h w')
+            ref_volume = repeat(ref_volume, 'b c 1 h w -> b c d h w', d=D)
+            if self.G == 1:
+                volume_sum = ref_volume.clone()
+                volume_sq_sum = ref_volume ** 2
+            else:
+                ref_volume = ref_volume.view(B, self.G, C // self.G, *ref_volume.shape[-3:])
+                volume_sum = 0
+            del ref_feats
+
+            for src_feat, proj_mat in zip(src_feats, proj_mats):
+                warped_volume = homo_warp(src_feat, proj_mat, depth_values)
+                warped_volume = warped_volume.to(ref_volume.dtype)
+                if self.G == 1:
+                    volume_sum = volume_sum + warped_volume
+                    volume_sq_sum = volume_sq_sum + warped_volume ** 2
+                else:
+                    warped_volume = warped_volume.view_as(ref_volume)
+                    if self.training:
+                        volume_sum = volume_sum + warped_volume
+                    else:
+                        volume_sum += warped_volume
+                del warped_volume, src_feat, proj_mat
+            del src_feats, proj_mats
+
+            if self.G == 1:
+                volume_variance = volume_sq_sum.div_(V).sub_(volume_sum.div_(V).pow_(2))
+                del volume_sq_sum, volume_sum
+            else:
+                volume_variance = reduce(volume_sum * ref_volume,
+                                         'b g c d h w -> b g d h w', 'mean').div_(V - 1)
+                del volume_sum, ref_volume
+
+            cost_reg = rearrange(cost_reg(volume_variance), 'b 1 d h w -> b d h w')
+            prob_volume = F.softmax(cost_reg, 1)
+            del cost_reg
+            depth = depth_regression(prob_volume, depth_values)
+
+            with torch.no_grad():
+                prob_volume_sum4 = 4 * F.avg_pool3d(F.pad(prob_volume.unsqueeze(1),
+                                                          pad=(0, 0, 0, 0, 1, 2)),
+                                                    (4, 1, 1), stride=1).squeeze(1)
+                depth_index = depth_regression(prob_volume,
+                                               torch.arange(D,
+                                                            device=prob_volume.device,
+                                                            dtype=prob_volume.dtype)
+                                              ).long()
+                depth_index = torch.clamp(depth_index, 0, D - 1)
+                confidence = torch.gather(prob_volume_sum4, 1,
+                                          depth_index.unsqueeze(1)).squeeze(1)
+
+            return depth, confidence
+
+        CascadeMVSNet.predict_depth = safe_predict_depth
+        print("[Compatibility] 已成功挂载 CasMVSNet eval 模式内存安全补丁！")
+
+    patch_casmvsnet_predict_depth()
 
     # 2. 构建测试数据集与 DataLoader
     MVSDataset = find_dataset_def(args.dataset)
@@ -389,10 +478,13 @@ def main():
             sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
             # 前向推理
-            depth_est, confidence = model(sample_cuda, n_views=args.n_views)  # [B, 1, H, W]
+            depth_est_s0, depth_est_s1, confidence = model(sample_cuda, n_views=args.n_views)
 
-            depth_gt = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
-            mask_gt = (sample_cuda["mask"]["stage_0"] > 0.5)
+            depth_gt_s0 = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
+            mask_gt_s0 = (sample_cuda["mask"]["stage_0"] > 0.5)
+
+            depth_gt_s1 = sample_cuda["depth"]["stage_1"]  # [B, 1, H//2, W//2]
+            mask_gt_s1 = (sample_cuda["mask"]["stage_1"] > 0.5)
 
             for b in range(B):
                 meta_idx = batch_idx * args.batch_size + b
@@ -401,38 +493,63 @@ def main():
                 if scan not in per_scan_records:
                     per_scan_records[scan] = []
 
-                m_b = mask_gt[b:b+1]
-                d_est_b = depth_est[b:b+1]
-                d_gt_b = depth_gt[b:b+1]
+                m_b_s0 = mask_gt_s0[b:b+1]
+                d_est_b_s0 = depth_est_s0[b:b+1]
+                d_gt_b_s0 = depth_gt_s0[b:b+1]
 
-                # 读取同源平面切片掩码 (由本项目提前导出的同源 stage0_planar_mask_{file_id}.png)
-                planar_mask_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
-                has_planar_mask = False
-                if os.path.exists(planar_mask_file):
-                    m_planar_np = cv2.imread(planar_mask_file, cv2.IMREAD_GRAYSCALE)
-                    if m_planar_np is not None:
-                        m_planar_t = (torch.from_numpy(m_planar_np).to(device) > 128).unsqueeze(0).unsqueeze(0)
-                        m_planar_b = m_b & m_planar_t
-                        m_curved_b = m_b & (~m_planar_t)
-                        has_planar_mask = True
+                # 读取同源平面切片掩码 (由本项目提前导出的同源 stage0_planar_mask_{file_id}.png 与 stage1_planar_mask_{file_id}.png)
+                planar_mask_s0_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
+                has_planar_mask_s0 = False
+                if os.path.exists(planar_mask_s0_file):
+                    m_planar_np_s0 = cv2.imread(planar_mask_s0_file, cv2.IMREAD_GRAYSCALE)
+                    if m_planar_np_s0 is not None:
+                        m_planar_t_s0 = (torch.from_numpy(m_planar_np_s0).to(device) > 128).unsqueeze(0).unsqueeze(0)
+                        m_planar_b_s0 = m_b_s0 & m_planar_t_s0
+                        m_curved_b_s0 = m_b_s0 & (~m_planar_t_s0)
+                        has_planar_mask_s0 = True
 
-                if not has_planar_mask:
-                    m_planar_b = torch.zeros_like(m_b)
-                    m_curved_b = m_b
+                if not has_planar_mask_s0:
+                    m_planar_b_s0 = torch.zeros_like(m_b_s0)
+                    m_curved_b_s0 = m_b_s0
 
-                # 计算绝对深度误差与阈值比例 (米)
-                s0_mae = safe_mae(d_est_b, d_gt_b, m_b)
-                s0_planar_mae = safe_mae(d_est_b, d_gt_b, m_planar_b) if has_planar_mask else float('nan')
-                s0_curved_mae = safe_mae(d_est_b, d_gt_b, m_curved_b) if has_planar_mask else float('nan')
+                # 计算 Stage 0 绝对深度误差与阈值比例 (米)
+                s0_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_b_s0)
+                s0_planar_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_planar_b_s0) if has_planar_mask_s0 else float('nan')
+                s0_curved_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_curved_b_s0) if has_planar_mask_s0 else float('nan')
 
-                t1_err = safe_thres_error(d_est_b, d_gt_b, m_b, 1.0)
-                t2_err = safe_thres_error(d_est_b, d_gt_b, m_b, 2.0)
-                t4_err = safe_thres_error(d_est_b, d_gt_b, m_b, 4.0)
-                t8_err = safe_thres_error(d_est_b, d_gt_b, m_b, 8.0)
+                t1_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 1.0)
+                t2_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 2.0)
+                t4_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 4.0)
+                t8_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 8.0)
 
-                valid_cnt = m_b.sum().item()
-                planar_cnt = m_planar_b.sum().item()
-                planar_ratio = (planar_cnt / valid_cnt * 100.0) if valid_cnt > 0 else 0.0
+                valid_cnt_s0 = m_b_s0.sum().item()
+                planar_cnt_s0 = m_planar_b_s0.sum().item()
+                planar_ratio_s0 = (planar_cnt_s0 / valid_cnt_s0 * 100.0) if valid_cnt_s0 > 0 else 0.0
+
+                # --- 计算 Stage 1 平面与全局指标 ---
+                s1_mae = float('nan')
+                s1_planar_mae = float('nan')
+                planar_ratio_s1 = 0.0
+                if depth_est_s1 is not None:
+                    m_b_s1 = mask_gt_s1[b:b+1]
+                    d_est_b_s1 = depth_est_s1[b:b+1]
+                    d_gt_b_s1 = depth_gt_s1[b:b+1]
+
+                    planar_mask_s1_file = os.path.join(args.mask_dir, scan, "masks", f"stage1_planar_mask_{file_id}.png")
+                    has_planar_mask_s1 = False
+                    if os.path.exists(planar_mask_s1_file):
+                        m_planar_np_s1 = cv2.imread(planar_mask_s1_file, cv2.IMREAD_GRAYSCALE)
+                        if m_planar_np_s1 is not None:
+                            m_planar_t_s1 = (torch.from_numpy(m_planar_np_s1).to(device) > 128).unsqueeze(0).unsqueeze(0)
+                            m_planar_b_s1 = m_b_s1 & m_planar_t_s1
+                            has_planar_mask_s1 = True
+
+                    s1_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_b_s1)
+                    if has_planar_mask_s1:
+                        s1_planar_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_planar_b_s1)
+                        valid_cnt_s1 = m_b_s1.sum().item()
+                        planar_cnt_s1 = m_planar_b_s1.sum().item()
+                        planar_ratio_s1 = (planar_cnt_s1 / valid_cnt_s1 * 100.0) if valid_cnt_s1 > 0 else 0.0
 
                 record = {
                     "scan": scan,
@@ -444,9 +561,12 @@ def main():
                     "stage0_thres2mm_err": t2_err,
                     "stage0_thres4mm_err": t4_err,
                     "stage0_thres8mm_err": t8_err,
-                    "s0_valid_pixels": valid_cnt,
-                    "s0_planar_pixels": planar_cnt,
-                    "s0_planar_ratio_pct": planar_ratio,
+                    "s0_valid_pixels": valid_cnt_s0,
+                    "s0_planar_pixels": planar_cnt_s0,
+                    "s0_planar_ratio_pct": planar_ratio_s0,
+                    "stage1_mae": s1_mae,
+                    "stage1_planar_mae": s1_planar_mae,
+                    "s1_planar_ratio_pct": planar_ratio_s1,
                 }
                 per_scan_records[scan].append(record)
                 all_sample_records.append(record)
@@ -455,16 +575,17 @@ def main():
                 if args.save_depth:
                     depth_save_dir = os.path.join(args.outdir, scan, "depths")
                     os.makedirs(depth_save_dir, exist_ok=True)
-                    d_s0_np = d_est_b[0, 0].cpu().numpy()
+                    d_s0_np = d_est_b_s0[0, 0].cpu().numpy()
                     save_pfm(os.path.join(depth_save_dir, f"casmvsnet_depth_{file_id}.pfm"), d_s0_np)
                     depth_png_s0 = np.clip(d_s0_np * 64.0, 0, 65535).astype(np.uint16)
                     cv2.imwrite(os.path.join(depth_save_dir, f"casmvsnet_depth_{file_id}.png"), depth_png_s0)
 
             cur_idx = batch_idx + 1
             step_time = time.time() - step_start
-            planar_str = f"{s0_planar_mae:.4f}m" if not math.isnan(s0_planar_mae) else "N/A"
+            s0_planar_str = f"{s0_planar_mae:.4f}m" if not math.isnan(s0_planar_mae) else "N/A"
+            s1_planar_str = f"{s1_planar_mae:.4f}m" if not math.isnan(s1_planar_mae) else "N/A"
             print(f"[{cur_idx:03d}/{len(test_loader):03d}] Scan: {scan} | Img: {file_id} | "
-                  f"CasMVSNet MAE: {s0_mae:.4f}m | Planar MAE: {planar_str} | Time: {step_time:.2f}s")
+                  f"CasMVSNet S0 MAE: {s0_mae:.4f}m | S0 Planar: {s0_planar_str} | S1 Planar: {s1_planar_str} | Time: {step_time:.2f}s")
 
     eval_duration = time.time() - start_eval_time
     print("\n" + "=" * 85)
@@ -488,6 +609,9 @@ def main():
             "stage0_thres4mm_err": compute_mean_ignore_nan(recs, "stage0_thres4mm_err"),
             "stage0_thres8mm_err": compute_mean_ignore_nan(recs, "stage0_thres8mm_err"),
             "s0_planar_ratio_pct": compute_mean_ignore_nan(recs, "s0_planar_ratio_pct"),
+            "stage1_mae": compute_mean_ignore_nan(recs, "stage1_mae"),
+            "stage1_planar_mae": compute_mean_ignore_nan(recs, "stage1_planar_mae"),
+            "s1_planar_ratio_pct": compute_mean_ignore_nan(recs, "s1_planar_ratio_pct"),
         }
 
     overall_summary = {
@@ -500,6 +624,9 @@ def main():
         "stage0_thres4mm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres4mm_err"),
         "stage0_thres8mm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres8mm_err"),
         "s0_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s0_planar_ratio_pct"),
+        "stage1_mae": compute_mean_ignore_nan(all_sample_records, "stage1_mae"),
+        "stage1_planar_mae": compute_mean_ignore_nan(all_sample_records, "stage1_planar_mae"),
+        "s1_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s1_planar_ratio_pct"),
     }
 
     report_lines = []
@@ -525,17 +652,21 @@ def main():
     )
 
     report_lines.append("\n## Table 2: 细分区域精度与平面特性分析 (Regional & Planar Analysis)")
-    report_lines.append("| 模型 / Scan | S0 全局 MAE (m) | S0 平面区 MAE (m) | S0 曲面/非平面 MAE (m) | 平面像素占比 (%) |")
-    report_lines.append("| :--- | :---: | :---: | :---: | :---: |")
+    report_lines.append("| 模型 / Scan | S0 全局 MAE (m) | S0 平面区 MAE (m) | S1 全局 MAE (m) | S1 平面区 MAE (m) | S0 曲面/非平面 MAE (m) | S0 平面占比 (%) | S1 平面占比 (%) |")
+    report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for scan, s in summary_by_scan.items():
-        p_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
+        p0_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
+        p1_str = f"{s['stage1_planar_mae']:.4f}" if not math.isnan(s['stage1_planar_mae']) else "N/A"
+        s1_m_str = f"{s['stage1_mae']:.4f}" if not math.isnan(s['stage1_mae']) else "N/A"
         c_str = f"{s['stage0_curved_mae']:.4f}" if not math.isnan(s['stage0_curved_mae']) else "N/A"
-        report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% |")
+        report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p0_str} | {s1_m_str} | {p1_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% | {s['s1_planar_ratio_pct']:.1f}% |")
 
-    op_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
+    op0_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
+    op1_str = f"{overall_summary['stage1_planar_mae']:.4f}" if not math.isnan(overall_summary['stage1_planar_mae']) else "N/A"
+    os1_m_str = f"{overall_summary['stage1_mae']:.4f}" if not math.isnan(overall_summary['stage1_mae']) else "N/A"
     oc_str = f"{overall_summary['stage0_curved_mae']:.4f}" if not math.isnan(overall_summary['stage0_curved_mae']) else "N/A"
     report_lines.append(
-        f"| **CasMVSNet (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** |"
+        f"| **CasMVSNet (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op0_str}** | **{os1_m_str}** | **{op1_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** | **{overall_summary['s1_planar_ratio_pct']:.1f}%** |"
     )
 
     report_text = "\n".join(report_lines)

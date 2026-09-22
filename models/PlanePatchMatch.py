@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from mpmath import eye
 
 from models.edge_head import EdgeHead
-from utils import convert_edge_features_to_tri_format, compute_cross_check_score_gpu
+from utils import convert_edge_features_to_tri_format, compute_cross_check_score_gpu, extract_5d_multiview_evidence
 
 
 class PlaneHypothesisGenerator(nn.Module):
@@ -114,10 +114,10 @@ class PlaneHomographyWarper(nn.Module):
 
         return H_mat.view(B, H_img, W_img, 3, 3)
 
-    def warp_feature(self, src_feature, H_mat):
+    def warp_feature(self, src_feature, H_mat, return_fov_mask=False):
         """
         利用 H 矩阵对 Src 特征进行 grid_sample
-        优化点：增加了对相机背面点 (w < 0) 的处理
+        优化点：增加了对相机背面点 (w < 0) 的处理，并支持返回视场有效性掩码 fov_mask
         """
         B, C, H, W = src_feature.shape
         device = src_feature.device
@@ -165,7 +165,17 @@ class PlaneHomographyWarper(nn.Module):
         # 5. 采样
         warped_feat = F.grid_sample(src_feature, uv_grid, align_corners=True, padding_mode='zeros')
 
+        if return_fov_mask:
+            # 视场有效性判定：点在相机前方且落在源图画幅内部 [-1, 1]
+            fov_mask = (
+                valid_mask &
+                (uv_grid[..., 0] >= -1.0) & (uv_grid[..., 0] <= 1.0) &
+                (uv_grid[..., 1] >= -1.0) & (uv_grid[..., 1] <= 1.0)
+            ).unsqueeze(1).float()  # [B, 1, H, W]
+            return warped_feat, fov_mask
+
         return warped_feat
+
 
 class DoubleDecoupledTrianglePropagator(nn.Module):
     def __init__(self, plane_dim=4, hidden_dim=64,feature_dim=16):
@@ -196,14 +206,15 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         )
 
         # 3. 🎯 自身权重门控解耦拆分为双通道，彻底隔离 Z 与 N 的语义干扰
-        # self_gate_input = hidden + current_costs = H + 1
+        # 👑 实验 C: 纯 5D 证据流替代直接 cost 输入 (剔除标量 current_costs)
+        # self_gate_input = hidden + self_evidence = H + 5
         self.self_gate_net_z = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim // 2),
+            nn.Linear(hidden_dim + 5, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
         self.self_gate_net_n = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim // 2),
+            nn.Linear(hidden_dim + 5, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -215,17 +226,18 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         nn.init.zeros_(self.self_gate_net_n[2].weight)
 
         # 4. 深度传播专属门控 (GNN_Z)
-        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
+        # 👑 实验 C: 输入去除 neighbor_costs，由 5D 证据全面接管
+        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + feat_dist(1) + self_W(1) + neighbor_W(1) + self_evidence(5) + neighbor_evidence(5) = 2H + 18
         self.gate_net_z = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 9, hidden_dim),
+            nn.Linear(hidden_dim * 2 + 18, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
 
         # 5. 法向传播专属门控 (GNN_N)
-        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + neighbor_cost(1) + feat_dist(1) + self_W(1) + neighbor_W(1) = 2H + 9
+        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + feat_dist(1) + self_W(1) + neighbor_W(1) + self_evidence(5) + neighbor_evidence(5) = 2H + 18
         self.gate_net_n = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 9, hidden_dim),
+            nn.Linear(hidden_dim * 2 + 18, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1)
         )
@@ -271,7 +283,7 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
                 edge_probs, rays_centroids, depth_max,prev_costs,W_plane_tri,
                 pixel_counts=None, ref_feature=None, centroids_norm=None, midpoints_norm=None, temperature=0.2, 
                 W_raw_anchor=None, cross_costs=None, normalized_slope=None, surface_var=None,
-                penalty_cc=None):
+                penalty_cc=None, self_evidence=None, neighbor_evidence=None):
         """
         前向双解耦核心计算图流动
         Args:
@@ -425,8 +437,10 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         # =====================================================================
         # 4. 双重完全解耦门控计算 (自卫分配与邻居流形熔断)
         # =====================================================================
-        # self_gate_input 只用原始隐特征和代价，不加 max_intra_feat_var（内部特征跳变是置信度信号，不是传播 logit 信号）
-        self_gate_input = torch.cat([init_hidden, current_costs], dim=-1)
+        # 自身门控输入: init_hidden (H) + self_evidence (5) = H + 5 (👑 实验 C: 彻底剔除标量 current_costs)
+        if self_evidence is None:
+            self_evidence = torch.zeros((B, N, 5), device=device, dtype=init_hidden.dtype)
+        self_gate_input = torch.cat([init_hidden, self_evidence], dim=-1)
 
         # 4.a 拆分为两个独立的自身 Logit 预测通路
         self_weight_logits_z = self.self_gate_net_z(self_gate_input)  # [B, N, 1]
@@ -444,23 +458,29 @@ class DoubleDecoupledTrianglePropagator(nn.Module):
         W_self_expand = W_plane_tri_reg.unsqueeze(2).expand(-1, -1, 3, -1)
         neighbor_W_conf = W_plane_tri_reg[batch_idx, neighbor_indices]
 
+        # 准备自身与邻居 5D 证据输入
+        if neighbor_evidence is None:
+            neighbor_evidence = torch.zeros((B, N, 3, 5), device=device, dtype=init_hidden.dtype)
+        self_evidence_expand = self_evidence.unsqueeze(2).expand(-1, -1, 3, -1)  # [B, N, 3, 5]
+
         # 4.b 深度通道邻居 Logits 预测
-        # max_intra_feat_var 不属于传播 logit（物理上无意义），只保留标准特征总线
-        # 形状完全契合 [B, N, 3, 2H + 9]
+        # 👑 实验 C: 剔除标量 neighbor_costs，由 5D 证据全面接管
+        # 输入: self_hidden(H) + neighbor_hidden(H) + plane_diff(4) + edge_prob(1) + feat_dist(1) + self_W(1) + neighbor_W(1) + self_evidence(5) + neighbor_evidence(5) = 2H + 18
         gate_input_z = torch.cat([
             self_hidden_expand, neighbor_hidden,
-            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
-            W_self_expand, neighbor_W_conf
+            plane_diff, edge_probs.unsqueeze(-1), feat_dist,
+            W_self_expand, neighbor_W_conf,
+            self_evidence_expand, neighbor_evidence
         ], dim=-1)
         neighbor_logits_z = self.gate_net_z(gate_input_z)  # [B, N, 3, 1]
 
         # 4.c 🔥 【精准更替：满血版法向门控输入】
-        # 让法向流和深度流享有完全同等的“知情权”，同样通过全模态总线过滤边缘与曲面拉扯
-        # 形状完全契合扩容后的 [B, N, 3, 2H + 10]
+        # 输入维度同样为 2H + 18
         gate_input_n = torch.cat([
             self_hidden_expand, neighbor_hidden,
-            plane_diff, edge_probs.unsqueeze(-1), neighbor_costs, feat_dist,
-            W_self_expand, neighbor_W_conf
+            plane_diff, edge_probs.unsqueeze(-1), feat_dist,
+            W_self_expand, neighbor_W_conf,
+            self_evidence_expand, neighbor_evidence
         ], dim=-1)
         neighbor_logits_n = self.gate_net_n(gate_input_n)  # [B, N, 3, 1]
 
@@ -1276,16 +1296,22 @@ class PlanePatchMatchModule(nn.Module):
         pixel_hypotheses = self.map_tri_to_pixel(hypotheses, tri_id_map, H, W)
 
         # 3.2 运行端到端可微重采样，解算出全假设、全像素的匹配代价特征图 -> [B, H, W, K]
-        pixel_costs, pixel_costs_raw, cost_variance = self.compute_costs(
+        pixel_costs, pixel_costs_raw, cost_variance, init_scores, init_fov_masks = self.compute_costs(
             ref_feature, src_features, ref_proj, src_projs,
             pixel_hypotheses, view_weights=view_weights, ref_intrinsic=ref_intrinsics,
-            is_debug_diag=True
+            is_debug_diag=True, return_evidence_raw=True
         )
         self.pixel_costs_raw = pixel_costs_raw
         self.cost_variance = cost_variance
         
         # 聚合为三角形代价 [B, N_tri, 1]
         tri_costs_volume = self.aggregate_costs_per_triangle(pixel_costs, tri_id_map, max_tri_num)
+
+        # 提取全假设的 5D 多视证据 [B, max_tri_num, K, 5]
+        D_feat = ref_feature.shape[1] // self.G
+        tri_evidence_volume = extract_5d_multiview_evidence(
+            init_scores, init_fov_masks, view_weights, tri_id_map, max_tri_num, D=D_feat
+        )
 
         # 【硬核硬选择】：在假设维度直接取最小光度代价对应的“黄金轨号”索引 -> [B, N_tri]
         best_k = tri_costs_volume.argmin(dim=2)  # [B, N_tri]
@@ -1294,6 +1320,11 @@ class PlanePatchMatchModule(nn.Module):
         current_planes = torch.gather(hypotheses, 2, gather_idx).squeeze(2)  # [B, N_tri, 4]
         # 同步抽取三角形级获胜轨道的自发光度代价缓存 -> [B, N_tri, 1]
         current_costs = torch.gather(tri_costs_volume, 2, best_k.unsqueeze(-1))  # [B, N_tri, 1]
+
+        # 同步抽取获胜轨道的 5D 证据 -> [B, N_tri, 5]
+        self_evidence = torch.gather(
+            tri_evidence_volume, 2, best_k.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 5)
+        ).squeeze(2)
 
         safe_tri_id_map = tri_id_map.long().clamp(min=0, max=max_tri_num - 1)
         batch_lookup = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
@@ -1399,14 +1430,17 @@ class PlanePatchMatchModule(nn.Module):
             
             # 3. 运行端到端光度代价计算 (客场验证) - 🛡️ 必须加上 no_grad 防止 OOM！
             with torch.no_grad():
-                cross_costs_pixel = self.compute_costs(
+                cross_costs_pixel, cross_scores, cross_fov_masks = self.compute_costs(
                     ref_feature, src_features, ref_proj, src_projs,
                     pixel_hypotheses_cross, view_weights=view_weights, ref_intrinsic=ref_intrinsics,
-                    is_debug_diag=False
+                    is_debug_diag=False, return_evidence_raw=True
                 ) # [B, H, W, 3]
             
-            # 4. 聚合并提纯到面片维度 [B, N, 3]
+            # 4. 聚合并提纯到面片维度 [B, N, 3] 与 5D 证据提取 [B, N, 3, 5]
             cross_costs_flat = self.aggregate_costs_per_triangle(cross_costs_pixel, tri_id_map, max_tri_num)
+            neighbor_evidence = extract_5d_multiview_evidence(
+                cross_scores, cross_fov_masks, view_weights, tri_id_map, max_tri_num, D=D_feat
+            )
             # ----------------------------------------------------
 
             # 5.1 ym-modify 传播：全新双解耦网络，完美注入 W_plane_tr，在传播中不断更新w_plane
@@ -1428,7 +1462,9 @@ class PlanePatchMatchModule(nn.Module):
                 cross_costs=cross_costs_flat, # 传入 Cross-Cost
                 normalized_slope=normalized_slope,  # 传入绝对斜率特征 (对抗悬崖错分面)
                 surface_var=surface_var,            # 传入表面粗糙度 (对抗树木与噪声)
-                penalty_cc=penalty_cc               # 传入 Pre-GNN 物理铁闸门控
+                penalty_cc=penalty_cc,              # 传入 Pre-GNN 物理铁闸门控
+                self_evidence=self_evidence.detach(),
+                neighbor_evidence=neighbor_evidence.detach()
             )
 
             # 将本轮的代价封存，作为下一轮的“历史代价”
@@ -1447,20 +1483,24 @@ class PlanePatchMatchModule(nn.Module):
                 H=H, W=W
             )
 
-            # 5.2 重新评估新平面的代价
+            # 5.2 重新评估新平面的代价与 5D 证据
             if iter_idx < self.propagator_iter - 1:  # 💡 性能榨取：最后一轮不需要重复计算代价，直接省掉 33% 采样耗时！
                 new_planes_k1 = new_planes.unsqueeze(2)
                 pixel_hypo = self.map_tri_to_pixel(new_planes_k1, tri_id_map, H, W)
 
                 with torch.no_grad():  # 🛡️ 降下绝对梯度防火墙，封杀可微重采样的非连续毛刺
-                    pixel_costs_new = self.compute_costs(
+                    pixel_costs_new, new_scores, new_fov_masks = self.compute_costs(
                         ref_feature, src_features, ref_proj, src_projs,
                         pixel_hypo,
                         view_weights=view_weights,
                         ref_intrinsic=ref_intrinsics,
-                        is_debug=False
-                    ).detach()
+                        is_debug=False,
+                        return_evidence_raw=True
+                    )
                 current_costs = self.aggregate_costs_per_triangle(pixel_costs_new, tri_id_map, max_tri_num).detach()
+                self_evidence = extract_5d_multiview_evidence(
+                    new_scores, new_fov_masks, view_weights, tri_id_map, max_tri_num, D=D_feat
+                ).squeeze(2).detach()
 
             # 5.3 状态更新，进入下一次迭代
             # 注意：因为是 Learned Propagator，我们直接相信它的更新（像 RNN 一样），而不进行 Argmin 判断
@@ -1626,7 +1666,7 @@ class PlanePatchMatchModule(nn.Module):
         return pixel_hypotheses
 
     def compute_costs(self, ref_feature, src_features, ref_proj, src_projs, current_hypotheses, view_weights,
-                      ref_intrinsic, is_debug=True, is_debug_diag=False):
+                      ref_intrinsic, is_debug=True, is_debug_diag=False, return_evidence_raw=False):
         """
         计算代价体积 (Cost Volume)
         Args:
@@ -1637,6 +1677,7 @@ class PlanePatchMatchModule(nn.Module):
             current_hypotheses: [B, H, W, K, 4] (像素级平面假设)
             view_weights: [B, Nview-1, H, W] (可选)
             ref_intrinsic: [B, 3, 3] (参考图内参 K, 必须提供以计算 Homography)
+            return_evidence_raw: bool, 是否返回逐视角的 view_scores 和 view_fov_masks
         Returns:
             costs: [B, H, W, K]
         """
@@ -1672,6 +1713,7 @@ class PlanePatchMatchModule(nn.Module):
         similarity_sum = 0.0
         weight_sum = 0.0
         view_scores = []
+        view_fov_masks = []
 
         # 遍历所有源视图
         for i, (src_feat, src_proj) in enumerate(zip(src_features, src_projs)):
@@ -1705,7 +1747,11 @@ class PlanePatchMatchModule(nn.Module):
             # --- C. 特征扭曲 (Warping) --- ✅
             # src_feat: [B, C, H, W] -> [B*K, C, H, W]
             src_feat_expand = src_feat.unsqueeze(1).repeat(1, K, 1, 1, 1).view(B * K, C, H, W)
-            warped_src = self.warper.warp_feature(src_feat_expand, H_mats)
+            if return_evidence_raw:
+                warped_src, fov_mask = self.warper.warp_feature(src_feat_expand, H_mats, return_fov_mask=True)
+                view_fov_masks.append(fov_mask)
+            else:
+                warped_src = self.warper.warp_feature(src_feat_expand, H_mats, return_fov_mask=False)
 
             del src_feat_expand, H_mats # 释放显存
 
@@ -1749,8 +1795,6 @@ class PlanePatchMatchModule(nn.Module):
         similarity_fused = similarity_sum / (weight_sum + 1e-6)
 
         # [B*K, 1, H, W]
-        # todo：暂时不用学习型，先用直接型
-        # score_fused = self.similarity_net(similarity_fused)
         score_fused = similarity_fused.mean(dim=1, keepdim=True)
 
         # 转换为 Cost (越小越好)
@@ -1758,6 +1802,19 @@ class PlanePatchMatchModule(nn.Module):
 
         # 还原形状 [B*K, 1, H, W] -> [B, K, H, W] -> [B, H, W, K]
         total_cost = cost_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+        if return_evidence_raw:
+            if is_debug_diag:
+                all_scores = torch.cat(view_scores, dim=1)
+                raw_score = all_scores.mean(dim=1, keepdim=True)
+                raw_cost_fused = -raw_score
+                raw_cost = raw_cost_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+                variance_fused = all_scores.var(dim=1, keepdim=True, unbiased=False)
+                cost_variance = variance_fused.view(B, K, H, W).permute(0, 2, 3, 1)
+
+                return total_cost, raw_cost, cost_variance, view_scores, view_fov_masks
+            return total_cost, view_scores, view_fov_masks
 
         if is_debug_diag:
             # 1. 未加权的平均代价：[B*K, Nview-1, H, W] -> mean -> [B*K, 1, H, W]
@@ -1773,6 +1830,7 @@ class PlanePatchMatchModule(nn.Module):
             return total_cost, raw_cost, cost_variance
 
         return total_cost
+
 
     def aggregate_costs_per_triangle(self, pixel_costs, tri_id_map, max_num_tri):
         """

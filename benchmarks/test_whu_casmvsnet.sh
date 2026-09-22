@@ -43,7 +43,6 @@ fi
 
 if [ -n "${CASMVSNET_DIR}" ] && [ -d "${CASMVSNET_DIR}" ]; then
     echo "  -> 挂载 CasMVSNet 源码目录: ${CASMVSNET_DIR}"
-    export PYTHONPATH="${CASMVSNET_DIR}:${PYTHONPATH}"
 else
     echo "  -> [Warning] 未找到 CasMVSNet 源码目录，请通过环境变量 CASMVSNET_DIR 指定！"
 fi
@@ -53,7 +52,7 @@ fi
 DEFAULT_CKPT=${1:-""}
 if [ -z "${DEFAULT_CKPT}" ]; then
     CKPT_CANDIDATES=(
-        "/home/myao/CasMVSNet_pl-master/ckpts/exp2/_ckpt_epoch_10.ckpt"
+        "checkpoints/casmvsnet_whu_train/model_15.ckpt"
         "/home/ym/Experiment/CasMVSNet_pl-master/ckpts/exp2/_ckpt_epoch_10.ckpt"
         "/home/myao/CasMVSNet_pl-master/ckpts/_ckpt_epoch_10.ckpt"
         "${CASMVSNET_DIR}/ckpts/exp2/_ckpt_epoch_10.ckpt"

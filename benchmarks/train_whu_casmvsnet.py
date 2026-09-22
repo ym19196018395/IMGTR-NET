@@ -6,10 +6,11 @@ import json
 import math
 import numpy as np
 
-# 确保项目根目录在 sys.path 中，以便无缝导入 datasets, utils 等模块
+# 确保项目根目录强制位于 sys.path[0]，杜绝任何外部 baseline 仓库的 datasets 等同名包产生遮蔽
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+while PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 
 # 控制 GPU ID：优先使用外部环境变量 GPU_ID，其次 CUDA_VISIBLE_DEVICES，默认 '0'
 _gpu_choice = os.environ.get('GPU_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
@@ -340,17 +341,96 @@ def main():
                 print(f"[Auto-Detect] 自动探测并挂载 CasMVSNet 源码路径: {casmvsnet_root}")
                 break
 
-    if casmvsnet_root and os.path.isdir(casmvsnet_root):
-        if casmvsnet_root not in sys.path:
-            sys.path.insert(0, casmvsnet_root)
-        print(f"[Import] 已挂载 CasMVSNet 代码路径: {casmvsnet_root}")
-    else:
-        print(f"[Warning] 未指定或未找到 --casmvsnet_code_dir: {casmvsnet_root}")
+    # 动态安全挂载外部 CasMVSNet 的 models.mvsnet，杜绝与主仓 models 命名空间冲突
+    old_models = sys.modules.pop('models', None)
+    old_models_sub = {k: sys.modules.pop(k) for k in list(sys.modules.keys()) if k.startswith('models.')}
+    if casmvsnet_root and casmvsnet_root not in sys.path:
+        sys.path.insert(0, casmvsnet_root)
 
     try:
         from models.mvsnet import CascadeMVSNet
+        from models.modules import homo_warp, depth_regression
     except ImportError as e:
         raise ImportError(f"🚨 无法导入 CascadeMVSNet 核心模块！请检查 --casmvsnet_code_dir。\n错误: {e}")
+    finally:
+        if casmvsnet_root and casmvsnet_root in sys.path:
+            sys.path.remove(casmvsnet_root)
+        if old_models is not None:
+            sys.modules['models'] = old_models
+        sys.modules.update(old_models_sub)
+
+    # 动态修复原版 CasMVSNet 在 eval 模式下因 in-place 操作广播张量导致的崩溃问题:
+    # 官方源码: volume_sum = ref_volume (通过 repeat 得到的 expand 视图)
+    # 在 self.training == False 时执行 volume_sum += warped_volume 抛出错误:
+    # RuntimeError: unsupported operation: more than one element of the written-to tensor refers to a single memory location.
+    def patch_casmvsnet_predict_depth():
+        from einops import rearrange, repeat, reduce
+
+        def safe_predict_depth(self, feats, proj_mats, depth_values, cost_reg):
+            B, V, C, H, W = feats.shape
+            D = depth_values.shape[1]
+
+            ref_feats, src_feats = feats[:, 0], feats[:, 1:]
+            src_feats = rearrange(src_feats, 'b vm1 c h w -> vm1 b c h w')
+            proj_mats = rearrange(proj_mats, 'b vm1 x y -> vm1 b x y')
+
+            ref_volume = rearrange(ref_feats, 'b c h w -> b c 1 h w')
+            ref_volume = repeat(ref_volume, 'b c 1 h w -> b c d h w', d=D)
+            if self.G == 1:
+                volume_sum = ref_volume.clone()
+                volume_sq_sum = ref_volume ** 2
+            else:
+                ref_volume = ref_volume.view(B, self.G, C // self.G, *ref_volume.shape[-3:])
+                volume_sum = 0
+            del ref_feats
+
+            for src_feat, proj_mat in zip(src_feats, proj_mats):
+                warped_volume = homo_warp(src_feat, proj_mat, depth_values)
+                warped_volume = warped_volume.to(ref_volume.dtype)
+                if self.G == 1:
+                    volume_sum = volume_sum + warped_volume
+                    volume_sq_sum = volume_sq_sum + warped_volume ** 2
+                else:
+                    warped_volume = warped_volume.view_as(ref_volume)
+                    if self.training:
+                        volume_sum = volume_sum + warped_volume
+                    else:
+                        volume_sum += warped_volume
+                del warped_volume, src_feat, proj_mat
+            del src_feats, proj_mats
+
+            if self.G == 1:
+                volume_variance = volume_sq_sum.div_(V).sub_(volume_sum.div_(V).pow_(2))
+                del volume_sq_sum, volume_sum
+            else:
+                volume_variance = reduce(volume_sum * ref_volume,
+                                         'b g c d h w -> b g d h w', 'mean').div_(V - 1)
+                del volume_sum, ref_volume
+
+            cost_reg = rearrange(cost_reg(volume_variance), 'b 1 d h w -> b d h w')
+            prob_volume = F.softmax(cost_reg, 1)
+            del cost_reg
+            depth = depth_regression(prob_volume, depth_values)
+
+            with torch.no_grad():
+                prob_volume_sum4 = 4 * F.avg_pool3d(F.pad(prob_volume.unsqueeze(1),
+                                                          pad=(0, 0, 0, 0, 1, 2)),
+                                                    (4, 1, 1), stride=1).squeeze(1)
+                depth_index = depth_regression(prob_volume,
+                                               torch.arange(D,
+                                                            device=prob_volume.device,
+                                                            dtype=prob_volume.dtype)
+                                              ).long()
+                depth_index = torch.clamp(depth_index, 0, D - 1)
+                confidence = torch.gather(prob_volume_sum4, 1,
+                                          depth_index.unsqueeze(1)).squeeze(1)
+
+            return depth, confidence
+
+        CascadeMVSNet.predict_depth = safe_predict_depth
+        print("[Compatibility] 已成功挂载 CasMVSNet eval 模式内存安全补丁！")
+
+    patch_casmvsnet_predict_depth()
 
     # 2. 构建 DataLoader
     MVSDataset = find_dataset_def(args.dataset)

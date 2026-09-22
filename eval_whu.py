@@ -4,7 +4,7 @@ import os
 from matplotlib import pyplot as plt
 from tensorboard.plugins.hparams.metadata import NULL_TENSOR
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4" #ym_add 要在torch之前因为要让服务器只看得见第二张卡
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.environ.get("GPU_ID", "4"))
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -24,7 +24,10 @@ import cv2
 from plyfile import PlyData, PlyElement
 from PIL import Image
 
-from datasets.dtu_whu import collate_keep_list
+try:
+    from datasets.dtu_whu_eval import collate_keep_list
+except ImportError:
+    from datasets.dtu_whu import collate_keep_list
 
 import resource
 import platform
@@ -73,6 +76,8 @@ parser.add_argument('--evaluate_neighbors', nargs='+', type=int, default=[9,9,9]
 parser.add_argument('--geo_pixel_thres', type=float, default=1, help='pixel threshold for geometric consistency filtering')
 parser.add_argument('--geo_depth_thres', type=float, default=0.01, help='depth threshold for geometric consistency filtering')
 parser.add_argument('--photo_thres', type=float, default=0.8, help='threshold for photometric consistency filtering')
+parser.add_argument('--normal_planar_thres', type=float, default=0.80,
+                    help='W_plane threshold used by Stage-1 fused depth and planar-only normal visualization')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -142,6 +147,101 @@ def save_depth_img(filename, depth):
     # assert mask.dtype == np.bool
     depth = depth.astype(np.float32) * 255
     Image.fromarray(depth).save(filename)
+
+
+def build_stage1_fused_normal_views(outputs, ref_intrinsics_s1, planar_threshold=0.80, smooth=True):
+    """Build physical normal visualizations from the actual Stage-1 fused depth.
+
+    The fusion rule is kept identical to ``PatchmatchNet.forward``:
+    high-confidence planar pixels use the propagated plane depth, while all
+    remaining pixels fall back to the native pixel-wise PatchMatch depth.
+
+    Returns:
+        fused_depth:       [B, 1, H, W], metric Stage-1 fused depth.
+        normal_vis:        [B, 3, H, W], RGB normal map in [0, 1].
+        normal_planar_vis: [B, 3, H, W], the same map restricted to W>=threshold.
+        normal_analytic_fused_vis: [B, 3, H, W].  Planar pixels use the
+            propagated plane-equation normal directly; non-planar pixels use
+            normals reconstructed from the native pixel-wise depth.
+        planar_mask:       [B, 1, H, W], high-confidence planar mask.
+    """
+    output_plane = outputs["output_plane"]
+    plane_depth = outputs["depth_patchmatch"]["stage_1"][-1]
+    pixel_depth = output_plane["depth_stage1_pixels"]
+    w_plane = output_plane.get("W_plane_pixel")
+
+    if plane_depth.dim() == 3:
+        plane_depth = plane_depth.unsqueeze(1)
+    if pixel_depth.dim() == 3:
+        pixel_depth = pixel_depth.unsqueeze(1)
+
+    if w_plane is None:
+        planar_mask = torch.zeros_like(plane_depth, dtype=torch.bool)
+    else:
+        if w_plane.dim() == 3:
+            w_plane = w_plane.unsqueeze(1)
+        if w_plane.shape[-2:] != plane_depth.shape[-2:]:
+            w_plane = F.interpolate(
+                w_plane.float(), size=plane_depth.shape[-2:],
+                mode='bilinear', align_corners=True
+            )
+        planar_mask = w_plane >= planar_threshold
+
+    tri_id_map = output_plane.get("tri_id_map")
+    if tri_id_map is not None:
+        if tri_id_map.dim() == 3:
+            tri_id_map = tri_id_map.unsqueeze(1)
+        planar_mask = planar_mask & (tri_id_map >= 0)
+
+    fused_depth = torch.where(planar_mask, plane_depth, pixel_depth).detach()
+    valid_mask = torch.isfinite(fused_depth) & (fused_depth > 0)
+    fused_depth = torch.where(valid_mask, fused_depth, torch.zeros_like(fused_depth))
+
+    # Diagnostic view 1: differentiate the fused depth itself.  This is useful
+    # for exposing seams/noise introduced by the hard fusion boundary.
+    _, normal_vis = compute_normal_map_torch(
+        fused_depth, ref_intrinsics_s1, mask=valid_mask.float(), smooth=smooth
+    )
+    normal_planar_vis = normal_vis * planar_mask.expand_as(normal_vis).float()
+
+    # Patent-facing view: preserve the analytic plane normal in planar regions.
+    # Only the non-planar branch needs a depth-to-normal reconstruction.
+    pixel_normal_math, _ = compute_normal_map_torch(
+        pixel_depth.detach(), ref_intrinsics_s1,
+        mask=(torch.isfinite(pixel_depth) & (pixel_depth > 0)).float(),
+        smooth=smooth
+    )
+    plane_normal_math = output_plane["normal_pro_pure"].detach()
+    if plane_normal_math.shape[-2:] != plane_depth.shape[-2:]:
+        plane_normal_math = F.interpolate(
+            plane_normal_math, size=plane_depth.shape[-2:],
+            mode='nearest'
+        )
+    plane_normal_math = torch.where(
+        torch.isfinite(plane_normal_math),
+        plane_normal_math,
+        torch.zeros_like(plane_normal_math)
+    )
+    plane_normal_math = F.normalize(plane_normal_math, p=2, dim=1, eps=1e-6)
+    # Use the same camera-facing convention as compute_normal_map_torch: n_z <= 0.
+    plane_orientation = torch.where(
+        plane_normal_math[:, 2:3] > 0,
+        -torch.ones_like(plane_normal_math[:, 2:3]),
+        torch.ones_like(plane_normal_math[:, 2:3])
+    )
+    plane_normal_math = plane_normal_math * plane_orientation
+
+    analytic_fused_normal_math = torch.where(
+        planar_mask.expand_as(plane_normal_math),
+        plane_normal_math,
+        pixel_normal_math
+    )
+    normal_analytic_fused_vis = get_visual_normal(
+        analytic_fused_normal_math, valid_mask.float()
+    )
+
+    return (fused_depth, normal_vis, normal_planar_vis,
+            normal_analytic_fused_vis, planar_mask)
 
 
 def read_list_file(filename):
@@ -233,10 +333,11 @@ def save_depth():
             outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                             sample_cuda["depth_min"], sample_cuda["depth_max"],
                             vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
-                            max_lambda_c, max_lambda_s)
+                            max_lambda_c, max_lambda_s,
+                            compute_edge_pixels=True)
 
             image_outputs_pre = generate_edge_alpha_overlays(
-                ref_imgs=sample["imgs"]['stage_0'][:, 0],
+                ref_imgs=sample["imgs"]['stage_1'][:, 0],  # 🌟 统一使用 Stage 1 (1/2 分辨率) 航测底图
                 edge_alphas_list=outputs["edge_alphas"],
                 edges_pixels_list=outputs["tri_infos"][0]['edges_pixels'],
                 device=device, overlay_alpha=0.6, line_thickness=1
@@ -253,12 +354,29 @@ def save_depth():
             res_img_uint8 = (res_np * 255.0).clip(0, 255).astype(np.uint8)
 
             # 5. 保存图片
-            # 构造文件名，例如保存为 edge_overlay.png
+            # 构造文件名，保存为 1/2 分辨率的 edge_overlay.png
             filename = sample["filename"][0]
             save_path = os.path.join(args.outdir, filename.format('edge_overlay', '.png'))
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
             Image.fromarray(res_img_uint8).save(save_path)
+
+            # Build normals from the *actual* Stage-1 fused surface before converting
+            # the model output tree to NumPy.  This deliberately differs from
+            # ``final_normal``, which belongs to the Stage-0 refined depth.
+            ref_intrinsics_s1 = sample_cuda["intrinsics_mats"]['stage_1'][:, 0].float()
+            (depth_s1_fused_vis, normal_s1_fused_vis,
+             normal_s1_fused_planar_vis, normal_s1_fused_analytic_vis,
+             _) = build_stage1_fused_normal_views(
+                outputs,
+                ref_intrinsics_s1,
+                planar_threshold=args.normal_planar_thres,
+                smooth=True
+            )
+            outputs["output_plane"]["depth_s1_fused_vis"] = depth_s1_fused_vis
+            outputs["output_plane"]["normal_s1_fused_vis"] = normal_s1_fused_vis
+            outputs["output_plane"]["normal_s1_fused_planar_vis"] = normal_s1_fused_planar_vis
+            outputs["output_plane"]["normal_s1_fused_analytic_vis"] = normal_s1_fused_analytic_vis
 
             outputs = tensor2numpy(outputs)
             del sample_cuda
@@ -270,7 +388,9 @@ def save_depth():
             # ====================================================================
             #
             stage1_depths = outputs["depth_patchmatch"]['stage_1'][-1]
-            stage1_normals = outputs["output_plane"]['normal_final']
+            stage1_normals = outputs["output_plane"]['normal_s1_fused_vis']
+            stage1_normals_planar = outputs["output_plane"]['normal_s1_fused_planar_vis']
+            stage1_normals_analytic = outputs["output_plane"]['normal_s1_fused_analytic_vis']
             tri_id_maps_np = outputs["output_plane"]['tri_id_map']
 
             # 🎯 架构师新增：提取像素级原生深度和 Stage 0 网格掩码
@@ -291,18 +411,79 @@ def save_depth():
             # stage1_depths = outputs["output_plane"]['depth_stage1_pixels']
             # stage1_normals = outputs["output_plane"]['normal_no_pro']
 
-            for b_idx, (filename, depth_est, normal_est) in enumerate(zip(filenames, stage1_depths, stage1_normals)):
+            for b_idx, (filename, depth_est, normal_est, normal_planar_est,
+                        normal_analytic_est) in enumerate(
+                    zip(filenames, stage1_depths, stage1_normals,
+                        stage1_normals_planar, stage1_normals_analytic)):
                 # 1. 设定输出路径
                 depth_filename = os.path.join(args.outdir, filename.format('depth_est_s1', '.pfm'))
-                normal_filename = os.path.join(args.outdir, filename.format('normal_est_s1', '.png'))
+                normal_filename = os.path.join(args.outdir, filename.format('normal_est_s1_fused', '.png'))
+                normal_planar_filename = os.path.join(
+                    args.outdir, filename.format('normal_est_s1_fused_planar', '.png')
+                )
+                normal_analytic_filename = os.path.join(
+                    args.outdir, filename.format('normal_est_s1_fused_analytic', '.png')
+                )
                 diff_filename = os.path.join(args.outdir, filename.format('depth_diff_s1', 'dif.png'))  # 差异图路径
 
                 os.makedirs(depth_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(normal_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(normal_planar_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(normal_analytic_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(diff_filename.rsplit('/', 1)[0], exist_ok=True)
 
                 # 去除多余的维度
                 depth_est = np.squeeze(depth_est)
+
+                # ==========================================
+                # 【1. 保存 Stage 1 本发明融合深度 (pfm + npy，供图 6 剖面提取)】
+                # ==========================================
+                save_pfm(depth_filename, depth_est.astype(np.float32))
+                np.save(depth_filename.replace('.pfm', '.npy'), depth_est.astype(np.float32))
+
+                # ==========================================
+                # 【2. 保存 Stage 1 传统 PatchmatchNet 原生像素深度 (供图 6 对比)】
+                # ==========================================
+                depth_pixel_curr = stage1_depths_pixels[b_idx]
+                if isinstance(depth_pixel_curr, torch.Tensor):
+                    depth_pixel_s1 = np.squeeze(depth_pixel_curr.detach().cpu().numpy())
+                else:
+                    depth_pixel_s1 = np.squeeze(depth_pixel_curr)
+
+                pixel_depth_filename = os.path.join(args.outdir, filename.format('depth_pixel_s1', '.pfm'))
+                os.makedirs(pixel_depth_filename.rsplit('/', 1)[0], exist_ok=True)
+                save_pfm(pixel_depth_filename, depth_pixel_s1.astype(np.float32))
+                np.save(pixel_depth_filename.replace('.pfm', '.npy'), depth_pixel_s1.astype(np.float32))
+
+                # 原生像素深度伪彩色可视化
+                valid_mask_p = depth_pixel_s1 > 0
+                if valid_mask_p.any():
+                    d_min_p = np.percentile(depth_pixel_s1[valid_mask_p], 1)
+                    d_max_p = np.percentile(depth_pixel_s1[valid_mask_p], 99)
+                    depth_vis_p = np.clip((depth_pixel_s1 - d_min_p) / (d_max_p - d_min_p + 1e-8), 0, 1)
+                    depth_color_p = cv2.applyColorMap((depth_vis_p * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                    depth_color_p[~valid_mask_p] = 0
+                    cv2.imwrite(pixel_depth_filename.replace('.pfm', '_vis.png'), depth_color_p)
+
+                # ==========================================
+                # 【3. 保存 Stage 1 真值深度 GT (pfm + npy，如果有)】
+                # ==========================================
+                if depth_gt_np is not None:
+                    gt_curr_s1 = np.squeeze(depth_gt_np[b_idx])
+                    gt_depth_filename = os.path.join(args.outdir, filename.format('depth_gt_s1', '.pfm'))
+                    os.makedirs(gt_depth_filename.rsplit('/', 1)[0], exist_ok=True)
+                    save_pfm(gt_depth_filename, gt_curr_s1.astype(np.float32))
+                    np.save(gt_depth_filename.replace('.pfm', '.npy'), gt_curr_s1.astype(np.float32))
+
+                    valid_mask_g = gt_curr_s1 > 0
+                    if valid_mask_g.any():
+                        d_min_g = np.percentile(gt_curr_s1[valid_mask_g], 1)
+                        d_max_g = np.percentile(gt_curr_s1[valid_mask_g], 99)
+                        depth_vis_g = np.clip((gt_curr_s1 - d_min_g) / (d_max_g - d_min_g + 1e-8), 0, 1)
+                        depth_color_g = cv2.applyColorMap((depth_vis_g * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                        depth_color_g[~valid_mask_g] = 0
+                        cv2.imwrite(gt_depth_filename.replace('.pfm', '_vis.png'), depth_color_g)
+
 
                 # ==========================================
                 # 【深度图可视化】
@@ -349,6 +530,30 @@ def save_depth():
                 if valid_mask is not None:
                     normal_vis_rgb[~valid_mask] = 0
                 Image.fromarray(normal_vis_rgb).save(normal_filename)
+
+                # High-confidence planar-only view: the background is black so that
+                # weak-texture roofs selected by W_plane stand out in patent figures.
+                normal_planar_sq = np.squeeze(normal_planar_est)
+                if normal_planar_sq.ndim == 3 and normal_planar_sq.shape[-1] == 3:
+                    normal_planar_sq = np.transpose(normal_planar_sq, (2, 0, 1))
+                normal_planar_uint8 = (
+                    np.clip(normal_planar_sq, 0.0, 1.0) * 255.0
+                ).astype(np.uint8)
+                normal_planar_rgb = np.transpose(normal_planar_uint8, (1, 2, 0))
+                normal_planar_rgb[~valid_mask] = 0
+                Image.fromarray(normal_planar_rgb).save(normal_planar_filename)
+
+                # Physically faithful fusion: analytic plane-equation normals on
+                # W>=threshold, pixel-depth normals everywhere else.
+                normal_analytic_sq = np.squeeze(normal_analytic_est)
+                if normal_analytic_sq.ndim == 3 and normal_analytic_sq.shape[-1] == 3:
+                    normal_analytic_sq = np.transpose(normal_analytic_sq, (2, 0, 1))
+                normal_analytic_uint8 = (
+                    np.clip(normal_analytic_sq, 0.0, 1.0) * 255.0
+                ).astype(np.uint8)
+                normal_analytic_rgb = np.transpose(normal_analytic_uint8, (1, 2, 0))
+                normal_analytic_rgb[~valid_mask] = 0
+                Image.fromarray(normal_analytic_rgb).save(normal_analytic_filename)
 
                 # ====================================================================
                 # 提前提取平面置信度 (W_plane)，供平面 MAE 切分和最终保存使用
@@ -420,27 +625,62 @@ def save_depth():
                         plt.close()
 
                 # ====================================================================
-                # 🚨 4. 生成平面置信度 (W_plane) 大图 (用于论文展示)
+                # 🚨 4. 生成平面置信度与图 4 全套联合诊断图 (用于专利/论文展示)
                 # ====================================================================
                 if 'W_plane_pixel' in outputs["output_plane"]:
+                    # (b-1) 连续平面置信度 JET 伪彩图 (红高分蓝低分，经典热力图标准)
                     conf_jet_filename = os.path.join(args.outdir, filename.format('confidence_s1', '_jet.png'))
+                    os.makedirs(os.path.dirname(conf_jet_filename), exist_ok=True)
 
                     w_plane_uint8 = (np.clip(w_plane_sq, 0.0, 1.0) * 255.0).astype(np.uint8)
-                    w_plane_uint8_inv = 255 - w_plane_uint8  # 反转：平面(蓝) 曲面(红)
-
-                    if 'valid_mask' in locals():
-                        w_plane_uint8_inv[~valid_mask] = 0
-
-                    w_plane_color = cv2.applyColorMap(w_plane_uint8_inv, cv2.COLORMAP_JET)
+                    w_plane_color = cv2.applyColorMap(w_plane_uint8, cv2.COLORMAP_JET)
                     if 'valid_mask' in locals():
                         w_plane_color[~valid_mask] = 0
-
                     cv2.imwrite(conf_jet_filename, w_plane_color)
 
+                    # 额外提供一份反转配色 (蓝高红低)，供用户灵活选择
+                    conf_jet_inv_filename = os.path.join(args.outdir, filename.format('confidence_s1', '_jet_inv.png'))
+                    w_plane_color_inv = cv2.applyColorMap(255 - w_plane_uint8, cv2.COLORMAP_JET)
+                    if 'valid_mask' in locals():
+                        w_plane_color_inv[~valid_mask] = 0
+                    cv2.imwrite(conf_jet_inv_filename, w_plane_color_inv)
+
+                    # (b-2) 连续平面置信度灰度图 (白高分黑低分，专利黑白打印标准)
+                    conf_gray_filename = os.path.join(args.outdir, filename.format('confidence_s1', '_gray.png'))
+                    os.makedirs(os.path.dirname(conf_gray_filename), exist_ok=True)
+                    w_plane_gray = w_plane_uint8.copy()
+                    if 'valid_mask' in locals():
+                        w_plane_gray[~valid_mask] = 0
+                    cv2.imwrite(conf_gray_filename, w_plane_gray)
+
+                    # (d-1) 阈值 0.80 硬二分掩码黑白图 (白色为硬平面约束，黑色为回退自由像素)
+                    mask_080 = (w_plane_sq >= args.normal_planar_thres).astype(np.uint8) * 255
+                    if 'valid_mask' in locals():
+                        mask_080[~valid_mask] = 0
+                    mask_080_filename = os.path.join(args.outdir, filename.format('planar_mask_080_s1', '.png'))
+                    os.makedirs(os.path.dirname(mask_080_filename), exist_ok=True)
+                    cv2.imwrite(mask_080_filename, mask_080)
+
+                    # (d-2) 非平面回退决策直观诊断图 (翠绿=硬平面约束，亮橙黄=回退自由像素)
+                    fallback_diag = np.zeros((w_plane_sq.shape[0], w_plane_sq.shape[1], 3), dtype=np.uint8)
+                    if 'valid_mask' in locals():
+                        fallback_diag[valid_mask & (w_plane_sq < args.normal_planar_thres)] = [0, 180, 255]
+                        fallback_diag[valid_mask & (w_plane_sq >= args.normal_planar_thres)] = [50, 220, 50]
+                    fallback_diag_filename = os.path.join(args.outdir, filename.format('fallback_decision_s1', '.png'))
+                    os.makedirs(os.path.dirname(fallback_diag_filename), exist_ok=True)
+                    cv2.imwrite(fallback_diag_filename, fallback_diag)
+
                 if 'cross_check_diagnosis_rgb' in outputs["output_plane"]:
+                    # (c) 跨视角几何校验三态诊断图 (🟢亮绿=真平面保留 | 🔴鲜红=降级伪平面 | 🔵暗蓝=稳定背景)
                     diag_filename = os.path.join(args.outdir, filename.format('cross_check_diag_s1', '.png'))
+                    os.makedirs(os.path.dirname(diag_filename), exist_ok=True)
                     diag_rgb_tensor = outputs["output_plane"]['cross_check_diagnosis_rgb'][b_idx]
-                    diag_rgb_np = diag_rgb_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+                    if isinstance(diag_rgb_tensor, torch.Tensor):
+                        diag_rgb_np = diag_rgb_tensor.detach().cpu().numpy()
+                    else:
+                        diag_rgb_np = np.asarray(diag_rgb_tensor)
+                    if diag_rgb_np.ndim == 3 and diag_rgb_np.shape[0] == 3:
+                        diag_rgb_np = diag_rgb_np.transpose(1, 2, 0)
                     diag_bgr_np = (np.clip(diag_rgb_np, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1]
                     cv2.imwrite(diag_filename, diag_bgr_np)
 
@@ -501,7 +741,8 @@ def save_depth():
                     else:
                         depth_est_s0_sq = np.squeeze(depth_est_s0)
 
-                    gt_curr_s0 = np.squeeze(sample["depth"]["stage_0"][b_idx].detach().cpu().numpy())
+                    gt_s0_val = sample["depth"]["stage_0"][b_idx]
+                    gt_curr_s0 = np.squeeze(gt_s0_val.detach().cpu().numpy() if isinstance(gt_s0_val, torch.Tensor) else np.asarray(gt_s0_val))
                     tri_id_curr_s0 = np.squeeze(tri_id_maps_s0_np[b_idx])  # 🎯 提取 Stage 0 专属网格掩码
 
                     # 尺寸保护

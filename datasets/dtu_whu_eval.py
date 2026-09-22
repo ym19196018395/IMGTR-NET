@@ -5,6 +5,7 @@ from PIL import Image
 from datasets.data_io import *
 import cv2
 
+from torch.utils.data._utils.collate import default_collate
 from datasets.triangulation import get_cdt_datas
 
 
@@ -19,7 +20,8 @@ class MVSDataset(Dataset):
         self.nviews = nviews
         self.img_wh = img_wh
 
-        assert self.mode == "test"
+        assert self.mode in ["test", "train", "val"]
+        self.scan_modes = {}
         self.metas = self.build_list()
 
     # def build_list(self):
@@ -80,8 +82,18 @@ class MVSDataset(Dataset):
             scans = [line.rstrip() for line in scans]
 
         for scan in scans:
-            # 储存着每个照片的id
-            list_file = os.path.join(self.datapath, "{}/Images/{}/list.txt".format(self.mode,scan))
+            # 自动探测 scan 实际位于 test、train 还是 val 目录，避免跨 split 评测时路径失效
+            scan_mode = self.mode
+            candidate_list = os.path.join(self.datapath, "{}/Images/{}/list.txt".format(scan_mode, scan))
+            if not os.path.exists(candidate_list):
+                for fallback_mode in ["test", "train", "val"]:
+                    fallback_list = os.path.join(self.datapath, "{}/Images/{}/list.txt".format(fallback_mode, scan))
+                    if os.path.exists(fallback_list):
+                        scan_mode = fallback_mode
+                        candidate_list = fallback_list
+                        break
+            self.scan_modes[scan] = scan_mode
+            list_file = candidate_list
 
             with open(list_file) as f:
                 for line in f:
@@ -257,6 +269,7 @@ class MVSDataset(Dataset):
         # 这里是对应的一组数据子数据集名称和里面的图片名
         meta = self.metas[idx]
         scan, file_id = meta
+        scan_mode = getattr(self, "scan_modes", {}).get(scan, self.mode)
         # whu数据集每个参考图和源图已经固定了
 
         view_ids=[1,0,2,3,4]
@@ -293,16 +306,16 @@ class MVSDataset(Dataset):
             triangulation_filename=[]
             # 对于参考图进行不一样的处理
             if(vid==1):
-                img_filename = os.path.join(self.datapath,"{}/Images/{}/urd/{}.png".format(self.mode,scan,file_id))
+                img_filename = os.path.join(self.datapath,"{}/Images/{}/urd/{}.png".format(scan_mode,scan,file_id))
                 # 暂时不需要三角剖分数据
                 triangulation_filename = os.path.join(self.datapath,
-                            '{}/Images/{}/triangulation/CDTinfo/CDT_info_vlf_{}.txt'.format(self.mode,scan,file_id))
+                            '{}/Images/{}/triangulation/CDTinfo/CDT_info_vlf_{}.txt'.format(scan_mode,scan,file_id))
             else:
-                img_filename = os.path.join(self.datapath,"{}/Images/{}/{}/{}.png".format(self.mode,scan,vid,file_id))
+                img_filename = os.path.join(self.datapath,"{}/Images/{}/{}/{}.png".format(scan_mode,scan,vid,file_id))
 
-            proj_mat_filename = os.path.join(self.datapath, "{}/Cams/{}/{}/{}.txt".format(self.mode,scan,vid,file_id))
+            proj_mat_filename = os.path.join(self.datapath, "{}/Cams/{}/{}/{}.txt".format(scan_mode,scan,vid,file_id))
             depth_filename_hr = os.path.join(self.datapath,
-                                             "{}/Depths/{}/{}/{}.png".format(self.mode, scan, vid, file_id))
+                                             "{}/Depths/{}/{}/{}.png".format(scan_mode, scan, vid, file_id))
 
 
             imgs = self.read_img(img_filename)
@@ -426,4 +439,19 @@ class MVSDataset(Dataset):
                 "lines": lines,  # ndarray (Nl, ..)
                 "triangles": triangles  # list of ndarrays
                 }
+
+
+def collate_keep_list(batch):
+    """
+    跳过cdt-data与一维变长数组，后面单独进行一个处理
+    """
+    out = {}
+    keys = batch[0].keys()
+    for k in keys:
+        if k in ['triangles', 'vertexs', 'lines', 'tri_conf_cleaned', 'tri_normal_cleaned', 'tri_plane_cleaned', 'is_gt_planar', 'tri_err95', 'tri_weight_normal', 'tri_weight_conf']:
+            out[k] = [b[k] for b in batch]
+        else:
+            out[k] = default_collate([b[k] for b in batch])
+    return out
+
 

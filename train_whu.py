@@ -30,7 +30,7 @@ import gc
 import sys
 import datetime
 import subprocess
-from datasets.dtu_whu import collate_keep_list
+import importlib
 
 # ym_add 这对应的就是实际的cuda
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -45,6 +45,8 @@ parser.add_argument('--trainpath', help='train datapath')
 parser.add_argument('--valpath', help='validation datapath')
 parser.add_argument('--trainlist', help='train list')
 parser.add_argument('--vallist', help='validation list')
+parser.add_argument('--nviews', type=int, default=5,
+                    help='number of input views (reference + source views)')
 
 parser.add_argument('--epochs', type=int, default=16, help='number of epochs to train')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
@@ -87,6 +89,14 @@ parser.add_argument('--normal_gt_mode', default='hard', choices=['hard', 'soft']
 parser.add_argument('--conf_gt_mode', default='hard', choices=['hard', 'soft'],
                     help='平面置信度真值监督模式: hard(原0.08m二值硬目标) 或 soft(0.08~0.16m连续软目标)')
 
+# 👑 实验 B：梯度裁剪解耦实验开关 (Global vs Independent)
+parser.add_argument('--clip_mode', default='independent', choices=['global', 'independent'],
+                    help='梯度裁剪模式: global(原全局统一裁剪) 或 independent(主干、平面分支、Refinement独立解耦裁剪)')
+parser.add_argument('--clip_max_norm_bb', type=float, default=2.0, help='主干网络梯度裁剪阈值 (默认 2.0)')
+parser.add_argument('--clip_max_norm_plane', type=float, default=1.0, help='平面分支(GNN/SVD)梯度裁剪阈值 (默认 1.0)')
+parser.add_argument('--clip_max_norm_refine', type=float, default=1.0, help='Refinement精修网络梯度裁剪阈值 (默认 1.0)')
+parser.add_argument('--clip_max_norm_total', type=float, default=2.0, help='全局梯度裁剪阈值 (在 clip_mode=global 时生效)')
+
 # parse arguments and check
 args = parser.parse_args()
 if args.resume:  # store_true means set the variable as "True"
@@ -112,18 +122,20 @@ print("argv:", sys.argv[1:])
 print_args(args)
 
 # dataset, dataloader
+# 数据集类与 collate 必须来自同一模块。这样既保留 WHU 的变长几何字段，
+# 也允许 ENRICH-Aerial 使用自己的目录结构与 3 视图配置。
+dataset_module = importlib.import_module(f'datasets.{args.dataset}')
 MVSDataset = find_dataset_def(args.dataset)
-if args.dataset == 'dtu_whu':
-    train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 5, robust_train=True)
-    # ym-modify 12.1 因为测试集里面没有这个数据
-    test_dataset = MVSDataset(args.trainpath, args.vallist, "test", 5, robust_train=False)
+dataset_collate_fn = getattr(dataset_module, 'collate_keep_list', None)
+train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", args.nviews, robust_train=True)
+test_dataset = MVSDataset(args.valpath, args.vallist, "test", args.nviews, robust_train=False)
 
 # 进行了一个修改，对于有些数据不进行默认collate
-TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=collate_keep_list,
+TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, collate_fn=dataset_collate_fn,
                             num_workers=args.num_workers, pin_memory=True,
                             persistent_workers=(args.num_workers > 0),
                             drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=collate_keep_list,
+TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate_fn=dataset_collate_fn,
                            num_workers=max(2, args.num_workers // 2) if args.num_workers > 0 else 0,
                            pin_memory=True,
                            persistent_workers=(args.num_workers > 0),
@@ -277,9 +289,9 @@ def  train():
                 avg_test_scalars.update(scalar_outputs)
                 del scalar_outputs, image_outputs
                 print(
-                    'Epoch {}/{}, Iter {}/{},loss_depth:{:.3f},loss_alpha_sup:{:.3f},total loss:{:.3f}, time = {:.3f}'.format(
+                    'Epoch {}/{}, [Validation] Iter {}/{}, loss_depth:{:.3f}, loss_alpha_sup:{:.3f}, total loss:{:.3f}, time = {:.3f}'.format(
                         epoch_idx, args.epochs, batch_idx,
-                        len(TrainImgLoader), loss_depth, loss_alpha_sup, loss,
+                        len(TestImgLoader), loss_depth, loss_alpha_sup, loss,
                         time.time() - start_time))
 
             save_scalars(logger, 'fulltest', avg_test_scalars.mean(), global_step)
@@ -574,9 +586,12 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar", "tri_err95", "tri_weight_normal", "tri_weight_conf"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
-    # 手动转换并移动到 GPU
-    sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
-    sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
+    # 手动转换并移动到 GPU。ENRICH-Aerial 没有 WHU 离线 geom_svd 标签时，
+    # 保留在线动态置信度监督，并安全跳过静态法向/置信度辅助项。
+    if 'tri_conf_cleaned' in sample:
+        sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
+    if 'tri_normal_cleaned' in sample:
+        sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
     if 'is_gt_planar' in sample:
         sample_cuda['is_gt_planar'] = [torch.from_numpy(v).to(device).bool() for v in sample['is_gt_planar']]
     if 'tri_weight_normal' in sample:
@@ -595,7 +610,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 连续性约束和光滑性约束权重
     # max_lambda_c = 40.0
     # max_lambda_s = 1.0
-    max_lambda_c = 0.2
+    max_lambda_c = 0.0
     max_lambda_s = 0.0
     max_lambda_n_tri = 1.0  # 宏观平面级法向峰值（完全恢复至创造 0.185m/0.106m 黄金记录时的 1.0，贡献约 0.05）
     max_lambda_n_pix = 0.0  # 微观像素级 D2N 法向峰值（已关闭，彻底释放 FeatureNet 泛化能力）
@@ -611,8 +626,8 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # ====================================================
     # 1. 法向约束 (一阶方向引导，率先点火，摆正平面且不破坏深度边界)：
     # 0.15 启动，0.40 满载，0.85 开始松绑，底线保留 75%
-    lambda_n_tri = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_tri, end_ratio=0.75)
-    lambda_n_pix = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.85, max_lambda_n_pix, end_ratio=0.75) if max_lambda_n_pix > 0.0 else 0.0
+    lambda_n_tri = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.80, max_lambda_n_tri, end_ratio=0.75)
+    lambda_n_pix = get_smooth_weight_with_decay(progress, 0.15, 0.40, 0.80, max_lambda_n_pix, end_ratio=0.75) if max_lambda_n_pix > 0.0 else 0.0
 
     # 2. 连通性约束 (强几何缝合，等 edge_head 充分预热学会断裂后再缓坡介入)：
     # 0.30 启动，0.55 满载，0.85 开始松绑，底线保留 20%
@@ -737,7 +752,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         depth_range=(sample_cuda["depth_min"], sample_cuda["depth_max"]),
         valid_mask=valid_mask_s1,
         intrinsics=ref_intrinsics,
-        tri_conf_gt=sample_cuda["tri_conf_cleaned"],
+        tri_conf_gt=sample_cuda.get("tri_conf_cleaned", None),
         is_gt_planar=sample_cuda.get("is_gt_planar", None),
         tri_weight_conf=sample_cuda.get("tri_weight_conf", None),
         conf_gt_mode=args.conf_gt_mode
@@ -746,7 +761,10 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
 
     # --- 🚨 新增：基于预处理 npz 数据，在线极速查表映射 Stage 1 真值置信度与法线 ---
     tri_id_map = outputs["output_plane"].get('tri_id_map', None)
-    if tri_id_map is not None and "tri_conf_cleaned" in sample_cuda:
+    if (tri_id_map is not None
+            and "tri_conf_cleaned" in sample_cuda
+            and "tri_normal_cleaned" in sample_cuda
+            and "is_gt_planar" in sample_cuda):
         B, H_s1, W_s1 = tri_id_map.shape
         tri_device = tri_id_map.device
         planar_soft_conf_s1_list = []
@@ -850,8 +868,33 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     # 边断裂损失
     loss.backward()
 
-    # 恢复全局梯度裁剪：为包含 GNN、SVD 法向与点到面几何多任务提供数值阻尼，防止极端视差梯度尖峰
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+    # 👑 实验 B：支持全局统一裁剪与分支独立解耦裁剪 (主干、平面分支、Refinement 分别裁剪)
+    clip_mode = getattr(args, 'clip_mode', 'independent')
+    grad_norms = {}
+    if clip_mode == 'independent':
+        raw_model = model.module if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)) else model
+        plane_params = [p for p in raw_model.plane_patchmatch_agent.parameters() if p.requires_grad]
+        refine_params = [p for p in raw_model.upsample_net.parameters() if p.requires_grad]
+        if hasattr(raw_model, 'stage0_refiner'):
+            refine_params += [p for p in raw_model.stage0_refiner.parameters() if p.requires_grad]
+
+        plane_param_ids = {id(p) for p in plane_params}
+        refine_param_ids = {id(p) for p in refine_params}
+        backbone_params = [
+            p for p in raw_model.parameters()
+            if p.requires_grad and id(p) not in plane_param_ids and id(p) not in refine_param_ids
+        ]
+
+        norm_bb = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=args.clip_max_norm_bb)
+        norm_plane = torch.nn.utils.clip_grad_norm_(plane_params, max_norm=args.clip_max_norm_plane)
+        norm_refine = torch.nn.utils.clip_grad_norm_(refine_params, max_norm=args.clip_max_norm_refine)
+
+        grad_norms["grad_norm_backbone"] = norm_bb.item() if isinstance(norm_bb, torch.Tensor) else float(norm_bb)
+        grad_norms["grad_norm_plane"] = norm_plane.item() if isinstance(norm_plane, torch.Tensor) else float(norm_plane)
+        grad_norms["grad_norm_refine"] = norm_refine.item() if isinstance(norm_refine, torch.Tensor) else float(norm_refine)
+    else:
+        norm_total = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(args, 'clip_max_norm_total', 2.0))
+        grad_norms["grad_norm_total"] = norm_total.item() if isinstance(norm_total, torch.Tensor) else float(norm_total)
 
     # 优化器根据计算的梯度更新模型参数（梯度下降的具体实现）
     optimizer.step()
@@ -868,6 +911,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                       "loss_plane_s1": loss_plane_s1,
                       "loss_dnc_s1": loss_dnc_s1
                       }
+    scalar_outputs.update(grad_norms)
 
         # 记录到 scalar_outputs 以便主循环写入 Tensorboard
     if isinstance(normal_loss_tri, torch.Tensor):
@@ -1093,9 +1137,11 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     skip = ["vertexs", "lines", "triangles", "tri_conf_cleaned", "tri_normal_cleaned", "is_gt_planar", "tri_err95", "tri_weight_normal", "tri_weight_conf"]
     sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
-    # 手动转换并移动到 GPU
-    sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
-    sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
+    # 手动转换并移动到 GPU（离线三角面标签为可选字段）。
+    if 'tri_conf_cleaned' in sample:
+        sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
+    if 'tri_normal_cleaned' in sample:
+        sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
@@ -1121,7 +1167,9 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
 
     # --- 🚨 新增：基于预处理 npz 数据，在线极速查表映射 Stage 1 真值置信度与法线 ---
     tri_id_map = outputs["output_plane"].get('tri_id_map', None)
-    if tri_id_map is not None and "tri_conf_cleaned" in sample_cuda:
+    if (tri_id_map is not None
+            and "tri_conf_cleaned" in sample_cuda
+            and "tri_normal_cleaned" in sample_cuda):
         B, H_s1, W_s1 = tri_id_map.shape
         tri_device = tri_id_map.device
         planar_soft_conf_s1_list = []
