@@ -2200,4 +2200,249 @@ def compute_cross_check_score_gpu(depth_ref, ref_proj, src_raw_depths, src_projs
         max_ratio_deg = torch.ones(B, max_tri_num, 1, device=device)
         
     return max_ratio_deg.detach()
-
+
+
+def compute_geometric_risk_features(
+    planes,
+    neighbor_indices,
+    rays_centroids,
+    aligned_endpoints_norm,
+    ref_intrinsics,
+    H,
+    W
+):
+    """
+    计算三角形与其邻居面片之间的几何风险特征 (共享边端点物理缝隙 Delta Z_edge 与 质心外推偏离 delta_centroid)
+
+    Args:
+        planes: [B, N, 4] 当前三角形平面参数 (n_x, n_y, n_z, d)
+        neighbor_indices: [B, N, 3] 邻居三角形索引
+        rays_centroids: [B, N, 3] 三角形质心视锥射线
+        aligned_endpoints_norm: [B, N, 3, 2, 2] 共享边端点归一化坐标 [-1, 1]，最后一维为 (x, y)
+        ref_intrinsics: [B, 3, 3] 参考视角相机内参
+        H: int 图像高度
+        W: int 图像宽度
+
+    Returns:
+        geo_risk_features: [B, N, 3, 2] 包含 [delta_edge, delta_centroid] 的几何风险张量
+    """
+    B, N, _ = planes.shape
+    device = planes.device
+    dtype = planes.dtype
+
+    # 保底拦截：若缺少端点输入，直接返回全 0 风险张量
+    if aligned_endpoints_norm is None:
+        return torch.zeros((B, N, 3, 2), device=device, dtype=dtype)
+
+    # 1. 提取自身与邻居平面参数
+    n_curr = planes[..., :3]  # [B, N, 3]
+    d_curr = planes[..., 3:]  # [B, N, 1]
+
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, 3)
+    safe_neighbor_idx = torch.clamp(neighbor_indices, 0, N - 1)
+    neighbor_planes = planes[batch_idx, safe_neighbor_idx]  # [B, N, 3, 4]
+    n_neigh = neighbor_planes[..., :3]  # [B, N, 3, 3]
+    d_neigh = neighbor_planes[..., 3:]  # [B, N, 3, 1]
+
+    # 2. 反投影共享边端点得到空间视线射线 [B, N, 3, 2, 3]
+    u_px = (aligned_endpoints_norm[..., 0] + 1.0) * 0.5 * (W - 1)
+    v_px = (aligned_endpoints_norm[..., 1] + 1.0) * 0.5 * (H - 1)
+    uv_homo = torch.stack([u_px, v_px, torch.ones_like(u_px)], dim=-1)  # [B, N, 3, 2, 3]
+
+    K_inv = torch.inverse(ref_intrinsics)  # [B, 3, 3]
+    uv_flat = uv_homo.view(B, -1, 3)  # [B, N*3*2, 3]
+    rays_flat = torch.bmm(uv_flat, K_inv.transpose(1, 2))  # [B, N*3*2, 3]
+    rays_endpoints = rays_flat.view(B, N, 3, 2, 3)  # [B, N, 3, 2, 3]
+
+    # 3. 计算共享边端点在自身平面与邻居平面的绝对深度
+    n_curr_exp = n_curr.view(B, N, 1, 1, 3)
+    d_curr_exp = d_curr.view(B, N, 1, 1, 1)
+    denom_curr_pts = (n_curr_exp * rays_endpoints).sum(dim=-1, keepdim=True)  # [B, N, 3, 2, 1]
+    denom_curr_pts_safe = torch.where(
+        denom_curr_pts.abs() < 1e-4,
+        torch.sign(denom_curr_pts + 1e-10) * 1e-4,
+        denom_curr_pts
+    )
+    Z_curr_pts = (-d_curr_exp / denom_curr_pts_safe).abs()  # [B, N, 3, 2, 1]
+
+    n_neigh_exp = n_neigh.unsqueeze(3)  # [B, N, 3, 1, 3]
+    d_neigh_exp = d_neigh.unsqueeze(3)  # [B, N, 3, 1, 1]
+    denom_neigh_pts = (n_neigh_exp * rays_endpoints).sum(dim=-1, keepdim=True)  # [B, N, 3, 2, 1]
+    denom_neigh_pts_safe = torch.where(
+        denom_neigh_pts.abs() < 1e-4,
+        torch.sign(denom_neigh_pts + 1e-10) * 1e-4,
+        denom_neigh_pts
+    )
+    Z_neigh_pts = (-d_neigh_exp / denom_neigh_pts_safe).abs()  # [B, N, 3, 2, 1]
+
+    # 端点物理缝隙定义为两端点缝隙的最大值
+    gap_pts = (Z_curr_pts - Z_neigh_pts).abs()  # [B, N, 3, 2, 1]
+    delta_z_edge = gap_pts.max(dim=3)[0]  # [B, N, 3, 1]
+
+    # 4. 计算当前三角形质心深度与邻居平面外推质心深度的差值
+    denom_curr_c = (n_curr * rays_centroids).sum(dim=-1, keepdim=True)  # [B, N, 1]
+    denom_curr_c_safe = torch.where(
+        denom_curr_c.abs() < 1e-4,
+        torch.sign(denom_curr_c + 1e-10) * 1e-4,
+        denom_curr_c
+    )
+    Z_curr_c = (-d_curr / denom_curr_c_safe).abs()  # [B, N, 1]
+
+    rays_c_exp = rays_centroids.unsqueeze(2)  # [B, N, 1, 3]
+    denom_neigh_c = (n_neigh * rays_c_exp).sum(dim=-1, keepdim=True)  # [B, N, 3, 1]
+    denom_neigh_c_safe = torch.where(
+        denom_neigh_c.abs() < 1e-4,
+        torch.sign(denom_neigh_c + 1e-10) * 1e-4,
+        denom_neigh_c
+    )
+    Z_neigh_c = (-d_neigh / denom_neigh_c_safe).abs()  # [B, N, 3, 1]
+
+    delta_z_centroid = (Z_curr_c.unsqueeze(2) - Z_neigh_c).abs()  # [B, N, 3, 1]
+
+    # 5. 尺度相对归一化与平滑对数压缩
+    scale_ref = Z_curr_c.unsqueeze(2) + 1e-6  # [B, N, 1, 1]
+    delta_edge_norm = torch.log(1.0 + delta_z_edge / scale_ref)  # [B, N, 3, 1]
+    delta_centroid_norm = torch.log(1.0 + delta_z_centroid / scale_ref)  # [B, N, 3, 1]
+
+    # 极端值截断保护
+    delta_edge_norm = torch.clamp(delta_edge_norm, min=0.0, max=10.0)
+    delta_centroid_norm = torch.clamp(delta_centroid_norm, min=0.0, max=10.0)
+
+    # 6. 拼接输出 [B, N, 3, 2]
+    geo_risk_features = torch.cat([delta_edge_norm, delta_centroid_norm], dim=-1)
+    return geo_risk_features.detach()
+
+
+def extract_5d_multiview_evidence(
+    view_scores,
+    view_fov_masks,
+    view_weights,
+    tri_id_map,
+    max_tri_num,
+    D=4
+):
+    """
+    提取三角形级别的 5 维多视证据张量 (5D Multi-View Evidence Tensor)
+
+    Args:
+        view_scores: List[V] of [B*K, 1, H, W], 每个源视角与参考视角的余弦相似度 (归一化平均前为 -C_v_raw)
+        view_fov_masks: List[V] of [B*K, 1, H, W], 每个源视角的视场有效性掩码 (0.0 或 1.0)
+        view_weights: [B, V, H, W] 或 None, 视角连续权重
+        tri_id_map: [B, H, W], 像素到三角形 ID 的映射
+        max_tri_num: int, 最大三角形数量
+        D: int, 每个特征分组的通道数 (C // G, 默认 4)
+
+    Returns:
+        evidence_tensor: [B, max_tri_num, K, 5]
+            E1: 有效区域平均代价 (匹配质量) [0.0, 1.0]
+            E2: 有效视角间分歧 (未加权标准差) [0.0, 0.5]
+            E3: 平均有效视角比例 [0.0, 1.0]
+            E4: 至少一视有效像素占比 (覆盖率) [0.0, 1.0]
+            E5: 至少两视有效像素占比 (分歧置信度) [0.0, 1.0]
+    """
+    B, H, W = tri_id_map.shape
+    device = tri_id_map.device
+    V = len(view_scores)
+    BK = view_scores[0].shape[0]
+    K = BK // B
+
+    # 1. 堆叠并还原视角与假设维度
+    # scores: [B, K, V, H, W]
+    scores = torch.stack(view_scores, dim=1).view(B, K, V, H, W)
+    # fov_masks: [B, K, V, H, W]
+    fov_masks = torch.stack(view_fov_masks, dim=1).view(B, K, V, H, W).float()
+
+    # 2. 原始代价值规范化到 [0.0, 1.0] 严格单调区间: C_01 = (1.0 - D * score) / 2.0
+    c_01 = torch.clamp((1.0 - D * scores) * 0.5, min=0.0, max=1.0)  # [B, K, V, H, W]
+
+    # 3. 准备有效视角权重
+    if view_weights is not None:
+        vw = view_weights.unsqueeze(1)  # [B, 1, V, H, W]
+        eff_weights = vw * fov_masks     # [B, K, V, H, W]
+    else:
+        eff_weights = fov_masks          # [B, K, V, H, W]
+
+    # 4. 逐像素统计
+    valid_view_count = fov_masks.sum(dim=2)  # [B, K, H, W]
+    mask_ge1 = (valid_view_count >= 1.0).float()  # [B, K, H, W]
+    mask_ge2 = (valid_view_count >= 2.0).float()  # [B, K, H, W]
+
+    # 有效视角加权代价
+    weight_sum = eff_weights.sum(dim=2)  # [B, K, H, W]
+    weighted_cost_sum = (c_01 * eff_weights).sum(dim=2)  # [B, K, H, W]
+    pixel_cost_in_fov = torch.where(
+        mask_ge1 > 0,
+        weighted_cost_sum / (weight_sum + 1e-6),
+        torch.full_like(weight_sum, 0.5)
+    )  # [B, K, H, W]
+
+    # 有效视角间未加权分歧 (仅在 >= 2 视有效像素上计算标准差)
+    unweighted_mean = (c_01 * fov_masks).sum(dim=2) / (valid_view_count + 1e-6)  # [B, K, H, W]
+    sq_diff = ((c_01 - unweighted_mean.unsqueeze(2)) ** 2) * fov_masks             # [B, K, V, H, W]
+    pixel_var = sq_diff.sum(dim=2) / (valid_view_count + 1e-6)                    # [B, K, H, W]
+    pixel_std = torch.sqrt(torch.clamp(pixel_var, min=0.0))                       # [B, K, H, W]
+    pixel_std = torch.where(mask_ge2 > 0, pixel_std, torch.zeros_like(pixel_std))  # [B, K, H, W]
+
+    # 视角丰度
+    pixel_r_view = valid_view_count / float(V)  # [B, K, H, W]
+
+    # 5. 展平与 Scatter 聚合准备
+    flat_cost_val = (pixel_cost_in_fov * mask_ge1).permute(0, 2, 3, 1).reshape(B, -1, K)
+    flat_mask_ge1 = mask_ge1.permute(0, 2, 3, 1).reshape(B, -1, K)
+    flat_std_val = (pixel_std * mask_ge2).permute(0, 2, 3, 1).reshape(B, -1, K)
+    flat_mask_ge2 = mask_ge2.permute(0, 2, 3, 1).reshape(B, -1, K)
+    flat_r_view = pixel_r_view.permute(0, 2, 3, 1).reshape(B, -1, K)
+    flat_ids = tri_id_map.reshape(B, -1)
+
+    # 有效像素过滤
+    valid_pixel = (flat_ids >= 0) & (flat_ids < max_tri_num)
+    batch_offset = (torch.arange(B, device=device) * max_tri_num).view(B, 1)
+    safe_ids = torch.where(valid_pixel, flat_ids, torch.zeros_like(flat_ids))
+    global_ids = (safe_ids + batch_offset).view(-1)
+    flat_mask = valid_pixel.reshape(-1)
+
+    valid_global_ids = global_ids[flat_mask]  # [N_valid_px]
+    idx_expand = valid_global_ids.unsqueeze(1).expand(-1, K)
+
+    total_bins = B * max_tri_num
+    # 统计每个三角形的总有效像素数
+    tri_pixel_counts = torch.zeros(total_bins, 1, device=device).scatter_add_(
+        0, valid_global_ids.unsqueeze(1),
+        torch.ones_like(valid_global_ids.unsqueeze(1), dtype=torch.float32)
+    )  # [total_bins, 1]
+
+    # 累加各通道分子
+    tri_sum_cost = torch.zeros(total_bins, K, device=device).scatter_add_(
+        0, idx_expand, flat_cost_val.reshape(-1, K)[flat_mask]
+    )
+    tri_sum_ge1 = torch.zeros(total_bins, K, device=device).scatter_add_(
+        0, idx_expand, flat_mask_ge1.reshape(-1, K)[flat_mask]
+    )
+    tri_sum_std = torch.zeros(total_bins, K, device=device).scatter_add_(
+        0, idx_expand, flat_std_val.reshape(-1, K)[flat_mask]
+    )
+    tri_sum_ge2 = torch.zeros(total_bins, K, device=device).scatter_add_(
+        0, idx_expand, flat_mask_ge2.reshape(-1, K)[flat_mask]
+    )
+    tri_sum_r_view = torch.zeros(total_bins, K, device=device).scatter_add_(
+        0, idx_expand, flat_r_view.reshape(-1, K)[flat_mask]
+    )
+
+    # 6. 计算 5 维证据
+    # E1: 有效区域平均代价 (仅在有效像素上平均，全无证据赋予中性 0.5)
+    e1 = torch.where(tri_sum_ge1 > 0, tri_sum_cost / (tri_sum_ge1 + 1e-6), torch.full_like(tri_sum_cost, 0.5))
+    # E2: 有效视角间分歧 (仅在 >= 2 视有效像素上平均，无法计算填 0.0)
+    e2 = torch.where(tri_sum_ge2 > 0, tri_sum_std / (tri_sum_ge2 + 1e-6), torch.zeros_like(tri_sum_std))
+    # E3: 平均有效视角比例
+    e3 = torch.where(tri_pixel_counts > 0, tri_sum_r_view / (tri_pixel_counts + 1e-6), torch.zeros_like(tri_sum_r_view))
+    # E4: 至少一视有效像素占比 (空间覆盖率)
+    e4 = torch.where(tri_pixel_counts > 0, tri_sum_ge1 / (tri_pixel_counts + 1e-6), torch.zeros_like(tri_sum_ge1))
+    # E5: 至少两视有效像素占比 (分歧统计置信度)
+    e5 = torch.where(tri_pixel_counts > 0, tri_sum_ge2 / (tri_pixel_counts + 1e-6), torch.zeros_like(tri_sum_ge2))
+
+    evidence = torch.stack([e1, e2, e3, e4, e5], dim=-1)  # [total_bins, K, 5]
+    evidence = evidence.view(B, max_tri_num, K, 5)
+
+    return evidence.detach()
+
+

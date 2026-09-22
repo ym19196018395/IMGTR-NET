@@ -51,11 +51,11 @@ LOG_DIR="${LOG_DIR:-${PATCHMATCHNET_DIR}/checkpoints/casmvsnet_whu_train}"
 # ==============================================================================
 # 3. GPU 与训练超参数配置
 # ==============================================================================
-export GPU_ID="${GPU_ID:-3}"
+export GPU_ID="${GPU_ID:-1}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 # 训练 Batch Size: CasMVSNet 包含 3 级代价体，显存占用中等，建议设为 2 (若显存吃紧可设为 1)
-BATCH_SIZE="${BATCH_SIZE:-3}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 EPOCHS="${EPOCHS:-16}"
 LR="${LR:-0.001}"
 

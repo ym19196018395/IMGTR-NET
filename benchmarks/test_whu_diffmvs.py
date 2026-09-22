@@ -151,14 +151,26 @@ class DiffMVSWrapper(nn.Module):
             depth_values=depth_values
         )
 
-        # 5. 提取最高分辨率预测深度图 (以绝对物理米 meters 为单位)
-        depth_pred = outputs["depth"][-1].unsqueeze(1)  # [B, 1, H, W]
+        # 5. 提取最高分辨率 (Stage 0, 1/1) 与半分辨率 (Stage 1, 1/2) 预测深度图 (以绝对物理米 meters 为单位)
+        depth_pred_s0 = outputs["depth"][-1]
+        if depth_pred_s0.dim() == 3:
+            depth_pred_s0 = depth_pred_s0.unsqueeze(1)  # [B, 1, H, W]
+
+        # 动态定位 Stage 1 (1/2 分辨率) 预测深度图
+        H_s0, W_s0 = depth_pred_s0.shape[-2], depth_pred_s0.shape[-1]
+        target_h1, target_w1 = H_s0 // 2, W_s0 // 2
+        depth_pred_s1 = None
+        for d in reversed(outputs["depth"]):
+            d_h, d_w = d.shape[-2], d.shape[-1]
+            if d_h == target_h1 and d_w == target_w1:
+                depth_pred_s1 = d.unsqueeze(1) if d.dim() == 3 else d
+                break
 
         # 提取全分辨率置信度 (若可用)
         conf_list = outputs.get("photometric_confidence", [])
         confidence = conf_list[-1].unsqueeze(1) if len(conf_list) > 0 else None
 
-        return depth_pred, confidence
+        return depth_pred_s0, depth_pred_s1, confidence
 
 
 def safe_mae(depth_est, depth_gt, mask):
@@ -274,10 +286,13 @@ def main():
             sample_cuda = tocuda(sample, device=device, skip_keys=skip)
 
             # 前向推理
-            depth_est, confidence = model(sample_cuda, n_views=args.n_views)  # [B, 1, H, W]
+            depth_est_s0, depth_est_s1, confidence = model(sample_cuda, n_views=args.n_views)
 
-            depth_gt = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
-            mask_gt = (sample_cuda["mask"]["stage_0"] > 0.5)
+            depth_gt_s0 = sample_cuda["depth"]["stage_0"]  # [B, 1, H, W]
+            mask_gt_s0 = (sample_cuda["mask"]["stage_0"] > 0.5)
+
+            depth_gt_s1 = sample_cuda["depth"]["stage_1"]  # [B, 1, H//2, W//2]
+            mask_gt_s1 = (sample_cuda["mask"]["stage_1"] > 0.5)
 
             for b in range(B):
                 meta_idx = batch_idx * args.batch_size + b
@@ -286,38 +301,63 @@ def main():
                 if scan not in per_scan_records:
                     per_scan_records[scan] = []
 
-                m_b = mask_gt[b:b+1]
-                d_est_b = depth_est[b:b+1]
-                d_gt_b = depth_gt[b:b+1]
+                m_b_s0 = mask_gt_s0[b:b+1]
+                d_est_b_s0 = depth_est_s0[b:b+1]
+                d_gt_b_s0 = depth_gt_s0[b:b+1]
 
-                # 读取同源平面切片掩码 (由本项目提前导出的同源 stage0_planar_mask_{file_id}.png)
-                planar_mask_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
-                has_planar_mask = False
-                if os.path.exists(planar_mask_file):
-                    m_planar_np = cv2.imread(planar_mask_file, cv2.IMREAD_GRAYSCALE)
-                    if m_planar_np is not None:
-                        m_planar_t = (torch.from_numpy(m_planar_np).to(device) > 128).unsqueeze(0).unsqueeze(0)
-                        m_planar_b = m_b & m_planar_t
-                        m_curved_b = m_b & (~m_planar_t)
-                        has_planar_mask = True
+                # 读取同源平面切片掩码 (由本项目提前导出的同源 stage0_planar_mask_{file_id}.png 与 stage1_planar_mask_{file_id}.png)
+                planar_mask_s0_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
+                has_planar_mask_s0 = False
+                if os.path.exists(planar_mask_s0_file):
+                    m_planar_np_s0 = cv2.imread(planar_mask_s0_file, cv2.IMREAD_GRAYSCALE)
+                    if m_planar_np_s0 is not None:
+                        m_planar_t_s0 = (torch.from_numpy(m_planar_np_s0).to(device) > 128).unsqueeze(0).unsqueeze(0)
+                        m_planar_b_s0 = m_b_s0 & m_planar_t_s0
+                        m_curved_b_s0 = m_b_s0 & (~m_planar_t_s0)
+                        has_planar_mask_s0 = True
 
-                if not has_planar_mask:
-                    m_planar_b = torch.zeros_like(m_b)
-                    m_curved_b = m_b
+                if not has_planar_mask_s0:
+                    m_planar_b_s0 = torch.zeros_like(m_b_s0)
+                    m_curved_b_s0 = m_b_s0
 
-                # 计算绝对深度误差与阈值比例
-                s0_mae = safe_mae(d_est_b, d_gt_b, m_b)
-                s0_planar_mae = safe_mae(d_est_b, d_gt_b, m_planar_b) if has_planar_mask else float('nan')
-                s0_curved_mae = safe_mae(d_est_b, d_gt_b, m_curved_b) if has_planar_mask else float('nan')
+                # 计算 Stage 0 绝对深度误差与阈值比例
+                s0_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_b_s0)
+                s0_planar_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_planar_b_s0) if has_planar_mask_s0 else float('nan')
+                s0_curved_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_curved_b_s0) if has_planar_mask_s0 else float('nan')
 
-                t1_err = safe_thres_error(d_est_b, d_gt_b, m_b, 1.0)
-                t2_err = safe_thres_error(d_est_b, d_gt_b, m_b, 2.0)
-                t4_err = safe_thres_error(d_est_b, d_gt_b, m_b, 4.0)
-                t8_err = safe_thres_error(d_est_b, d_gt_b, m_b, 8.0)
+                t1_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 1.0)
+                t2_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 2.0)
+                t4_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 4.0)
+                t8_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 8.0)
 
-                valid_cnt = m_b.sum().item()
-                planar_cnt = m_planar_b.sum().item()
-                planar_ratio = (planar_cnt / valid_cnt * 100.0) if valid_cnt > 0 else 0.0
+                valid_cnt_s0 = m_b_s0.sum().item()
+                planar_cnt_s0 = m_planar_b_s0.sum().item()
+                planar_ratio_s0 = (planar_cnt_s0 / valid_cnt_s0 * 100.0) if valid_cnt_s0 > 0 else 0.0
+
+                # --- 计算 Stage 1 平面与全局指标 ---
+                s1_mae = float('nan')
+                s1_planar_mae = float('nan')
+                planar_ratio_s1 = 0.0
+                if depth_est_s1 is not None:
+                    m_b_s1 = mask_gt_s1[b:b+1]
+                    d_est_b_s1 = depth_est_s1[b:b+1]
+                    d_gt_b_s1 = depth_gt_s1[b:b+1]
+
+                    planar_mask_s1_file = os.path.join(args.mask_dir, scan, "masks", f"stage1_planar_mask_{file_id}.png")
+                    has_planar_mask_s1 = False
+                    if os.path.exists(planar_mask_s1_file):
+                        m_planar_np_s1 = cv2.imread(planar_mask_s1_file, cv2.IMREAD_GRAYSCALE)
+                        if m_planar_np_s1 is not None:
+                            m_planar_t_s1 = (torch.from_numpy(m_planar_np_s1).to(device) > 128).unsqueeze(0).unsqueeze(0)
+                            m_planar_b_s1 = m_b_s1 & m_planar_t_s1
+                            has_planar_mask_s1 = True
+
+                    s1_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_b_s1)
+                    if has_planar_mask_s1:
+                        s1_planar_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_planar_b_s1)
+                        valid_cnt_s1 = m_b_s1.sum().item()
+                        planar_cnt_s1 = m_planar_b_s1.sum().item()
+                        planar_ratio_s1 = (planar_cnt_s1 / valid_cnt_s1 * 100.0) if valid_cnt_s1 > 0 else 0.0
 
                 record = {
                     "scan": scan,
@@ -329,9 +369,12 @@ def main():
                     "stage0_thres2mm_err": t2_err,
                     "stage0_thres4mm_err": t4_err,
                     "stage0_thres8mm_err": t8_err,
-                    "s0_valid_pixels": valid_cnt,
-                    "s0_planar_pixels": planar_cnt,
-                    "s0_planar_ratio_pct": planar_ratio,
+                    "s0_valid_pixels": valid_cnt_s0,
+                    "s0_planar_pixels": planar_cnt_s0,
+                    "s0_planar_ratio_pct": planar_ratio_s0,
+                    "stage1_mae": s1_mae,
+                    "stage1_planar_mae": s1_planar_mae,
+                    "s1_planar_ratio_pct": planar_ratio_s1,
                 }
                 per_scan_records[scan].append(record)
                 all_sample_records.append(record)
@@ -340,16 +383,17 @@ def main():
                 if args.save_depth:
                     depth_save_dir = os.path.join(args.outdir, scan, "depths")
                     os.makedirs(depth_save_dir, exist_ok=True)
-                    d_s0_np = d_est_b[0, 0].cpu().numpy()
+                    d_s0_np = d_est_b_s0[0, 0].cpu().numpy()
                     save_pfm(os.path.join(depth_save_dir, f"diffmvs_depth_{file_id}.pfm"), d_s0_np)
                     depth_png_s0 = np.clip(d_s0_np * 64.0, 0, 65535).astype(np.uint16)
                     cv2.imwrite(os.path.join(depth_save_dir, f"diffmvs_depth_{file_id}.png"), depth_png_s0)
 
             cur_idx = batch_idx + 1
             step_time = time.time() - step_start
-            planar_str = f"{s0_planar_mae:.4f}m" if not math.isnan(s0_planar_mae) else "N/A"
+            s0_planar_str = f"{s0_planar_mae:.4f}m" if not math.isnan(s0_planar_mae) else "N/A"
+            s1_planar_str = f"{s1_planar_mae:.4f}m" if not math.isnan(s1_planar_mae) else "N/A"
             print(f"[{cur_idx:03d}/{len(test_loader):03d}] Scan: {scan} | Img: {file_id} | "
-                  f"DiffMVS MAE: {s0_mae:.4f}m | Planar MAE: {planar_str} | Time: {step_time:.2f}s")
+                  f"DiffMVS S0 MAE: {s0_mae:.4f}m | S0 Planar: {s0_planar_str} | S1 Planar: {s1_planar_str} | Time: {step_time:.2f}s")
 
     eval_duration = time.time() - start_eval_time
     print("\n" + "=" * 85)
@@ -373,6 +417,9 @@ def main():
             "stage0_thres4mm_err": compute_mean_ignore_nan(recs, "stage0_thres4mm_err"),
             "stage0_thres8mm_err": compute_mean_ignore_nan(recs, "stage0_thres8mm_err"),
             "s0_planar_ratio_pct": compute_mean_ignore_nan(recs, "s0_planar_ratio_pct"),
+            "stage1_mae": compute_mean_ignore_nan(recs, "stage1_mae"),
+            "stage1_planar_mae": compute_mean_ignore_nan(recs, "stage1_planar_mae"),
+            "s1_planar_ratio_pct": compute_mean_ignore_nan(recs, "s1_planar_ratio_pct"),
         }
 
     overall_summary = {
@@ -385,6 +432,9 @@ def main():
         "stage0_thres4mm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres4mm_err"),
         "stage0_thres8mm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres8mm_err"),
         "s0_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s0_planar_ratio_pct"),
+        "stage1_mae": compute_mean_ignore_nan(all_sample_records, "stage1_mae"),
+        "stage1_planar_mae": compute_mean_ignore_nan(all_sample_records, "stage1_planar_mae"),
+        "s1_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s1_planar_ratio_pct"),
     }
 
     report_lines = []
@@ -410,17 +460,21 @@ def main():
     )
 
     report_lines.append("\n## Table 2: 细分区域精度与平面特性分析 (Regional & Planar Analysis)")
-    report_lines.append("| 模型 / Scan | S0 全局 MAE (m) | S0 平面区 MAE (m) | S0 曲面/非平面 MAE (m) | 平面像素占比 (%) |")
-    report_lines.append("| :--- | :---: | :---: | :---: | :---: |")
+    report_lines.append("| 模型 / Scan | S0 全局 MAE (m) | S0 平面区 MAE (m) | S1 全局 MAE (m) | S1 平面区 MAE (m) | S0 曲面/非平面 MAE (m) | S0 平面占比 (%) | S1 平面占比 (%) |")
+    report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for scan, s in summary_by_scan.items():
-        p_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
+        p0_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
+        p1_str = f"{s['stage1_planar_mae']:.4f}" if not math.isnan(s['stage1_planar_mae']) else "N/A"
+        s1_m_str = f"{s['stage1_mae']:.4f}" if not math.isnan(s['stage1_mae']) else "N/A"
         c_str = f"{s['stage0_curved_mae']:.4f}" if not math.isnan(s['stage0_curved_mae']) else "N/A"
-        report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% |")
+        report_lines.append(f"| `{scan}` | {s['stage0_mae']:.4f} | {p0_str} | {s1_m_str} | {p1_str} | {c_str} | {s['s0_planar_ratio_pct']:.1f}% | {s['s1_planar_ratio_pct']:.1f}% |")
 
-    op_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
+    op0_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
+    op1_str = f"{overall_summary['stage1_planar_mae']:.4f}" if not math.isnan(overall_summary['stage1_planar_mae']) else "N/A"
+    os1_m_str = f"{overall_summary['stage1_mae']:.4f}" if not math.isnan(overall_summary['stage1_mae']) else "N/A"
     oc_str = f"{overall_summary['stage0_curved_mae']:.4f}" if not math.isnan(overall_summary['stage0_curved_mae']) else "N/A"
     report_lines.append(
-        f"| **DiffMVS (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** |"
+        f"| **DiffMVS (总计)** | **{overall_summary['stage0_mae']:.4f}** | **{op0_str}** | **{os1_m_str}** | **{op1_str}** | **{oc_str}** | **{overall_summary['s0_planar_ratio_pct']:.1f}%** | **{overall_summary['s1_planar_ratio_pct']:.1f}%** |"
     )
 
     report_text = "\n".join(report_lines)
