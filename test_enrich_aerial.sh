@@ -1,76 +1,95 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# ENRICH-Aerial_Data 航空遥感数据集独立评测执行脚本
-# 适配 2112x1408 超大分辨率与 1 参 2 源 (严格 3 视角)
+# ENRICH-Aerial 航空遥感大场景深度精度诊断与区域 MAE 排序评测脚本
+# 适配统一 eval() 机制 | 5 视角 | BatchSize 2 | 输出各拍摄组/区域排名
 # ==============================================================================
-set -e
+set -euo pipefail
 
-# 获取 PatchmatchNet-new 项目根目录
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
+export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# GPU 设定 (默认 GPU 0，可通过外部环境变量 GPU_ID=1 bash ... 灵活指定)
-GPU_ID=${GPU_ID:-3}
-export CUDA_VISIBLE_DEVICES=${GPU_ID}
+# GPU 设定 (默认 GPU 0，可通过外部环境变量 GPU_ID=1 bash ... 指定)
+GPU_ID="${GPU_ID:-0}"
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
-# 基础路径配置
-DATA_PATH=${DATA_PATH:-"/home/myao/Crop_Test_Dataset"}
-LIST_FILE=${LIST_FILE:-"/home/myao/Crop_Test_Dataset/scan_list.txt"}
-OUT_DIR=${OUT_DIR:-"./outputs_enrich_aerial_crop"}
-
-# 模型 Checkpoint 路径 (优先取第一个参数，否则使用默认权重)
-DEFAULT_CKPT="./checkpoints/tensorboard_train35/model_000033.ckpt"
-CKPT_FILE="${1:-$DEFAULT_CKPT}"
-
-# 掩码导出与深度保存配置
-SAVE_MASKS="${SAVE_MASKS:-true}"
-if [ "${SAVE_MASKS}" = "true" ]; then
-    MASK_OPT="--save_masks"
-else
-    MASK_OPT="--no_masks"
+# 数据集路径候选 (自动探查)
+DATA_PATH="${DATA_PATH:-/home/myao/ENRICH-Aerial_Cropped_0.6x_Overlap50/}"
+if [[ ! -d "${DATA_PATH}" ]]; then
+  if [[ -d "/home/myao/ENRICH-Aerial_Data/" ]]; then
+    DATA_PATH="/home/myao/ENRICH-Aerial_Data/"
+  elif [[ -d "/home/myao/Crop_Test_Dataset/" ]]; then
+    DATA_PATH="/home/myao/Crop_Test_Dataset/"
+  fi
 fi
 
-SAVE_DEPTH="${SAVE_DEPTH:-true}"
-if [ "${SAVE_DEPTH}" = "true" ]; then
-    DEPTH_OPT="--save_depth"
-else
-    DEPTH_OPT="--no_depth"
+TRAIN_LIST="${TRAIN_LIST:-lists/enrich_aerial/train.txt}"
+TEST_LIST="${TEST_LIST:-lists/enrich_aerial/test.txt}"
+OUT_DIR="${OUT_DIR:-./outputs_enrich_aerial_diag}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+N_VIEWS="${N_VIEWS:-5}"
+SPLIT="${SPLIT:-both}"   # 'both' (同时评测并对比训练集与测试集), 'test', 'train'
+BN_MODE="${BN_MODE:-eval}"   # 'eval' | 'batch' | 'recalib'
+RECALIB_BATCHES="${RECALIB_BATCHES:-200}"
+
+# 权重 Checkpoint 寻找机制
+CKPT_FILE="${1:-}"
+if [[ -z "${CKPT_FILE}" ]]; then
+  # 自动寻找 checkpoints 目录下最新的 .ckpt 文件
+  if [[ -d "./checkpoints" ]]; then
+    LATEST_CKPT=$(find ./checkpoints -name "*.ckpt" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+    if [[ -n "${LATEST_CKPT}" && -f "${LATEST_CKPT}" ]]; then
+      CKPT_FILE="${LATEST_CKPT}"
+    fi
+  fi
+fi
+
+if [[ -z "${CKPT_FILE}" || ! -f "${CKPT_FILE}" ]]; then
+  CKPT_FILE="./checkpoints/tensorboard_enrich_ours_6/model_000033.ckpt"
 fi
 
 mkdir -p "${OUT_DIR}"
-LOG_FILE="${OUT_DIR}/test_enrich_aerial.log"
+mkdir -p txt_logs
+timestamp=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="txt_logs/${timestamp}_eval_diag.log"
 
 echo "=============================================================================="
-echo "启动 ENRICH-Aerial_Data 航空遥感大场景评测系统"
-echo "当前主机: $(hostname) | 物理 GPU: ${GPU_ID}"
-echo "数据集路径: ${DATA_PATH}"
-echo "场景列表:   ${LIST_FILE}"
-echo "模型权重:   ${CKPT_FILE}"
-echo "输出目录:   ${OUT_DIR}"
-echo "日志文件:   ${LOG_FILE}"
+echo "启动 ENRICH-Aerial 航空遥感深度精度诊断评测系统"
+echo "  主机名称:   $(hostname)"
+echo "  物理 GPU:   ${GPU_ID}"
+echo "  数据集路径: ${DATA_PATH}"
+echo "  评估划分:   ${SPLIT} (both=同时同构评测训练集与测试集)"
+echo "  测试场景表: ${TEST_LIST}"
+echo "  训练场景表: ${TRAIN_LIST}"
+echo "  模型权重:   ${CKPT_FILE}"
+echo "  Batch Size: ${BATCH_SIZE}"
+echo "  视角数量:   ${N_VIEWS}"
+echo "  输出目录:   ${OUT_DIR}"
+echo "  日志保存:   ${LOG_FILE}"
 echo "=============================================================================="
 
-# 若传入了第一个参数作为 ckpt，则 shift 移除
+# 移去已经读取的 $1 参数
 if [ "$#" -gt 0 ]; then
-    shift
+  shift
 fi
 
 python "${PROJECT_DIR}/test_enrich_aerial.py" \
-    --dataset enrich_aerial \
-    --testpath "${DATA_PATH}" \
-    --testlist "${LIST_FILE}" \
-    --loadckpt "${CKPT_FILE}" \
-    --outdir "${OUT_DIR}" \
-    --batch_size 1 \
-    --n_views 3 \
-    --num_workers 2 \
-    ${MASK_OPT} \
-    ${DEPTH_OPT} \
-    "$@" 2>&1 | tee "${LOG_FILE}"
+  --dataset enrich_aerial \
+  --testpath "${DATA_PATH}" \
+  --trainlist "${TRAIN_LIST}" \
+  --testlist "${TEST_LIST}" \
+  --loadckpt "${CKPT_FILE}" \
+  --outdir "${OUT_DIR}" \
+  --split "${SPLIT}" \
+  --batch_size "${BATCH_SIZE}" \
+  --n_views "${N_VIEWS}" \
+  --num_workers 4 \
+  --bn_mode "${BN_MODE}" \
+  --recalib_batches "${RECALIB_BATCHES}" \
+  "$@" 2>&1 | tee "${LOG_FILE}"
 
 echo "=============================================================================="
-echo "ENRICH-Aerial_Data 评测已顺利完成！"
-echo "  - Markdown 评估报表: ${OUT_DIR}/test_summary.md"
-echo "  - 详细 JSON 数据:     ${OUT_DIR}/metrics.json"
-echo "  - 完整执行日志:       ${LOG_FILE}"
+echo "评测报告已生成！(BN 模式: ${BN_MODE})"
+echo "  - 报表: ${OUT_DIR}/${BN_MODE}/test_summary.md"
+echo "  - JSON: ${OUT_DIR}/${BN_MODE}/metrics_diagnostic.json"
+echo "  - 日志: ${LOG_FILE}"
 echo "=============================================================================="

@@ -489,7 +489,7 @@ def save_depth():
             outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                             sample_cuda["depth_min"], sample_cuda["depth_max"],
                             vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
-                            max_lambda_c, max_lambda_s,current_temp)
+                            max_lambda_c, max_lambda_s, progress=1.0)
 
 
             image_outputs_pre = generate_edge_alpha_overlays(
@@ -2711,7 +2711,7 @@ def save_depth_cross_check():
                 outputs = model(imgs_v, proj_v, intr_v,
                                 sample_cuda["depth_min"], sample_cuda["depth_max"],
                                 vertexs_batch, lines_batch, triangles_batch, None,
-                                0.0, 0.0, 0.55)
+                                0.0, 0.0, progress=1.0)
                                 
                 d1 = outputs["depth_patchmatch"]["stage_1"][-1].detach().cpu().numpy()[0]
                 d1 = np.squeeze(d1)
@@ -3566,7 +3566,7 @@ def export_planar_geometry_comparison(max_samples=2):
                 sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                 sample_cuda["depth_min"], sample_cuda["depth_max"],
                 vertexs_batch, lines_batch, triangles_batch, depth_stage_1,
-                args.lambda_c, 0.0, 0.55
+                args.lambda_c, 0.0, progress=1.0
             )
 
             # 3. 提取核心深度与置信度张量

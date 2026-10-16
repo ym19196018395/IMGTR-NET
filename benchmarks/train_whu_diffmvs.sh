@@ -40,7 +40,7 @@ LOG_DIR="${LOG_DIR:-${PATCHMATCHNET_DIR}/checkpoints/diffmvs_whu_train}"
 # ==============================================================================
 # 3. GPU 与训练超参数配置
 # ==============================================================================
-export GPU_ID="${GPU_ID:-2}"
+export GPU_ID="${GPU_ID:-3}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 # 训练 Batch Size: DiffMVS 包含扩散去噪迭代，建议设为 2 (若显存吃紧如 16G 显存可设为 1)

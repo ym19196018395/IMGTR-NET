@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1161,16 +1162,21 @@ class SimilarityNet(nn.Module):
         return score
 
 class PlanePatchMatchModule(nn.Module):
-    def __init__(self, num_hypotheses=3, G=8, feat_channels=16,propagator_iter=3):
+    def __init__(self, num_hypotheses=3, G=8, feat_channels=16, propagator_iter=3,
+                 pre_base_depth_thresh=0.10, pre_pixel_dist_thresh=1.2):
         """
         Args:
             num_hypotheses: K (假设数量)
             G: Group Correlation 的组数 (默认8)
             feat_channels: 传入EdgeHead的通道数
+            pre_base_depth_thresh: Pre-GNN 物理铁闸基础深度容限 (m)
+            pre_pixel_dist_thresh: Pre-GNN 物理铁闸2D像素距离容限 (px)
         """
         super().__init__()
 
         self.num_hypotheses = num_hypotheses
+        self.pre_base_depth_thresh = pre_base_depth_thresh
+        self.pre_pixel_dist_thresh = pre_pixel_dist_thresh
 
         self.G=G
 
@@ -1194,8 +1200,10 @@ class PlanePatchMatchModule(nn.Module):
 
     def forward(self,fitter_module, depth_stage1, tri_infos, ref_feature, src_features,
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights=None,
-                neighbor_indices_batched=None,lambda_c=0.0, lambda_s=0.0,current_temp=0.0,
-                src_raw_depths=None):
+                neighbor_indices_batched=None,lambda_c=0.0, lambda_s=0.0,
+                progress=None,
+                src_raw_depths=None,
+                pre_base_depth_thresh=None, pre_pixel_dist_thresh=None):
         """
         Args:
             fitter_module: 实例化好的 DensePlaneFitter 对象
@@ -1209,12 +1217,38 @@ class PlanePatchMatchModule(nn.Module):
             depth_min, depth_max: 深度范围
             view_weights: [B, N_view] (可选，视图权重)
             neighbor_indices_batched: 每个面的邻居索引 [B, N_tri, 3]
+            progress: 训练进度 [0.0 ~ 1.0]，未提供或测试时默认为 1.0
+            src_raw_depths: 源视图原始深度
+            pre_base_depth_thresh: Pre-GNN 物理铁闸基础深度容限 (m)
+            pre_pixel_dist_thresh: Pre-GNN 物理铁闸2D像素距离容限 (px)
 
         Returns:
             depth_samples: List[[B, 1, H, W]] (这里只返回一项)
             score: [B, 1, H, W] (置信度)
             view_weights: [B, N_view] (返回传入的权重或None)
         """
+        if pre_base_depth_thresh is None:
+            pre_base_depth_thresh = self.pre_base_depth_thresh
+        if pre_pixel_dist_thresh is None:
+            pre_pixel_dist_thresh = self.pre_pixel_dist_thresh
+
+        # 👑 统一无量纲进度解析与内部自洽调度 (解耦 GNN 温度退火与 Cross-Check 惩罚强度)
+        # 评测/验证模式 (not self.training) 或未提供 progress 时，强制锁定为最终完全收敛状态 (prog_val = 1.0)
+        if not self.training or progress is None:
+            prog_val = 1.0
+        else:
+            prog_val = max(0.0, min(float(progress), 1.0))
+
+        # 1. 内部计算 GNN 消息分配温度 (余弦退火 [1.0 -> 0.55]，收敛/评估期恒为 0.55)
+        cos_decay = 0.5 * (1.0 + math.cos(prog_val * math.pi))
+        gnn_temp = 0.55 + (1.0 - 0.55) * cos_decay
+
+        # 2. 内部计算 Pre-Cross-Check 惩罚强度 alpha (前 50% 步数余弦平滑升压至 1.0，后 50% 满载；评估期恒为 1.0)
+        if prog_val >= 0.5:
+            pre_cc_alpha = 1.0
+        else:
+            pre_cc_alpha = 0.5 * (1.0 - math.cos(math.pi * (prog_val / 0.5)))
+
         B, C, H, W = ref_feature.shape
         device = ref_feature.device
         self.fitter = fitter_module
@@ -1332,6 +1366,7 @@ class PlanePatchMatchModule(nn.Module):
         pixel_costs = torch.gather(pixel_costs, -1, best_k_pixel)  # [B, H, W, 1]
 
         # 渲染没有经过传播的 深度图和法向量图 后续用
+        self.initial_planes = current_planes.detach()
         no_prop_depth, no_propa_normal = visualizer.render_from_planes(
             current_planes.detach() ,  # 注意 detach，不传导梯度
             tri_id_map,
@@ -1361,8 +1396,8 @@ class PlanePatchMatchModule(nn.Module):
                 src_projs=src_projs,
                 tri_id_map=tri_id_map,
                 max_tri_num=max_tri_num,
-                base_depth_thresh=0.16,
-                pixel_dist_thresh=1.2,
+                base_depth_thresh=pre_base_depth_thresh,
+                pixel_dist_thresh=pre_pixel_dist_thresh,
                 normal_ref=no_propa_normal
             )
             tau_deg = 0.40  # 调高及格线门槛（原 0.35 提至 0.40），对冲 4 视角 max 极值虚高，卡死单视角偶然伪面
@@ -1370,6 +1405,11 @@ class PlanePatchMatchModule(nn.Module):
             min_penalty = 0.40
             penalty_cc = min_penalty + (1.0 - min_penalty) * torch.sigmoid((ratio_deg_init - tau_deg) / temperature_cc)
             
+            # 👑 动态课程化惩罚调节：p_eff = 1.0 - pre_cc_alpha * (1.0 - p)
+            # pre_cc_alpha 从 0.0 平滑过渡到 1.0：早期减轻冷启动压制，后期完全恢复严格铁闸
+            if pre_cc_alpha < 1.0:
+                penalty_cc = 1.0 - pre_cc_alpha * (1.0 - penalty_cc)
+
             # 仅对传入 GNN 循环的初始门控 W_plane_tri 施加冷启动压制
             W_plane_tri = W_plane_tri * penalty_cc
 
@@ -1457,7 +1497,7 @@ class PlanePatchMatchModule(nn.Module):
                 centroids_norm=centroids_norm,
                 midpoints_norm=aligned_midpoints_norm,  # 传入边缘中点用于 Cross-Star 探针
                 pixel_counts=pixel_counts_tensor,
-                temperature=current_temp,  # 可根据当前训练的 Epoch 动态退火压低
+                temperature=gnn_temp,  # 内部自洽余弦退火控温 [1.0 -> 0.55]
                 W_raw_anchor=W_raw_anchor,  # 刚性投递，防止置信度头多轮迭代后神经失忆
                 cross_costs=cross_costs_flat, # 传入 Cross-Cost
                 normalized_slope=normalized_slope,  # 传入绝对斜率特征 (对抗悬崖错分面)

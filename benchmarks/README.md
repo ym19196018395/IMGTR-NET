@@ -9,6 +9,14 @@
 ```
 benchmarks/
 ├── README.md                     # 本说明文档
+├── test_enrich_casmvsnet.py      # CasMVSNet ENRICH-Aerial 独立评测脚本
+├── test_enrich_casmvsnet.sh      # CasMVSNet ENRICH-Aerial 评测启动脚本
+├── train_enrich_casmvsnet.py     # CasMVSNet ENRICH-Aerial 从零训练适配器
+├── train_enrich_casmvsnet.sh     # CasMVSNet ENRICH-Aerial 训练启动脚本
+├── test_whu_casmvsnet.py         # CasMVSNet WHU-MVS 独立评测脚本
+├── test_whu_casmvsnet.sh         # CasMVSNet WHU-MVS 评测启动脚本
+├── train_whu_casmvsnet.py        # CasMVSNet WHU-MVS 训练适配器
+├── train_whu_casmvsnet.sh        # CasMVSNet WHU-MVS 训练启动脚本
 ├── test_whu_diffmvs.py           # DiffMVS / CasDiffMVS (IEEE TPAMI 2025) 独立评测与双表导出
 ├── test_whu_diffmvs.sh           # DiffMVS 评测启动脚本
 ├── train_whu_diffmvs.py          # DiffMVS 从零训练适配器

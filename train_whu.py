@@ -97,6 +97,12 @@ parser.add_argument('--clip_max_norm_plane', type=float, default=1.0, help='平�
 parser.add_argument('--clip_max_norm_refine', type=float, default=1.0, help='Refinement精修网络梯度裁剪阈值 (默认 1.0)')
 parser.add_argument('--clip_max_norm_total', type=float, default=2.0, help='全局梯度裁剪阈值 (在 clip_mode=global 时生效)')
 
+# Cross-Check 阈值参数透传
+parser.add_argument('--pre_base_depth_thresh', type=float, default=0.16, help='Pre-GNN Cross-Check 基础深度容限 (m)')
+parser.add_argument('--pre_pixel_dist_thresh', type=float, default=1.2, help='Pre-GNN Cross-Check 2D像素距离容限 (px)')
+parser.add_argument('--post_base_depth_thresh', type=float, default=0.10, help='Post-GNN Cross-Check 基础深度容限 (m)')
+parser.add_argument('--post_pixel_dist_thresh', type=float, default=1.2, help='Post-GNN Cross-Check 2D像素距离容限 (px)')
+
 # parse arguments and check
 args = parser.parse_args()
 if args.resume:  # store_true means set the variable as "True"
@@ -149,7 +155,11 @@ TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, collate
 model = PatchmatchNet(patchmatch_interval_scale=args.patchmatch_interval_scale,
                       propagation_range=args.patchmatch_range, patchmatch_iteration=args.patchmatch_iteration,
                       patchmatch_num_sample=args.patchmatch_num_sample,
-                      propagate_neighbors=args.propagate_neighbors, evaluate_neighbors=args.evaluate_neighbors)
+                      propagate_neighbors=args.propagate_neighbors, evaluate_neighbors=args.evaluate_neighbors,
+                      pre_base_depth_thresh=args.pre_base_depth_thresh,
+                      pre_pixel_dist_thresh=args.pre_pixel_dist_thresh,
+                      post_base_depth_thresh=args.post_base_depth_thresh,
+                      post_pixel_dist_thresh=args.post_pixel_dist_thresh)
 
 # if args.mode in ["train", "val"]:
 #     model = nn.DataParallel(model)
@@ -512,7 +522,15 @@ def compute_stage1_flat_region_mae_tensors(outputs, pixel_depth_s1, depth_gt_s1,
 
     # 3. 完美合成平面单纯形掩码场
     mask_valid = (pixel_depth_s1 > 0) & (depth_gt_s1 > 0) & tri_valid
-    mask_planar = mask_valid & (w_plane_pixel > 0.80)  # 严格对齐 0.80 刚性判据
+    if 'is_gt_planar_pixel' in output_plane_dict:
+        is_gt_planar_pixel = output_plane_dict['is_gt_planar_pixel']
+        if is_gt_planar_pixel.shape[2:] != depth_gt_s1.shape[2:]:
+            is_gt_planar_pixel = F.interpolate(
+                is_gt_planar_pixel.float(), size=depth_gt_s1.shape[2:], mode='nearest'
+            )
+        mask_planar = mask_valid & (is_gt_planar_pixel > 0.5)
+    else:
+        mask_planar = mask_valid & (w_plane_pixel > 0.80)  # 平滑回退到 0.80 刚性判据
 
     # 4. 解析空间绝对误差提取
     err_map_dense = torch.abs(pixel_depth_s1 - depth_gt_s1)
@@ -645,14 +663,11 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
     lambda_plane_s1=get_smooth_weight_with_decay(progress, 0.05, 0.15, 1.0, max_lambda_plane, end_ratio=1.0)
 
 
-    # 余弦柔和退火控温 [1.0 -> 0.55]，避免线性下坠引发 Softmax 阶跃相变
-    current_temp = cosine_temperature_schedule(progress)
-
     # 自动构建计算图（动态计算图），记录每个张量的操作历史（如卷积、激活、矩阵乘法等），从而在反向传播时能通过链式法则计算梯度
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch,depth_gt['stage_1'],
-                    lambda_c,lambda_s,current_temp, compute_edge_pixels=do_summary_image)
+                    lambda_c,lambda_s,progress=progress, compute_edge_pixels=do_summary_image)
 
     depth_est = outputs["refined_depth"]
 
@@ -768,6 +783,7 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
         B, H_s1, W_s1 = tri_id_map.shape
         tri_device = tri_id_map.device
         planar_soft_conf_s1_list = []
+        is_gt_planar_pixel_list = []
         gt_normal_map_s1_list = []
         
         for b in range(B):
@@ -776,25 +792,31 @@ def train_sample(sample, do_summary_image=False,global_step=0, total_steps=0):
                 tri_conf_b = sample_cuda['tri_weight_conf'][b].float()
             else:
                 tri_conf_b = sample_cuda['is_gt_planar'][b].float()
+            tri_is_planar_b = sample_cuda['is_gt_planar'][b].float()
             tri_normal_b = sample_cuda['tri_normal_cleaned'][b] # [N_tri, 3]
             tri_id_map_b = tri_id_map[b]                        # [H_s1, W_s1]
             
             dummy_conf = torch.cat([tri_conf_b, torch.tensor([0.0], device=tri_device)], dim=0)
+            dummy_is_planar = torch.cat([tri_is_planar_b, torch.tensor([0.0], device=tri_device)], dim=0)
             dummy_normal = torch.cat([tri_normal_b, torch.tensor([[0.0, 0.0, 0.0]], device=tri_device)], dim=0)
             
             safe_idx = torch.where(tri_id_map_b >= 0, tri_id_map_b, torch.tensor(tri_conf_b.shape[0], device=tri_device).long())
             
-            planar_soft_conf_s1_b = dummy_conf[safe_idx]  # [H_s1, W_s1]
-            gt_normal_map_s1_b = dummy_normal[safe_idx]    # [H_s1, W_s1, 3]
+            planar_soft_conf_s1_b = dummy_conf[safe_idx]      # [H_s1, W_s1]
+            is_gt_planar_pixel_b = dummy_is_planar[safe_idx]  # [H_s1, W_s1]
+            gt_normal_map_s1_b = dummy_normal[safe_idx]        # [H_s1, W_s1, 3]
             
             planar_soft_conf_s1_list.append(planar_soft_conf_s1_b)
+            is_gt_planar_pixel_list.append(is_gt_planar_pixel_b)
             gt_normal_map_s1_list.append(gt_normal_map_s1_b)
             
         planar_soft_conf_s1 = torch.stack(planar_soft_conf_s1_list, dim=0).unsqueeze(1) # [B, 1, H_s1, W_s1]
+        is_gt_planar_pixel = torch.stack(is_gt_planar_pixel_list, dim=0).unsqueeze(1)   # [B, 1, H_s1, W_s1]
         gt_normal_map_s1 = torch.stack(gt_normal_map_s1_list, dim=0) # [B, H_s1, W_s1, 3]
         
         # 将降级且清晰的 W_plane_gt 塞入输出字典，使 TensorBoard 可视化完全对齐！
         outputs["output_plane"]["W_plane_gt_pixel"] = planar_soft_conf_s1
+        outputs["output_plane"]["is_gt_planar_pixel"] = is_gt_planar_pixel
         outputs["output_plane"]["gt_normal_map_s1"] = gt_normal_map_s1
 
     loss_plane_s1 = loss_plane_s1 * lambda_plane_s1
@@ -1142,6 +1164,12 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
         sample_cuda['tri_conf_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_conf_cleaned']]
     if 'tri_normal_cleaned' in sample:
         sample_cuda['tri_normal_cleaned'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_normal_cleaned']]
+    if 'is_gt_planar' in sample:
+        sample_cuda['is_gt_planar'] = [torch.from_numpy(v).to(device).bool() for v in sample['is_gt_planar']]
+    if 'tri_weight_normal' in sample:
+        sample_cuda['tri_weight_normal'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_weight_normal']]
+    if 'tri_weight_conf' in sample:
+        sample_cuda['tri_weight_conf'] = [torch.from_numpy(v).to(device).float() for v in sample['tri_weight_conf']]
 
     depth_gt = sample_cuda["depth"]
     mask = sample_cuda["mask"]
@@ -1156,11 +1184,10 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
     max_lambda_cost = 0.0
     max_lambda_dnc_s1 = 0.05
 
-    current_temp = cosine_temperature_schedule(progress)
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"],
                     vertexs_batch, lines_batch, triangles_batch, depth_gt['stage_1'],
-                    max_lambda_c, max_lambda_s, current_temp, compute_edge_pixels=detailed_summary)
+                    max_lambda_c, max_lambda_s, progress=1.0, compute_edge_pixels=detailed_summary)
 
     depth_est = outputs["refined_depth"]
     depth_patchmatch = outputs["depth_patchmatch"]
@@ -1173,7 +1200,9 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
         B, H_s1, W_s1 = tri_id_map.shape
         tri_device = tri_id_map.device
         planar_soft_conf_s1_list = []
+        is_gt_planar_pixel_list = []
         gt_normal_map_s1_list = []
+        has_is_gt_planar = "is_gt_planar" in sample_cuda
         
         for b in range(B):
             tri_conf_b = sample_cuda['tri_conf_cleaned'][b]     # [N_tri]
@@ -1191,10 +1220,18 @@ def test_sample(sample, detailed_summary=False, global_step=0, total_steps=1):
             planar_soft_conf_s1_list.append(planar_soft_conf_s1_b)
             gt_normal_map_s1_list.append(gt_normal_map_s1_b)
             
+            if has_is_gt_planar:
+                tri_is_planar_b = sample_cuda['is_gt_planar'][b].float()
+                dummy_is_planar = torch.cat([tri_is_planar_b, torch.tensor([0.0], device=tri_device)], dim=0)
+                is_gt_planar_pixel_b = dummy_is_planar[safe_idx]
+                is_gt_planar_pixel_list.append(is_gt_planar_pixel_b)
+            
         planar_soft_conf_s1 = torch.stack(planar_soft_conf_s1_list, dim=0).unsqueeze(1) # [B, 1, H_s1, W_s1]
         gt_normal_map_s1 = torch.stack(gt_normal_map_s1_list, dim=0) # [B, H_s1, W_s1, 3]
         
         outputs["output_plane"]["W_plane_gt_pixel"] = planar_soft_conf_s1
+        if has_is_gt_planar:
+            outputs["output_plane"]["is_gt_planar_pixel"] = torch.stack(is_gt_planar_pixel_list, dim=0).unsqueeze(1)
         outputs["output_plane"]["gt_normal_map_s1"] = gt_normal_map_s1
 
     # ====================================================

@@ -16,9 +16,9 @@ if [[ -z "${MVS_TRAINING:-}" ]]; then
     fi
   done
 fi
-GPU_ID="${GPU_ID:-0}"
-RUN_NAME="${RUN_NAME:-enrich_ours}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+GPU_ID="${GPU_ID:-3}"
+RUN_NAME="${RUN_NAME:-enrich_ours_15}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 EPOCHS="${EPOCHS:-34}"
 
 if [[ -z "${MVS_TRAINING}" || ! -d "${MVS_TRAINING}" ]]; then
@@ -31,6 +31,7 @@ fi
 mkdir -p txt_logs
 timestamp=$(date +%Y%m%d_%H%M%S)
 export GPU_ID
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 python train_enrich_aerial.py \
   --trainpath "${MVS_TRAINING}" \
@@ -45,10 +46,12 @@ python train_enrich_aerial.py \
   --propagate_neighbors 0 8 16 \
   --evaluate_neighbors 9 9 9 \
   --patchmatch_interval_scale 0.005 0.0125 0.025 \
-  --lrepochs "22,26,30:2" \
+  --lrepochs "22,28,30:2" \
   --logdir "./checkpoints/tensorboard_${RUN_NAME}" \
   --clip_mode independent \
   --normal_gt_mode soft \
   --conf_gt_mode hard \
+  --pre_base_depth_thresh 0.18 \
+  --post_base_depth_thresh 0.12 \
   "$@" \
-  2>&1 | tee "txt_logs/${timestamp}_${RUN_NAME}.log"
+  2>&1 | tee "txt_logs/${timestamp}_调整学习率,修改数据集平面置信度阈值0.5_0.09${RUN_NAME}.log"

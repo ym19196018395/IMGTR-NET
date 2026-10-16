@@ -90,7 +90,7 @@ def evaluate_single_sample_stage1(model, sample, device):
         sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["intrinsics_mats"],
         sample_cuda["depth_min"], sample_cuda["depth_max"],
         vertexs_batch, lines_batch, triangles_batch, depth_gt['stage_1'],
-        0.0, 0.0, 0.55, compute_edge_pixels=False
+        0.0, 0.0, progress=1.0, compute_edge_pixels=False
     )
     return outputs, depth_gt, mask, sample_cuda
 

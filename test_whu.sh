@@ -11,7 +11,7 @@ OUT_DIR="./outputs_minitest"
 
 # 2. Checkpoint 配置（优先使用命令行第一个参数，若无则使用默认模型权重）
 # 例如: ./test.sh ./checkpoints/tensorboard_train19/model_000033.ckpt
-DEFAULT_CKPT="./checkpoints/tensorboard_train44/model_000033.ckpt"
+DEFAULT_CKPT="./checkpoints/tensorboard_train49/model_000031.ckpt"
 CKPT_FILE="${1:-$DEFAULT_CKPT}"
 
 # 3. GPU 设备配置（默认使用 3 号 GPU，也可通过外部环境变量临时指定：GPU_ID=2 ./test.sh）
@@ -19,7 +19,7 @@ export GPU_ID="${GPU_ID:-3}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 # 4. 掩码导出配置 (默认 false 开启快速评测模式：不写掩码图像到磁盘以极速跑完测试；若需导出掩码可设置 SAVE_MASKS=true ./test_whu.sh)
-SAVE_MASKS="${SAVE_MASKS:-false}"
+SAVE_MASKS="${SAVE_MASKS:-true}"
 if [ "${SAVE_MASKS}" = "true" ]; then
     MASK_OPT="--save_masks"
 else

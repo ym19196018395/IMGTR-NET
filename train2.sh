@@ -43,10 +43,10 @@ python train_whu.py --dataset dtu_whu --batch_size 4 --epochs 34 \
 --patchmatch_interval_scale 0.005 0.0125 0.025 \
 --lrepochs "22,26,30:2" \
 --trainpath=$MVS_TRAINING --trainlist lists/whu/newtrain.txt --vallist lists/whu/minitest.txt \
---logdir ./checkpoints/tensorboard_train45 \
+--logdir ./checkpoints/tensorboard_train51 \
 --clip_mode independent \
 --normal_gt_mode soft --conf_gt_mode hard \
 --run_big_eval \
-2>&1 | tee txt_logs/${timestamp}_45_5d取消cost,取消全局梯度裁剪,跑34轮.log \
+2>&1 | tee txt_logs/${timestamp}_51_微调阈值is-gt-plane.log \
  "$@"
 

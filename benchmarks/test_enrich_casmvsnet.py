@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import copy
 import time
 import json
 import math
@@ -31,6 +32,17 @@ from utils import print_args, tocuda
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 cudnn.benchmark = True
 
+_BN_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+
+
+def extract_region_name(scan_name):
+    """从切片名称中提取拍摄组/测区名称 (例如 scan_031_p00 -> scan_031)"""
+    if "_p" in scan_name:
+        parts = scan_name.split("_p")
+        if len(parts) > 1 and parts[-1].isdigit():
+            return "_p".join(parts[:-1])
+    return scan_name
+
 
 # ==============================================================================
 # 0. 环境兼容层: InPlaceABN 与 kornia 降级保护
@@ -51,6 +63,7 @@ except ImportError:
             self.affine = affine
             self.activation = activation
             self.activation_param = activation_param
+            self.track_running_stats = True
 
             if self.affine:
                 self.weight = nn.Parameter(torch.ones(num_features))
@@ -64,8 +77,10 @@ except ImportError:
             self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
         def forward(self, x):
+            running_mean = self.running_mean if getattr(self, 'track_running_stats', True) else None
+            running_var = self.running_var if getattr(self, 'track_running_stats', True) else None
             x = F.batch_norm(
-                x, self.running_mean, self.running_var,
+                x, running_mean, running_var,
                 self.weight, self.bias,
                 self.training, self.momentum, self.eps
             )
@@ -115,18 +130,22 @@ except ImportError:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="ENRICH-Aerial_Data 航空遥感场景 CasMVSNet (CVPR 2020) 独立基准评测系统"
+        description="ENRICH-Aerial 航空遥感场景 CasMVSNet (CVPR 2020) A/B 模式独立基准评测系统"
     )
     # 数据集与路径
     parser.add_argument('--dataset', default='enrich_aerial', type=str, help='数据集定义名称')
-    parser.add_argument('--testpath', default="/home/myao/ENRICH-Aerial_Data", type=str, help='ENRICH 数据集根目录')
-    parser.add_argument('--testlist', default="/home/myao/ENRICH-Aerial_Data/scan_list.txt", type=str, help='测试场景列表文件')
+    parser.add_argument('--testpath', default="", type=str, help='ENRICH 数据集根目录 (留空自动探查)')
+    parser.add_argument('--testlist', default="lists/enrich_aerial/test.txt", type=str, help='测试场景列表文件')
     parser.add_argument('--loadckpt', required=True, type=str, help='CasMVSNet Checkpoint 权重路径 (.ckpt 或 .pth)')
     parser.add_argument('--casmvsnet_code_dir', default="", type=str,
                         help='外部 CasMVSNet 源码目录 (如 /home/myao/CasMVSNet_pl-master)')
     parser.add_argument('--mask_dir', default="./outputs_enrich_aerial", type=str,
                         help='同源平面掩码目录 (由 test_enrich_aerial.py 生成的 stage0/1_planar_mask_*.png)')
     parser.add_argument('--outdir', default="./outputs_casmvsnet_enrich", type=str, help='评测报告与结果保存目录')
+
+    # A/B 诊断模式配置
+    parser.add_argument('--bn_mode', default='both', choices=['both', 'eval', 'batch'],
+                        help='BN诊断模式: both(A/B双路对比) | eval(模式A 固化全局统计) | batch(模式B 动态即时统计)')
 
     # 批次与硬件
     parser.add_argument('--batch_size', type=int, default=1, help='测试批次大小 (航测大图建议 1)')
@@ -148,7 +167,7 @@ def parse_args():
 
 class CasMVSNetWrapper(nn.Module):
     """
-    ENRICH-Aerial_Data 航测数据基准评测适配包装器：将 DataLoader 输出动态转换为 CasMVSNet 输入
+    ENRICH-Aerial 航测数据基准评测适配包装器：将 DataLoader 输出动态转换为 CasMVSNet 输入
     """
     def __init__(self, casmvsnet_class, n_depths=[8, 32, 48], interval_ratios=[1.0, 2.0, 4.0], num_groups=1):
         super().__init__()
@@ -183,9 +202,6 @@ class CasMVSNetWrapper(nn.Module):
             imgs = imgs.view(B, n_views, 3, H + pad_h, W + pad_w)
 
         # 3. 构造 3 阶段多尺度相对投影矩阵 [B, V-1, 3, 3, 4] (顺序: fine to coarse)
-        # level 0: stage_0 (1/1)
-        # level 1: stage_1 (1/2)
-        # level 2: stage_2 (1/4)
         P_0 = sample_cuda["proj_matrices"]["stage_0"][:, :n_views]
         P_1 = sample_cuda["proj_matrices"]["stage_1"][:, :n_views]
         P_2 = sample_cuda["proj_matrices"]["stage_2"][:, :n_views]
@@ -201,7 +217,7 @@ class CasMVSNetWrapper(nn.Module):
             proj_mats.append(rel_proj[:, :, :3, :4])
         proj_mats = torch.stack(proj_mats, dim=1)
 
-        # 4. 深度范围与粗阶段假设步长计算 (CasMVSNet 要求形状必须为 [B, 1])
+        # 4. 深度范围与粗阶段假设步长计算
         init_depth_min = sample_cuda["depth_min"].view(B, 1).float()
         depth_max = sample_cuda["depth_max"].view(B, 1).float()
         coarse_coverage = float(self.n_depths[-1] * self.interval_ratios[-1])
@@ -216,41 +232,24 @@ class CasMVSNetWrapper(nn.Module):
         )
 
         # 6. 提取各尺度预测深度
-        # Stage 0: 全分辨率 [B, 1, H, W]
         depth_pred_s0 = outputs["depth_0"]
+        depth_pred_s1 = outputs["depth_1"]
+        depth_pred_s2 = outputs["depth_2"]
+        confidence = outputs["confidence_0"]
+
+        # 7. 若做了 Padding，还原为原始图像有效几何区域
         if pad_h > 0 or pad_w > 0:
             depth_pred_s0 = depth_pred_s0[:, :H, :W]
-        depth_pred_s0 = depth_pred_s0.unsqueeze(1)
+            depth_pred_s1 = depth_pred_s1[:, :H//2, :W//2]
+            depth_pred_s2 = depth_pred_s2[:, :H//4, :W//4]
+            confidence = confidence[:, :H, :W]
 
-        # Stage 1: 半分辨率 [B, 1, H//2, W//2]
-        depth_pred_s1 = None
-        if "depth_1" in outputs:
-            d1 = outputs["depth_1"]
-            if pad_h > 0 or pad_w > 0:
-                d1 = d1[:, :H // 2, :W // 2]
-            depth_pred_s1 = d1.unsqueeze(1)
-
-        # Stage 2: 1/4 分辨率 [B, 1, H//4, W//4]
-        depth_pred_s2 = None
-        if "depth_2" in outputs:
-            d2 = outputs["depth_2"]
-            if pad_h > 0 or pad_w > 0:
-                d2 = d2[:, :H // 4, :W // 4]
-            depth_pred_s2 = d2.unsqueeze(1)
-
-        # 全分辨率置信度
-        confidence = None
-        if "confidence_0" in outputs:
-            conf = outputs["confidence_0"]
-            if pad_h > 0 or pad_w > 0:
-                conf = conf[:, :H, :W]
-            confidence = conf.unsqueeze(1)
-
-        return depth_pred_s0, depth_pred_s1, depth_pred_s2, confidence
+        # 统一输出尺度: [B, 1, H, W]
+        return depth_pred_s0.unsqueeze(1), depth_pred_s1.unsqueeze(1), depth_pred_s2.unsqueeze(1), confidence
 
 
 def safe_mae(depth_est, depth_gt, mask):
-    """安全计算掩码区域内的绝对深度误差 MAE (m)"""
+    """安全计算 MAE (米)"""
     if mask is None or not mask.any():
         return float('nan')
     est_valid = depth_est[mask]
@@ -259,7 +258,7 @@ def safe_mae(depth_est, depth_gt, mask):
 
 
 def safe_thres_error(depth_est, depth_gt, mask, thres):
-    """安全计算误差大于特定阈值 (m) 的离群点比例"""
+    """安全计算误差大于阈值的比率 [0.0 ~ 1.0]"""
     if mask is None or not mask.any():
         return float('nan')
     est_valid = depth_est[mask]
@@ -269,52 +268,166 @@ def safe_thres_error(depth_est, depth_gt, mask, thres):
 
 
 def load_casmvsnet_ckpt(model, ckpt_path):
-    """兼容加载 PyTorch-Lightning 与原生 PyTorch 权重文件"""
-    if not os.path.exists(ckpt_path):
+    """稳健加载 CasMVSNet 权重"""
+    if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"🚨 Checkpoint 文件不存在: {ckpt_path}")
 
-    print(f"[Model] 载入 CasMVSNet 权重: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    print(f"[Model] 正在载入 Checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
 
-    if 'state_dict' in checkpoint:
-        raw_state = checkpoint['state_dict']
-    elif 'model' in checkpoint:
-        raw_state = checkpoint['model']
-    else:
-        raw_state = checkpoint
-
-    cleaned_state = {}
-    for k, v in raw_state.items():
+    clean_state = {}
+    for k, v in state_dict.items():
         clean_k = k
-        if clean_k.startswith('module.'):
-            clean_k = clean_k[7:]
-        if clean_k.startswith('model.'):
+        if clean_k.startswith("model."):
             clean_k = clean_k[6:]
-        if not clean_k.startswith('net.'):
-            clean_k = 'net.' + clean_k
-        cleaned_state[clean_k] = v
+        if clean_k.startswith("module."):
+            clean_k = clean_k[7:]
+        clean_state[clean_k] = v
 
-    missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
+    missing, unexpected = model.net.load_state_dict(clean_state, strict=False)
+    print(f"[Model] 权重加载成功！(缺失键数: {len(missing)}, 冗余键数: {len(unexpected)})")
     if len(missing) > 0:
-        print(f"[Model Warning] 缺失参数 (前5个): {missing[:5]}")
-    if len(unexpected) > 0:
-        print(f"[Model Warning] 冗余参数 (前5个): {unexpected[:5]}")
-    print("✓ CasMVSNet 模型权重载入成功！")
+        print(f"  -> 缺失前 5 项: {missing[:5]}")
+
+
+def evaluate_single_pass(model, test_loader, mode_tag, device, args):
+    """执行单个模式（Mode A 或 Mode B）的全量评测"""
+    print("--------------------------------------------------------------------------------")
+    print(f"🚀 开始执行 [{mode_tag}] 评测 (总样本批次: {len(test_loader)})")
+    print("--------------------------------------------------------------------------------")
+
+    all_records = []
+    per_scan_records = {}
+    start_time = time.time()
+
+    with torch.no_grad():
+        for batch_idx, sample in enumerate(test_loader):
+            step_start = time.time()
+            B = sample['imgs']['stage_0'].shape[0]
+
+            skip = ["vertexs", "lines", "triangles", "scan", "file_id"]
+            sample_cuda = tocuda(sample, device=device, skip_keys=skip)
+
+            # 前向推理
+            depth_est_s0, depth_est_s1, depth_est_s2, confidence = model(sample_cuda, n_views=args.n_views)
+
+            depth_gt_s0 = sample_cuda["depth"]["stage_0"]
+            mask_gt_s0 = (sample_cuda["mask"]["stage_0"] > 0.5)
+
+            depth_gt_s1 = sample_cuda["depth"]["stage_1"]
+            mask_gt_s1 = (sample_cuda["mask"]["stage_1"] > 0.5)
+
+            depth_gt_s2 = sample_cuda["depth"]["stage_2"]
+            mask_gt_s2 = (sample_cuda["mask"]["stage_2"] > 0.5)
+
+            for b in range(B):
+                scan = sample['scan'][b]
+                file_id = sample['file_id'][b]
+                region = extract_region_name(scan)
+                tag = f"{scan}_{file_id}"
+
+                if scan not in per_scan_records:
+                    per_scan_records[scan] = []
+
+                m_b_s0 = mask_gt_s0[b:b+1]
+                d_est_b_s0 = depth_est_s0[b:b+1]
+                d_gt_b_s0 = depth_gt_s0[b:b+1]
+
+                # 读取同源平面切片掩码
+                planar_mask_s0_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
+                has_planar_mask_s0 = False
+                if os.path.exists(planar_mask_s0_file):
+                    m_planar_np_s0 = cv2.imread(planar_mask_s0_file, cv2.IMREAD_GRAYSCALE)
+                    if m_planar_np_s0 is not None:
+                        m_planar_t_s0 = (torch.from_numpy(m_planar_np_s0).to(device) > 128).unsqueeze(0).unsqueeze(0)
+                        m_planar_b_s0 = m_b_s0 & m_planar_t_s0
+                        m_curved_b_s0 = m_b_s0 & (~m_planar_t_s0)
+                        has_planar_mask_s0 = True
+
+                if not has_planar_mask_s0:
+                    m_planar_b_s0 = torch.zeros_like(m_b_s0)
+                    m_curved_b_s0 = m_b_s0
+
+                s0_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_b_s0)
+                s1_mae = safe_mae(depth_est_s1[b:b+1], depth_gt_s1[b:b+1], mask_gt_s1[b:b+1]) if depth_est_s1 is not None else float('nan')
+                s2_mae = safe_mae(depth_est_s2[b:b+1], depth_gt_s2[b:b+1], mask_gt_s2[b:b+1]) if depth_est_s2 is not None else float('nan')
+
+                t10_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.10)
+                t20_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.20)
+                t50_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.50)
+
+                s0_planar_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_planar_b_s0) if has_planar_mask_s0 else float('nan')
+                s0_curved_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_curved_b_s0) if has_planar_mask_s0 else float('nan')
+
+                valid_cnt_s0 = m_b_s0.sum().item()
+                planar_cnt_s0 = m_planar_b_s0.sum().item()
+                planar_ratio_s0 = (planar_cnt_s0 / valid_cnt_s0 * 100.0) if valid_cnt_s0 > 0 else 0.0
+
+                record = {
+                    "idx": len(all_records) + 1,
+                    "scan": scan,
+                    "region": region,
+                    "file_id": file_id,
+                    "tag": tag,
+                    "s0": s0_mae,
+                    "s1": s1_mae,
+                    "s2": s2_mae,
+                    "err_10cm": t10_err,
+                    "err_20cm": t20_err,
+                    "err_50cm": t50_err,
+                    "s0_planar": s0_planar_mae,
+                    "s0_curved": s0_curved_mae,
+                    "planar_ratio": planar_ratio_s0,
+                }
+
+                per_scan_records[scan].append(record)
+                all_records.append(record)
+
+            if (batch_idx + 1) % 6 == 0 or (batch_idx + 1) == len(test_loader):
+                cur_rec = all_records[-1]
+                print(f"  [{mode_tag}] 进度: {batch_idx + 1:2d}/{len(test_loader)} | 切片: {cur_rec['tag']:22s} | "
+                      f"S0: {cur_rec['s0']:.4f}m | S1: {cur_rec['s1']:.4f}m | S2: {cur_rec['s2']:.4f}m")
+
+    elapsed = time.time() - start_time
+    print(f"✓ [{mode_tag}] 评测完成，总耗时: {elapsed:.1f}s\n")
+    return all_records, per_scan_records
+
+
+def compute_summary(records):
+    """计算全样本平均指标"""
+    return {
+        "s0": float(np.nanmean([r['s0'] for r in records])),
+        "s1": float(np.nanmean([r['s1'] for r in records])),
+        "s2": float(np.nanmean([r['s2'] for r in records])),
+        "err_10cm": float(np.nanmean([r['err_10cm'] for r in records])) * 100.0,
+        "err_20cm": float(np.nanmean([r['err_20cm'] for r in records])) * 100.0,
+        "err_50cm": float(np.nanmean([r['err_50cm'] for r in records])) * 100.0,
+        "s0_planar": float(np.nanmean([r['s0_planar'] for r in records])),
+        "s0_curved": float(np.nanmean([r['s0_curved'] for r in records])),
+        "planar_ratio": float(np.nanmean([r['planar_ratio'] for r in records])),
+    }
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
 
-    print("=" * 85)
-    print("ENRICH-Aerial_Data 航测大场景 CasMVSNet 独立评测系统 (严格 3 视角纯推理)")
-    print("=" * 85)
-    print_args(args)
+    # 1. 自动探查数据路径
+    if not args.testpath:
+        candidates = [
+            "/home/myao/ENRICH-Aerial_Cropped_0.6x_Overlap50/",
+            "/home/myao/ENRICH-Aerial_Data/",
+            "/home/myao/Crop_Test_Dataset/"
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                args.testpath = c
+                break
 
-    os.makedirs(args.outdir, exist_ok=True)
+    if not args.testpath or not os.path.isdir(args.testpath):
+        raise FileNotFoundError(f"未找到 ENRICH 数据集根目录，请通过 --testpath 明确指定")
 
-    # 1. 动态挂载外部 CasMVSNet 源码
+    # 2. 挂载外部 CasMVSNet 源码
     casmvsnet_root = os.path.abspath(args.casmvsnet_code_dir) if args.casmvsnet_code_dir else ""
     if not (casmvsnet_root and os.path.isdir(casmvsnet_root)):
         candidates = [
@@ -322,22 +435,16 @@ def main():
             "/home/ym/Experiment/CasMVSNet_pl-master",
             "/home/myao/CasMVSNet",
             "/home/ym/Experiment/CasMVSNet",
-            os.path.join(PROJECT_ROOT, "..", "CasMVSNet_pl-master"),
-            os.path.join(PROJECT_ROOT, "..", "CasMVSNet"),
+            os.path.abspath(os.path.join(PROJECT_ROOT, "..", "CasMVSNet_pl-master")),
+            os.path.abspath(os.path.join(PROJECT_ROOT, "..", "CasMVSNet_pl-master", "CasMVSNet_pl-master")),
+            os.path.abspath(os.path.join(PROJECT_ROOT, "..", "CasMVSNet")),
         ]
         for c in candidates:
             if os.path.isdir(c):
-                casmvsnet_root = os.path.abspath(c)
+                casmvsnet_root = c
+                print(f"[Auto-Detect] 自动探测并挂载 CasMVSNet 源码路径: {casmvsnet_root}")
                 break
 
-    if not (casmvsnet_root and os.path.isdir(casmvsnet_root)):
-        raise RuntimeError(
-            f"🚨 未找到外部 CasMVSNet 源码目录！请通过 --casmvsnet_code_dir 指定。"
-        )
-
-    print(f"[External] 动态挂载 CasMVSNet 源码目录: {casmvsnet_root}")
-
-    # 动态安全挂载外部 CasMVSNet 的 models.mvsnet，杜绝与主仓 models 命名空间冲突
     old_models = sys.modules.pop('models', None)
     old_models_sub = {k: sys.modules.pop(k) for k in list(sys.modules.keys()) if k.startswith('models.')}
     if casmvsnet_root and casmvsnet_root not in sys.path:
@@ -347,10 +454,7 @@ def main():
         from models.mvsnet import CascadeMVSNet
         from models.modules import homo_warp, depth_regression
     except ImportError as e:
-        raise ImportError(
-            f"🚨 无法导入 CascadeMVSNet 模型！请确认 --casmvsnet_code_dir 参数指向正确的 CasMVSNet 源码目录。\n"
-            f"原始错误: {e}"
-        )
+        raise ImportError(f"🚨 无法导入 CascadeMVSNet 核心模块！请检查 --casmvsnet_code_dir。\n错误: {e}")
     finally:
         if casmvsnet_root and casmvsnet_root in sys.path:
             sys.path.remove(casmvsnet_root)
@@ -358,7 +462,7 @@ def main():
             sys.modules['models'] = old_models
         sys.modules.update(old_models_sub)
 
-    # 动态修复原版 CasMVSNet 在 eval 模式下因 in-place 操作广播张量导致的崩溃问题
+    # 动态修补 CasMVSNet 在 eval 模式下因 in-place 广播操作导致崩溃的 Bug
     def patch_casmvsnet_predict_depth():
         from einops import rearrange, repeat, reduce
 
@@ -374,25 +478,20 @@ def main():
             ref_volume = repeat(ref_volume, 'b c 1 h w -> b c d h w', d=D)
             if self.G == 1:
                 volume_sum = ref_volume.clone()
-                volume_sq_sum = ref_volume ** 2
+                volume_sq_sum = ref_volume.pow(2)
             else:
-                ref_volume = ref_volume.view(B, self.G, C // self.G, *ref_volume.shape[-3:])
-                volume_sum = 0
-            del ref_feats
+                volume_sum = repeat(ref_feats, 'b (g c) h w -> b g c 1 h w', g=self.G)
+                volume_sum = repeat(volume_sum, 'b g c 1 h w -> b g c d h w', d=D).clone()
 
             for src_feat, proj_mat in zip(src_feats, proj_mats):
                 warped_volume = homo_warp(src_feat, proj_mat, depth_values)
-                warped_volume = warped_volume.to(ref_volume.dtype)
                 if self.G == 1:
-                    volume_sum = volume_sum + warped_volume
-                    volume_sq_sum = volume_sq_sum + warped_volume ** 2
+                    volume_sum += warped_volume
+                    volume_sq_sum += warped_volume.pow(2)
                 else:
-                    warped_volume = warped_volume.view_as(ref_volume)
-                    if self.training:
-                        volume_sum = volume_sum + warped_volume
-                    else:
-                        volume_sum += warped_volume
-                del warped_volume, src_feat, proj_mat
+                    warped_volume = rearrange(warped_volume, 'b (g c) d h w -> b g c d h w', g=self.G)
+                    volume_sum += warped_volume
+                del warped_volume
             del src_feats, proj_mats
 
             if self.G == 1:
@@ -428,275 +527,188 @@ def main():
 
     patch_casmvsnet_predict_depth()
 
-    # 2. 构建 Dataset 与 DataLoader
+    # 3. 构建 DataLoader
     MVSDataset = find_dataset_def(args.dataset)
-    print(f"\n[Dataset] 加载 ENRICH-Aerial 数据集: path={args.testpath}, listfile={args.testlist}")
     test_dataset = MVSDataset(args.testpath, args.testlist, mode="test", nviews=args.n_views)
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False,
         collate_fn=collate_keep_list, num_workers=args.num_workers,
-        pin_memory=True, persistent_workers=(args.num_workers > 0), drop_last=False
+        pin_memory=True, drop_last=False
     )
-    print(f"[Dataset] 测试集样本总量: {len(test_dataset)} (共 {len(test_loader)} 个批次)\n")
 
-    # 3. 实例化模型并载入权重
-    model = CasMVSNetWrapper(
+    print("=" * 85)
+    print("ENRICH-Aerial CasMVSNet (CVPR 2020) A / B 对照诊断评测系统")
+    print("=" * 85)
+    print(f"  数据集根目录:   {args.testpath}")
+    print(f"  测试列表路径:   {args.testlist}")
+    print(f"  模型 Checkpoint: {args.loadckpt}")
+    print(f"  输入视角数:     {args.n_views}")
+    print(f"  BN 诊断模式:    {args.bn_mode.upper()}")
+    print(f"  测试样本总数:   {len(test_dataset)} 张")
+    print("=" * 85)
+
+    # 4. 构建基准模型并载入权重
+    base_model = CasMVSNetWrapper(
         casmvsnet_class=CascadeMVSNet,
         n_depths=args.n_depths,
         interval_ratios=args.interval_ratios,
         num_groups=args.num_groups
     ).to(device)
+    load_casmvsnet_ckpt(base_model, args.loadckpt)
+    clean_state_dict = copy.deepcopy(base_model.state_dict())
 
-    load_casmvsnet_ckpt(model, args.loadckpt)
-    model.eval()
+    records_A = None
+    records_B = None
 
-    per_scan_records = {}
-    all_sample_records = []
-    start_eval_time = time.time()
+    # =========================================================================
+    # 评测 1: 模式 A (标准 eval - 原始全局 running 统计量)
+    # =========================================================================
+    if args.bn_mode in ['both', 'eval']:
+        model_A = copy.deepcopy(base_model)
+        model_A.load_state_dict(clean_state_dict)
+        model_A.eval()
+        for m in model_A.modules():
+            if isinstance(m, _BN_TYPES) or hasattr(m, 'track_running_stats') or m.__class__.__name__.endswith('ABN'):
+                m.eval()
+                if hasattr(m, 'track_running_stats'):
+                    m.track_running_stats = True
+        records_A, _ = evaluate_single_pass(model_A, test_loader, mode_tag="Mode A (原全局统计)", device=device, args=args)
+        del model_A
+        torch.cuda.empty_cache()
 
-    print("\n" + "=" * 85)
-    print("开始执行 ENRICH-Aerial_Data CasMVSNet 逐场景推断与 Table 1 / Table 2 精度评测...")
+    # =========================================================================
+    # 评测 2: 模式 B (动态单图 BN 统计 - track_running_stats=False 严格防污染)
+    # =========================================================================
+    if args.bn_mode in ['both', 'batch']:
+        model_B = copy.deepcopy(base_model)
+        model_B.load_state_dict(clean_state_dict)
+        model_B.eval()
+        for m in model_B.modules():
+            if isinstance(m, _BN_TYPES) or hasattr(m, 'track_running_stats') or m.__class__.__name__.endswith('ABN'):
+                m.train()
+                if hasattr(m, 'track_running_stats'):
+                    m.track_running_stats = False
+                if hasattr(m, 'momentum'):
+                    m.momentum = 0.0
+        records_B, _ = evaluate_single_pass(model_B, test_loader, mode_tag="Mode B (单图动态统计)", device=device, args=args)
+        del model_B
+        torch.cuda.empty_cache()
+
+    # =========================================================================
+    # 报表生成逻辑
+    # =========================================================================
+    os.makedirs(args.outdir, exist_ok=True)
+
+    if args.bn_mode == 'both' and records_A is not None and records_B is not None:
+        sum_A = compute_summary(records_A)
+        sum_B = compute_summary(records_B)
+
+        regions = sorted(list(set(r['region'] for r in records_A)))
+        reg_summary = {}
+        for reg in regions:
+            recs_reg_A = [r for r in records_A if r['region'] == reg]
+            recs_reg_B = [r for r in records_B if r['region'] == reg]
+            reg_summary[reg] = {
+                "count": len(recs_reg_A),
+                "s0_A": float(np.nanmean([r['s0'] for r in recs_reg_A])),
+                "s0_B": float(np.nanmean([r['s0'] for r in recs_reg_B])),
+                "s1_B": float(np.nanmean([r['s1'] for r in recs_reg_B])),
+                "s2_B": float(np.nanmean([r['s2'] for r in recs_reg_B])),
+                "s0_planar_B": float(np.nanmean([r['s0_planar'] for r in recs_reg_B])),
+                "s0_curved_B": float(np.nanmean([r['s0_curved'] for r in recs_reg_B])),
+                "planar_ratio_B": float(np.nanmean([r['planar_ratio'] for r in recs_reg_B])),
+            }
+
+        s0_gain = ((sum_A['s0'] - sum_B['s0']) / sum_A['s0']) * 100.0 if sum_A['s0'] > 0 else 0.0
+
+        report_md = f"""# ENRICH-Aerial 测试集 A / B 对照与精度评估报告 (CasMVSNet)
+
+- **评估样本集**: `TEST` (列表: `{args.testlist}`)
+- **样本总切片数**: {len(test_dataset)} 张
+- **Checkpoint**: `{args.loadckpt}`
+- **Batch Size**: {args.batch_size} (严格单卡单切片，与训练同构)
+- **输入视角数**: {args.n_views} 视角
+
+---
+
+## 🏆 1. 全局多尺度深度精度核心对比表 (Table 1: Global Accuracy)
+
+| 对照组 (Mode) | 运行环境与 BN 机制 | S0 最终 MAE | S1 中层 MAE | S2 粗层 MAE | >10cm 误差率 | >20cm 误差率 | >50cm 误差率 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **模式 A** | 标准 `model.eval()` (原全局 running 统计) | **{sum_A['s0']:.4f} m** | {sum_A['s1']:.4f} m | {sum_A['s2']:.4f} m | {sum_A['err_10cm']:.1f}% | {sum_A['err_20cm']:.1f}% | {sum_A['err_50cm']:.1f}% |
+| **模式 B** | `eval()` + BN 动态单图统计 (即时批统计) | **{sum_B['s0']:.4f} m** | **{sum_B['s1']:.4f} m** | **{sum_B['s2']:.4f} m** | **{sum_B['err_10cm']:.1f}%** | **{sum_B['err_20cm']:.1f}%** | **{sum_B['err_50cm']:.1f}%** |
+
+---
+
+## 🎯 2. 诊断结论与关键指标对比
+
+1. **S0 最终精度增益**: 模式 B 将 S0 MAE 从 **{sum_A['s0']:.4f}m** 调整至 **{sum_B['s0']:.4f}m**（相对变动 **{s0_gain:+.1f}%**）。
+2. **多尺度收敛对比**:
+   - S1 中层 MAE: 模式 A **{sum_A['s1']:.4f}m** vs 模式 B **{sum_B['s1']:.4f}m**
+   - S2 粗层 MAE: 模式 A **{sum_A['s2']:.4f}m** vs 模式 B **{sum_B['s2']:.4f}m**
+3. **离群误差抑制**:
+   - >10cm 误差率: 模式 A **{sum_A['err_10cm']:.1f}%** vs 模式 B **{sum_B['err_10cm']:.1f}%**
+   - >20cm 误差率: 模式 A **{sum_A['err_20cm']:.1f}%** vs 模式 B **{sum_B['err_20cm']:.1f}%**
+   - >50cm 误差率: 模式 A **{sum_A['err_50cm']:.1f}%** vs 模式 B **{sum_B['err_50cm']:.1f}%**
+
+---
+
+## 📌 3. 测试集各拍摄组 / 区域表现对比表 (Table 2: Regional Breakdown)
+
+| 拍摄组 (Region) | 切片数 | 模式 A (S0 MAE) | 模式 B (S0 MAE) | 模式 B 增益 | S1 MAE (B) | S2 MAE (B) | S0 平面 MAE (B) | 平面占比 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+"""
+        for reg, d in reg_summary.items():
+            diff_BA = ((d['s0_A'] - d['s0_B']) / d['s0_A']) * 100.0 if d['s0_A'] > 0 else 0.0
+            report_md += (f"| `{reg}` | {d['count']} | {d['s0_A']:.4f} m | **{d['s0_B']:.4f} m** | "
+                          f"`{diff_BA:+.1f}%` | {d['s1_B']:.4f} m | {d['s2_B']:.4f} m | "
+                          f"{d['s0_planar_B']:.4f} m | {d['planar_ratio_B']:.1f}% |\n")
+
+        report_md += f"""
+---
+
+## 📋 4. 逐切片详细指标明细表 (Sample Records Preview)
+
+| 序号 | 切片标签 | 模式 A (S0 MAE) | 模式 B (S0 MAE) | S1 (B) | S2 (B) | 模式 B 增益 |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+"""
+        for i in range(len(records_A)):
+            tag = records_A[i]['tag']
+            mA = records_A[i]['s0']
+            mB = records_B[i]['s0']
+            s1_b = records_B[i]['s1']
+            s2_b = records_B[i]['s2']
+            gain = ((mA - mB) / mA) * 100.0 if mA > 0 else 0.0
+            report_md += f"| {i+1} | `{tag}` | {mA:.4f} m | **{mB:.4f} m** | {s1_b:.4f} m | {s2_b:.4f} m | `{gain:+.1f}%` |\n"
+
+        print("\n" + report_md)
+
+        report_file = os.path.join(args.outdir, "casmvsnet_ab_diagnostic_report.md")
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(report_md)
+        with open(os.path.join(args.outdir, "casmvsnet_enrich_summary.md"), "w", encoding="utf-8") as f:
+            f.write(report_md)
+        print(f"✓ 对照 Markdown 报告已保存至: {report_file}")
+
+        json_file = os.path.join(args.outdir, "casmvsnet_ab_metrics.json")
+        with open(json_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "summary": {"A": sum_A, "B": sum_B},
+                "regions": reg_summary,
+                "records_A": records_A,
+                "records_B": records_B
+            }, f, indent=2)
+        print(f"✓ 结构化 JSON 数据已保存至: {json_file}")
+
+    else:
+        # 单模式运行 (Mode A 或 Mode B)
+        recs = records_A if records_A is not None else records_B
+        tag_name = "Mode A" if records_A is not None else "Mode B"
+        summ = compute_summary(recs)
+        print(f"\n[Summary {tag_name}] S0 MAE: {summ['s0']:.4f}m | S1: {summ['s1']:.4f}m | S2: {summ['s2']:.4f}m | "
+              f">10cm: {summ['err_10cm']:.1f}% | >20cm: {summ['err_20cm']:.1f}% | >50cm: {summ['err_50cm']:.1f}%")
+
     print("=" * 85)
-
-    with torch.no_grad():
-        for batch_idx, sample in enumerate(test_loader):
-            step_start = time.time()
-            B = sample['imgs']['stage_0'].shape[0]
-
-            skip = ["vertexs", "lines", "triangles", "scan", "file_id"]
-            sample_cuda = tocuda(sample, device=device, skip_keys=skip)
-
-            # 前向推理: 输出 Stage 0, Stage 1, Stage 2 深度预测
-            depth_est_s0, depth_est_s1, depth_est_s2, confidence = model(sample_cuda, n_views=args.n_views)
-
-            depth_gt_s0 = sample_cuda["depth"]["stage_0"]
-            mask_gt_s0 = (sample_cuda["mask"]["stage_0"] > 0.5)
-
-            depth_gt_s1 = sample_cuda["depth"]["stage_1"]
-            mask_gt_s1 = (sample_cuda["mask"]["stage_1"] > 0.5)
-
-            depth_gt_s2 = sample_cuda["depth"]["stage_2"]
-            mask_gt_s2 = (sample_cuda["mask"]["stage_2"] > 0.5)
-
-            for b in range(B):
-                scan = sample['scan'][b]
-                file_id = sample['file_id'][b]
-
-                if scan not in per_scan_records:
-                    per_scan_records[scan] = []
-
-                m_b_s0 = mask_gt_s0[b:b+1]
-                d_est_b_s0 = depth_est_s0[b:b+1]
-                d_gt_b_s0 = depth_gt_s0[b:b+1]
-
-                # 读取同源平面切片掩码 (由 test_enrich_aerial.py 保存)
-                planar_mask_s0_file = os.path.join(args.mask_dir, scan, "masks", f"stage0_planar_mask_{file_id}.png")
-                has_planar_mask_s0 = False
-                if os.path.exists(planar_mask_s0_file):
-                    m_planar_np_s0 = cv2.imread(planar_mask_s0_file, cv2.IMREAD_GRAYSCALE)
-                    if m_planar_np_s0 is not None:
-                        m_planar_t_s0 = (torch.from_numpy(m_planar_np_s0).to(device) > 128).unsqueeze(0).unsqueeze(0)
-                        m_planar_b_s0 = m_b_s0 & m_planar_t_s0
-                        m_curved_b_s0 = m_b_s0 & (~m_planar_t_s0)
-                        has_planar_mask_s0 = True
-
-                if not has_planar_mask_s0:
-                    m_planar_b_s0 = torch.zeros_like(m_b_s0)
-                    m_curved_b_s0 = m_b_s0
-
-                # --- Table 1: 全图多尺度全局深度精度与误差分布 ---
-                s0_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_b_s0)
-                s1_mae = safe_mae(depth_est_s1[b:b+1], depth_gt_s1[b:b+1], mask_gt_s1[b:b+1]) if depth_est_s1 is not None else float('nan')
-                s2_mae = safe_mae(depth_est_s2[b:b+1], depth_gt_s2[b:b+1], mask_gt_s2[b:b+1]) if depth_est_s2 is not None else float('nan')
-
-                # 航测场景误差阈值 (0.05m, 0.10m, 0.20m, 0.50m)
-                t05_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.05)
-                t10_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.10)
-                t20_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.20)
-                t50_err = safe_thres_error(d_est_b_s0, d_gt_b_s0, m_b_s0, 0.50)
-
-                # --- Table 2: 细分平面区与曲面区精度评测 ---
-                s0_planar_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_planar_b_s0) if has_planar_mask_s0 else float('nan')
-                s0_curved_mae = safe_mae(d_est_b_s0, d_gt_b_s0, m_curved_b_s0) if has_planar_mask_s0 else float('nan')
-
-                valid_cnt_s0 = m_b_s0.sum().item()
-                planar_cnt_s0 = m_planar_b_s0.sum().item()
-                planar_ratio_s0 = (planar_cnt_s0 / valid_cnt_s0 * 100.0) if valid_cnt_s0 > 0 else 0.0
-
-                # Stage 1 平面特性
-                s1_planar_mae = float('nan')
-                s1_curved_mae = float('nan')
-                planar_ratio_s1 = 0.0
-                if depth_est_s1 is not None:
-                    m_b_s1 = mask_gt_s1[b:b+1]
-                    d_est_b_s1 = depth_est_s1[b:b+1]
-                    d_gt_b_s1 = depth_gt_s1[b:b+1]
-
-                    planar_mask_s1_file = os.path.join(args.mask_dir, scan, "masks", f"stage1_planar_mask_{file_id}.png")
-                    has_planar_mask_s1 = False
-                    if os.path.exists(planar_mask_s1_file):
-                        m_planar_np_s1 = cv2.imread(planar_mask_s1_file, cv2.IMREAD_GRAYSCALE)
-                        if m_planar_np_s1 is not None:
-                            m_planar_t_s1 = (torch.from_numpy(m_planar_np_s1).to(device) > 128).unsqueeze(0).unsqueeze(0)
-                            m_planar_b_s1 = m_b_s1 & m_planar_t_s1
-                            m_curved_b_s1 = m_b_s1 & (~m_planar_t_s1)
-                            has_planar_mask_s1 = True
-
-                    if has_planar_mask_s1:
-                        s1_planar_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_planar_b_s1)
-                        s1_curved_mae = safe_mae(d_est_b_s1, d_gt_b_s1, m_curved_b_s1)
-                        valid_cnt_s1 = m_b_s1.sum().item()
-                        planar_cnt_s1 = m_planar_b_s1.sum().item()
-                        planar_ratio_s1 = (planar_cnt_s1 / valid_cnt_s1 * 100.0) if valid_cnt_s1 > 0 else 0.0
-
-                record = {
-                    "scan": scan,
-                    "file_id": file_id,
-                    "stage0_mae": s0_mae,
-                    "stage1_mae": s1_mae,
-                    "stage2_mae": s2_mae,
-                    "stage0_thres05cm_err": t05_err,
-                    "stage0_thres10cm_err": t10_err,
-                    "stage0_thres20cm_err": t20_err,
-                    "stage0_thres50cm_err": t50_err,
-                    "stage0_planar_mae": s0_planar_mae,
-                    "stage0_curved_mae": s0_curved_mae,
-                    "s0_valid_pixels": valid_cnt_s0,
-                    "s0_planar_pixels": planar_cnt_s0,
-                    "s0_planar_ratio_pct": planar_ratio_s0,
-                    "stage1_planar_mae": s1_planar_mae,
-                    "stage1_curved_mae": s1_curved_mae,
-                    "s1_planar_ratio_pct": planar_ratio_s1,
-                }
-
-                per_scan_records[scan].append(record)
-                all_sample_records.append(record)
-
-                # 保存预测深度图
-                if args.save_depth:
-                    depth_save_dir = os.path.join(args.outdir, scan, "depths")
-                    os.makedirs(depth_save_dir, exist_ok=True)
-                    d_s0_np = d_est_b_s0[0, 0].cpu().numpy()
-                    save_pfm(os.path.join(depth_save_dir, f"casmvsnet_depth_{file_id}.pfm"), d_s0_np)
-                    depth_png_s0 = np.clip(d_s0_np * 64.0, 0, 65535).astype(np.uint16)
-                    cv2.imwrite(os.path.join(depth_save_dir, f"casmvsnet_depth_{file_id}.png"), depth_png_s0)
-
-            cur_idx = batch_idx + 1
-            step_time = time.time() - step_start
-            p0_str = f"{record['stage0_planar_mae']:.4f}m" if not math.isnan(record['stage0_planar_mae']) else "N/A"
-            p1_str = f"{record['stage1_planar_mae']:.4f}m" if not math.isnan(record['stage1_planar_mae']) else "N/A"
-            s0_mae_str = f"{record['stage0_mae']:.4f}m" if not math.isnan(record['stage0_mae']) else "N/A"
-            print(f"[{cur_idx:03d}/{len(test_loader):03d}] Scan: {scan} | Img: {file_id} | "
-                  f"CasMVSNet S0 MAE: {s0_mae_str} | S0 Planar: {p0_str} | S1 Planar: {p1_str} | Time: {step_time:.2f}s")
-
-    eval_duration = time.time() - start_eval_time
-    print("\n" + "=" * 85)
-    print(f"评测完成！共评估 {len(all_sample_records)} 个场景，总耗时: {eval_duration:.2f} 秒。")
-    print("=" * 85)
-
-    # 4. 汇总生成 Markdown 双表
-    def compute_mean_ignore_nan(records, key):
-        vals = [r[key] for r in records if key in r and not math.isnan(r[key])]
-        return float(np.mean(vals)) if len(vals) > 0 else float('nan')
-
-    summary_by_scan = {}
-    for scan, recs in per_scan_records.items():
-        summary_by_scan[scan] = {
-            "count": len(recs),
-            "stage0_mae": compute_mean_ignore_nan(recs, "stage0_mae"),
-            "stage1_mae": compute_mean_ignore_nan(recs, "stage1_mae"),
-            "stage2_mae": compute_mean_ignore_nan(recs, "stage2_mae"),
-            "stage0_thres05cm_err": compute_mean_ignore_nan(recs, "stage0_thres05cm_err"),
-            "stage0_thres10cm_err": compute_mean_ignore_nan(recs, "stage0_thres10cm_err"),
-            "stage0_thres20cm_err": compute_mean_ignore_nan(recs, "stage0_thres20cm_err"),
-            "stage0_thres50cm_err": compute_mean_ignore_nan(recs, "stage0_thres50cm_err"),
-            "stage0_planar_mae": compute_mean_ignore_nan(recs, "stage0_planar_mae"),
-            "stage0_curved_mae": compute_mean_ignore_nan(recs, "stage0_curved_mae"),
-            "s0_planar_ratio_pct": compute_mean_ignore_nan(recs, "s0_planar_ratio_pct"),
-            "stage1_planar_mae": compute_mean_ignore_nan(recs, "stage1_planar_mae"),
-            "stage1_curved_mae": compute_mean_ignore_nan(recs, "stage1_curved_mae"),
-            "s1_planar_ratio_pct": compute_mean_ignore_nan(recs, "s1_planar_ratio_pct"),
-        }
-
-    overall_summary = {
-        "count": len(all_sample_records),
-        "stage0_mae": compute_mean_ignore_nan(all_sample_records, "stage0_mae"),
-        "stage1_mae": compute_mean_ignore_nan(all_sample_records, "stage1_mae"),
-        "stage2_mae": compute_mean_ignore_nan(all_sample_records, "stage2_mae"),
-        "stage0_thres05cm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres05cm_err"),
-        "stage0_thres10cm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres10cm_err"),
-        "stage0_thres20cm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres20cm_err"),
-        "stage0_thres50cm_err": compute_mean_ignore_nan(all_sample_records, "stage0_thres50cm_err"),
-        "stage0_planar_mae": compute_mean_ignore_nan(all_sample_records, "stage0_planar_mae"),
-        "stage0_curved_mae": compute_mean_ignore_nan(all_sample_records, "stage0_curved_mae"),
-        "s0_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s0_planar_ratio_pct"),
-        "stage1_planar_mae": compute_mean_ignore_nan(all_sample_records, "stage1_planar_mae"),
-        "stage1_curved_mae": compute_mean_ignore_nan(all_sample_records, "stage1_curved_mae"),
-        "s1_planar_ratio_pct": compute_mean_ignore_nan(all_sample_records, "s1_planar_ratio_pct"),
-    }
-
-    report_lines = []
-    report_lines.append("# ENRICH-Aerial_Data 航空遥感场景基准评测报告: CasMVSNet (CVPR 2020)\n")
-    report_lines.append(f"- **模型权重**: `{args.loadckpt}`")
-    report_lines.append(f"- **数据集路径**: `{args.testpath}`")
-    report_lines.append(f"- **测试场景数**: {len(summary_by_scan)} 个 (共 {overall_summary['count']} 张样本)")
-    report_lines.append(f"- **同源掩码目录**: `{args.mask_dir}`")
-    report_lines.append(f"- **视角配置**: 1 参 2 源 (严格 3 视角)\n")
-
-    # Table 1: 全图多尺度全局深度精度
-    report_lines.append("## Table 1: 全图多尺度全局深度精度与误差分布 (Global Depth Accuracy)")
-    report_lines.append("| Scan | 样本数 | S0 MAE (m) | S1 MAE (m) | S2 MAE (m) | >5cm 误差率 (%) | >10cm 误差率 (%) | >20cm 误差率 (%) | >50cm 误差率 (%) |")
-    report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    for scan, s in summary_by_scan.items():
-        s1_str = f"{s['stage1_mae']:.4f}" if not math.isnan(s['stage1_mae']) else "N/A"
-        s2_str = f"{s['stage2_mae']:.4f}" if not math.isnan(s['stage2_mae']) else "N/A"
-        report_lines.append(
-            f"| `{scan}` | {s['count']} | **{s['stage0_mae']:.4f}** | {s1_str} | {s2_str} | "
-            f"{s['stage0_thres05cm_err']*100:.2f}% | {s['stage0_thres10cm_err']*100:.2f}% | "
-            f"{s['stage0_thres20cm_err']*100:.2f}% | {s['stage0_thres50cm_err']*100:.2f}% |"
-        )
-    os1_str = f"{overall_summary['stage1_mae']:.4f}" if not math.isnan(overall_summary['stage1_mae']) else "N/A"
-    os2_str = f"{overall_summary['stage2_mae']:.4f}" if not math.isnan(overall_summary['stage2_mae']) else "N/A"
-    report_lines.append(
-        f"| **CasMVSNet (总计)** | **{overall_summary['count']}** | **{overall_summary['stage0_mae']:.4f}** | "
-        f"**{os1_str}** | **{os2_str}** | "
-        f"**{overall_summary['stage0_thres05cm_err']*100:.2f}%** | **{overall_summary['stage0_thres10cm_err']*100:.2f}%** | "
-        f"**{overall_summary['stage0_thres20cm_err']*100:.2f}%** | **{overall_summary['stage0_thres50cm_err']*100:.2f}%** |"
-    )
-
-    # Table 2: 细分平面与曲面特性评测
-    report_lines.append("\n## Table 2: 细分平面与曲面特性评测 (Planar vs Non-Planar Accuracy)")
-    report_lines.append("| Scan | S0 平面 MAE (m) | S0 曲面 MAE (m) | S1 平面 MAE (m) | S1 曲面 MAE (m) | S0 平面占比 (%) | S1 平面占比 (%) |")
-    report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
-    for scan, s in summary_by_scan.items():
-        p0_str = f"{s['stage0_planar_mae']:.4f}" if not math.isnan(s['stage0_planar_mae']) else "N/A"
-        c0_str = f"{s['stage0_curved_mae']:.4f}" if not math.isnan(s['stage0_curved_mae']) else "N/A"
-        p1_str = f"{s['stage1_planar_mae']:.4f}" if not math.isnan(s['stage1_planar_mae']) else "N/A"
-        c1_str = f"{s['stage1_curved_mae']:.4f}" if not math.isnan(s['stage1_curved_mae']) else "N/A"
-        report_lines.append(f"| `{scan}` | **{p0_str}** | {c0_str} | **{p1_str}** | {c1_str} | {s['s0_planar_ratio_pct']:.2f}% | {s['s1_planar_ratio_pct']:.2f}% |")
-
-    op0_str = f"{overall_summary['stage0_planar_mae']:.4f}" if not math.isnan(overall_summary['stage0_planar_mae']) else "N/A"
-    oc0_str = f"{overall_summary['stage0_curved_mae']:.4f}" if not math.isnan(overall_summary['stage0_curved_mae']) else "N/A"
-    op1_str = f"{overall_summary['stage1_planar_mae']:.4f}" if not math.isnan(overall_summary['stage1_planar_mae']) else "N/A"
-    oc1_str = f"{overall_summary['stage1_curved_mae']:.4f}" if not math.isnan(overall_summary['stage1_curved_mae']) else "N/A"
-    report_lines.append(
-        f"| **CasMVSNet (总计)** | **{op0_str}** | **{oc0_str}** | **{op1_str}** | **{oc1_str}** | "
-        f"**{overall_summary['s0_planar_ratio_pct']:.2f}%** | **{overall_summary['s1_planar_ratio_pct']:.2f}%** |"
-    )
-
-    report_text = "\n".join(report_lines)
-    print("\n" + report_text)
-
-    # 保存报告与指标 JSON
-    report_file = os.path.join(args.outdir, "casmvsnet_enrich_summary.md")
-    with open(report_file, "w", encoding="utf-8") as f:
-        f.write(report_text)
-    print(f"\n[Output] 完整评估报表已保存至: {report_file}")
-
-    json_file = os.path.join(args.outdir, "casmvsnet_enrich_records.json")
-    with open(json_file, "w", encoding="utf-8") as f:
-        json.dump({"overall": overall_summary, "by_scan": summary_by_scan, "records": all_sample_records}, f, indent=2)
-    print(f"[Output] 详细样本指标记录已保存至: {json_file}")
 
 
 if __name__ == '__main__':

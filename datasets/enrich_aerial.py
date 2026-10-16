@@ -304,7 +304,7 @@ class MVSDataset(Dataset):
             degrade_mask = (tri_conf > 0.80) & (tri_err95 > 0.08)
             tri_conf[degrade_mask] = 0.75
 
-            is_gt_planar = (tri_conf > 0.60) & (tri_err95 < 0.08)
+            is_gt_planar = (tri_conf > 0.50) & (tri_err95 < 0.09)
             valid_conf = tri_conf > 0.60
 
             # 法向连续加权 W_norm 与 置信度损失衰减权重 W_loss_conf

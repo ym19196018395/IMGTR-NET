@@ -40,7 +40,7 @@ LOG_DIR="${LOG_DIR:-${PATCHMATCHNET_DIR}/checkpoints/geomvsnet_whu_train}"
 # ==============================================================================
 # 3. GPU 与训练超参数配置
 # ==============================================================================
-export GPU_ID="${GPU_ID:-2}"
+export GPU_ID="${GPU_ID:-4}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 # 训练 Batch Size: GeoMVSNet 包含代价体构建，显存占用较高，建议设为 2 (若显存吃紧可改为 1)

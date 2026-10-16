@@ -50,11 +50,12 @@ else
 fi
 
 # 2. 检查 Checkpoint 路径
-# 优先从命令行首个参数 $1 传入，否则自动探测常见权重路径
 DEFAULT_CKPT=${1:-""}
 if [ -z "${DEFAULT_CKPT}" ]; then
     CKPT_CANDIDATES=(
-        "checkpoints/casmvsnet_whu_train/model_15.ckpt"
+        "${PATCHMATCHNET_DIR}/checkpoints/casmvsnet_enrich_1/model_best.ckpt"
+        "${PATCHMATCHNET_DIR}/checkpoints/casmvsnet_enrich_1/model_15.ckpt"
+        "${PATCHMATCHNET_DIR}/checkpoints/casmvsnet_whu_train/model_15.ckpt"
         "/home/ym/Experiment/CasMVSNet_pl-master/ckpts/exp2/_ckpt_epoch_10.ckpt"
         "/home/myao/CasMVSNet_pl-master/ckpts/_ckpt_epoch_10.ckpt"
         "${CASMVSNET_DIR}/ckpts/exp2/_ckpt_epoch_10.ckpt"
@@ -83,17 +84,41 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # 3. 数据集与输出路径配置
-DATA_PATH=${DATA_PATH:-"/home/myao/ENRICH-Aerial_Data"}
-LIST_FILE=${LIST_FILE:-"/home/myao/ENRICH-Aerial_Data/scan_list.txt"}
-MASK_DIR=${MASK_DIR:-"${PATCHMATCHNET_DIR}/outputs_enrich_aerial"}
-OUT_DIR=${OUT_DIR:-"${PATCHMATCHNET_DIR}/outputs_casmvsnet_enrich"}
+if [ -z "${DATA_PATH:-}" ]; then
+    DATA_CANDIDATES=(
+        "/home/myao/ENRICH-Aerial_Cropped_0.6x_Overlap50/"
+        "/home/myao/ENRICH-Aerial_Data/"
+        "/home/myao/Crop_Test_Dataset/"
+    )
+    for c in "${DATA_CANDIDATES[@]}"; do
+        if [ -d "$c" ]; then
+            DATA_PATH="$c"
+            break
+        fi
+    done
+fi
+DATA_PATH=${DATA_PATH:-"/home/myao/ENRICH-Aerial_Cropped_0.6x_Overlap50/"}
 
-LOG_FILE="${OUT_DIR}/test_enrich_casmvsnet.log"
+if [ -z "${LIST_FILE:-}" ]; then
+    if [ -f "${PATCHMATCHNET_DIR}/lists/enrich_aerial/test.txt" ]; then
+        LIST_FILE="${PATCHMATCHNET_DIR}/lists/enrich_aerial/test.txt"
+    elif [ -f "${DATA_PATH}/scan_list.txt" ]; then
+        LIST_FILE="${DATA_PATH}/scan_list.txt"
+    fi
+fi
+LIST_FILE=${LIST_FILE:-"lists/enrich_aerial/test.txt"}
+
+MASK_DIR=${MASK_DIR:-"${PATCHMATCHNET_DIR}/outputs_enrich_aerial"}
+OUT_DIR=${OUT_DIR:-"${PATCHMATCHNET_DIR}/outputs_casmvsnet_enrich_diag"}
+BN_MODE=${BN_MODE:-"both"}
+
+LOG_FILE="${OUT_DIR}/test_enrich_casmvsnet_ab.log"
 mkdir -p "${OUT_DIR}"
 
 echo "  -> 测试数据集路径: ${DATA_PATH}"
 echo "  -> 测试场景列表:   ${LIST_FILE}"
 echo "  -> 同源平面掩码:   ${MASK_DIR}"
+echo "  -> BN 诊断模式:    ${BN_MODE}"
 echo "  -> 评测输出目录:   ${OUT_DIR}"
 echo "  -> 终端执行日志:   ${LOG_FILE}"
 echo "=============================================================================="
@@ -107,8 +132,9 @@ python "${SCRIPT_DIR}/test_enrich_casmvsnet.py" \
     --casmvsnet_code_dir "${CASMVSNET_DIR}" \
     --mask_dir "${MASK_DIR}" \
     --outdir "${OUT_DIR}" \
+    --bn_mode "${BN_MODE}" \
     --batch_size 1 \
-    --n_views 3 \
+    --n_views 5 \
     --num_workers 2 \
     --n_depths 8 32 48 \
     --interval_ratios 1.0 2.0 4.0 \

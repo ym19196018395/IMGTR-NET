@@ -138,6 +138,10 @@ class Refinement(nn.Module):
 
     def forward(self, img, depth_0, depth_min, depth_max, w_plane_s0=None):
         batch_size = depth_min.size()[0]
+        img = img.float()
+        depth_0 = depth_0.float()
+        depth_min = depth_min.float()
+        depth_max = depth_max.float()
         # pre-scale the depth map into [0,1]
         depth = (depth_0-depth_min.view(batch_size,1,1,1))/(depth_max.view(batch_size,1,1,1)-depth_min.view(batch_size,1,1,1))
         
@@ -388,7 +392,9 @@ class PatchmatchNet(nn.Module):
     """ 主体网络，执行 coarse→fine 的可学习 PatchMatch 深度估计"""
     def __init__(self, patchmatch_interval_scale = [0.005, 0.0125, 0.025], propagation_range = [6,4,2],
                 patchmatch_iteration = [1,2,2], patchmatch_num_sample = [8,8,16], propagate_neighbors = [0,8,16],
-                evaluate_neighbors = [9,9,9]):
+                evaluate_neighbors = [9,9,9],
+                pre_base_depth_thresh=0.10, pre_pixel_dist_thresh=1.2,
+                post_base_depth_thresh=0.10, post_pixel_dist_thresh=1.2):
         """Initialize modules in PatchmatchNet
 
         Args:
@@ -398,8 +404,17 @@ class PatchmatchNet(nn.Module):
             patchmatch_num_sample: patchmatch number of samples，每个 stage 初始随机采样数量（候选深度数）
             propagate_neighbors: number of propagation neighbors，在传播/evaluation 阶段每像素考虑多少邻域位置
             evaluate_neighbors: number of propagation neighbors for evaluation
+            pre_base_depth_thresh: Pre-GNN 物理铁闸基础深度容限 (m)
+            pre_pixel_dist_thresh: Pre-GNN 物理铁闸2D像素距离容限 (px)
+            post_base_depth_thresh: Post-GNN Cross-Check 基础深度容限 (m)
+            post_pixel_dist_thresh: Post-GNN Cross-Check 2D像素距离容限 (px)
         """
         super(PatchmatchNet, self).__init__()
+
+        self.pre_base_depth_thresh = pre_base_depth_thresh
+        self.pre_pixel_dist_thresh = pre_pixel_dist_thresh
+        self.post_base_depth_thresh = post_base_depth_thresh
+        self.post_pixel_dist_thresh = post_pixel_dist_thresh
 
         self.stages = 4
         # 获取特征
@@ -438,17 +453,30 @@ class PatchmatchNet(nn.Module):
         self.num_hypotheses = 3
         self.tau = 1.0
 
-        self.plane_patchmatch_agent = PlanePatchMatchModule(num_hypotheses=self.num_hypotheses, G=8,
-                                                            feat_channels=num_features[1],
-                                                            propagator_iter=3)
+        self.plane_patchmatch_agent = PlanePatchMatchModule(
+            num_hypotheses=self.num_hypotheses, G=8,
+            feat_channels=num_features[1],
+            propagator_iter=3,
+            pre_base_depth_thresh=self.pre_base_depth_thresh,
+            pre_pixel_dist_thresh=self.pre_pixel_dist_thresh
+        )
 
         self.stage1_refine = GeometricRefinement(in_channels=16)
 
         # 注入高度工程集成的 Stage 0 抛光引擎
         self.stage0_refiner = Stage0RefinementNet_V2(in_channels=13)
 
-    def forward(self, imgs, proj_matrices, intrinsics_mats, depth_min, depth_max, vertexs, lines, triangles, depth_stage_1, lambda_c, lambda_s, current_temp=1.0, compute_edge_pixels=False):
-        
+    def forward(self, imgs, proj_matrices, intrinsics_mats, depth_min, depth_max, vertexs, lines, triangles, depth_stage_1, lambda_c, lambda_s, progress=None, compute_edge_pixels=False,
+                pre_base_depth_thresh=None, pre_pixel_dist_thresh=None,
+                post_base_depth_thresh=None, post_pixel_dist_thresh=None):
+        if pre_base_depth_thresh is None:
+            pre_base_depth_thresh = self.pre_base_depth_thresh
+        if pre_pixel_dist_thresh is None:
+            pre_pixel_dist_thresh = self.pre_pixel_dist_thresh
+        if post_base_depth_thresh is None:
+            post_base_depth_thresh = self.post_base_depth_thresh
+        if post_pixel_dist_thresh is None:
+            post_pixel_dist_thresh = self.post_pixel_dist_thresh
 
         imgs_0 = torch.unbind(imgs['stage_0'], 1)
         imgs_1 = torch.unbind(imgs['stage_1'], 1)
@@ -593,8 +621,10 @@ class PatchmatchNet(nn.Module):
                                                                     [f.detach() for f in src_features_l],
                 ref_proj, src_projs, intrinsics_s1,depth_min, depth_max, view_weights.detach(),
                 neighbor_indices_batched = neighbor_indices_batched,
-                lambda_c=lambda_c,lambda_s=lambda_s,current_temp=current_temp,
-                src_raw_depths=src_raw_depths
+                lambda_c=lambda_c,lambda_s=lambda_s,progress=progress,
+                src_raw_depths=src_raw_depths,
+                pre_base_depth_thresh=pre_base_depth_thresh,
+                pre_pixel_dist_thresh=pre_pixel_dist_thresh
                 )
 
                 # Score (Confidence) = -min_cost
@@ -617,6 +647,10 @@ class PatchmatchNet(nn.Module):
                 pixel_normal_s1_pure = pixel_planes_s1[:, :3, :, :]  # 获得绝对纯净的 [B, 3, H, W] 物理法向量！
 
                 output_plane['normal_pro_pure'] = pixel_normal_s1_pure
+                output_plane['initial_plane'] = getattr(self.plane_patchmatch_agent, 'initial_planes', None)
+                if output_plane['initial_plane'] is not None:
+                    pixel_planes_s1_init = map_tri_to_pixel_single(output_plane['initial_plane'], tri_id_map_tensor, height, width)
+                    output_plane['normal_no_pro_pure'] = pixel_planes_s1_init[:, :3, :, :]
                 output_plane['tri_id_map'] = tri_id_map_tensor
                 output_plane['tri_id_map_stage0'] = tri_id_map_stage0_tensor
 
@@ -650,8 +684,8 @@ class PatchmatchNet(nn.Module):
                     src_projs=self.proj_matrices_1[1:],
                     tri_id_map=tri_id_map_tensor,
                     max_tri_num=W_plane_tri.shape[1],
-                    base_depth_thresh=0.10,
-                    pixel_dist_thresh=1.2,
+                    base_depth_thresh=post_base_depth_thresh,
+                    pixel_dist_thresh=post_pixel_dist_thresh,
                     normal_ref=pixel_normal_s1_pure
                 )
                 
@@ -676,6 +710,8 @@ class PatchmatchNet(nn.Module):
 
                 # 5. 👑 生成 Cross-Check 三态诊断图并打包进 output_plane (绿: 保持真面 | 红: 降级伪面 | 蓝黑: 背景非平面)
                 W_plane_pixel_orig = self.plane_patchmatch_agent._scatter_triangle_to_pixel(W_plane_tri_pre_cc, tri_id_map_tensor)
+                output_plane['W_plane_pixel_orig'] = W_plane_pixel_orig
+                output_plane['W_plane_tri_orig'] = W_plane_tri_pre_cc
                 output_plane['cross_check_diagnosis_rgb'] = generate_cross_check_diagnosis_rgb(
                     W_plane_pixel_orig=W_plane_pixel_orig,
                     W_plane_pixel_final=W_plane_pixel,
